@@ -13,7 +13,7 @@ class Plan(BaseModel):
     )
 
     affected_areas: list[str] = Field(
-        description="Files, modules, or components likely to be affected."
+        description="Repository files, modules, or components likely to be affected."
     )
 
     acceptance_criteria: list[str] = Field(
@@ -22,7 +22,13 @@ class Plan(BaseModel):
 
 
 class Task(BaseModel):
-    """A concrete executable task produced by the foreman."""
+    """
+    A concrete executable task produced by the foreman.
+
+    The task describes work that an existing-file worker can perform.
+    Repository structure and file creation are intentionally outside
+    the worker's authority.
+    """
 
     task_id: str = Field(
         description="Unique identifier for this task."
@@ -33,19 +39,27 @@ class Task(BaseModel):
     )
 
     scope: str = Field(
-        description="Explicit boundaries of what the worker should and should not change."
+        description=(
+            "Explicit boundaries of what the worker may and may not change."
+        )
     )
 
     relevant_files: list[str] = Field(
-        description="Files relevant to this task."
+        description=(
+            "Existing files inside the worker workspace that the worker "
+            "is authorized to inspect or modify."
+        )
     )
 
     constraints: list[str] = Field(
-        description="Technical or architectural constraints the worker must respect."
+        description=(
+            "Technical, architectural, or repository constraints the "
+            "worker must respect."
+        )
     )
 
     acceptance_criteria: list[str] = Field(
-        description="Conditions the worker must satisfy."
+        description="Concrete conditions the worker must satisfy."
     )
 
 
@@ -57,13 +71,18 @@ class WorkerResult(BaseModel):
     )
 
     status: str = Field(
-        description="Result status, such as success or failure."
+        description=(
+            "Result status. Use values such as 'success', 'partial', "
+            "or 'failure'."
+        )
     )
 
     summary: str = Field(
-        description="Concise description of what the worker did."
+        description="Concise description of what the worker actually did."
     )
 
     implementation: str = Field(
-        description="Description of the implementation produced by the worker."
+        description=(
+            "Description of the code changes or patches actually produced."
+        )
     )
