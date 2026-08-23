@@ -1,8 +1,12 @@
 from pydantic import BaseModel, Field
 
 
+# ---------------------------------------------------------------------------
+# Planner
+# ---------------------------------------------------------------------------
+
 class Plan(BaseModel):
-    """High-level architectural plan produced by the planner."""
+    """High-level architectural plan produced by the Planner."""
 
     objective: str = Field(
         description="What the implementation should accomplish."
@@ -21,68 +25,187 @@ class Plan(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Worker profile
+# ---------------------------------------------------------------------------
+
+class WorkerProfile(BaseModel):
+    """
+    Compact description of the Worker model's capabilities.
+
+    This is planning metadata consumed by the Planner and Foreman.
+    It is not runtime telemetry.
+    """
+
+    model: str = Field(
+        description="Worker model identifier."
+    )
+
+    context_limit: str = Field(
+        description="Qualitative context constraint (e.g. 'limited')."
+    )
+
+    strengths: list[str] = Field(
+        description="Kinds of implementation work the Worker performs well."
+    )
+
+    avoid: list[str] = Field(
+        description="Work the Worker should not be assigned."
+    )
+
+    execution_mode: str = Field(
+        description="Execution strategy (e.g. one_session_per_batch)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Foreman task
+# ---------------------------------------------------------------------------
+
 class Task(BaseModel):
     """
-    A concrete executable task produced by the foreman.
+    A concrete executable task produced by the Foreman.
 
-    The task describes work that an existing-file worker can perform.
-    Repository structure and file creation are intentionally outside
-    the worker's authority.
+    Tasks are intentionally small and suitable for a limited-context Worker.
     """
 
     task_id: str = Field(
-        description="Unique identifier for this task."
+        description="Unique task identifier."
     )
 
-    description: str = Field(
-        description="Specific implementation task for the worker."
+    objective: str = Field(
+        description="Specific implementation objective."
     )
 
     scope: str = Field(
-        description=(
-            "Explicit boundaries of what the worker may and may not change."
-        )
+        description="Explicit boundaries of what the Worker may modify."
     )
 
     relevant_files: list[str] = Field(
-        description=(
-            "Existing files inside the worker workspace that the worker "
-            "is authorized to inspect or modify."
-        )
+        description="Existing files the Worker may inspect or edit."
+    )
+
+    dependencies: list[str] = Field(
+        default_factory=list,
+        description="Task IDs that must complete before this task."
     )
 
     constraints: list[str] = Field(
-        description=(
-            "Technical, architectural, or repository constraints the "
-            "worker must respect."
-        )
+        description="Technical or architectural constraints."
     )
 
     acceptance_criteria: list[str] = Field(
-        description="Concrete conditions the worker must satisfy."
+        description="Concrete completion conditions."
     )
 
 
-class WorkerResult(BaseModel):
-    """Result returned by the worker after attempting a task."""
+# ---------------------------------------------------------------------------
+# Task batching
+# ---------------------------------------------------------------------------
+
+class TaskBatch(BaseModel):
+    """
+    Group of related tasks executed during one Worker model session.
+    """
+
+    batch_id: str = Field(
+        description="Unique batch identifier."
+    )
+
+    objective: str = Field(
+        description="Shared objective of the batch."
+    )
+
+    tasks: list[Task] = Field(
+        description="Tasks included in this batch."
+    )
+
+    shared_context: list[str] = Field(
+        default_factory=list,
+        description="Compact context shared across every task."
+    )
+
+    relevant_files: list[str] = Field(
+        default_factory=list,
+        description="Union of repository files relevant to the batch."
+    )
+
+    constraints: list[str] = Field(
+        default_factory=list,
+        description="Batch-wide constraints."
+    )
+
+    execution_order: list[str] = Field(
+        description="Ordered list of task IDs."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Worker execution result
+# ---------------------------------------------------------------------------
+
+class TaskResult(BaseModel):
+    """
+    Compact factual record of a completed task.
+    """
 
     task_id: str = Field(
-        description="ID of the task that was attempted."
+        description="Completed task identifier."
     )
 
     status: str = Field(
-        description=(
-            "Result status. Use values such as 'success', 'partial', "
-            "or 'failure'."
-        )
+        description="success | partial | failure"
     )
 
-    summary: str = Field(
-        description="Concise description of what the worker actually did."
+    actions: list[str] = Field(
+        default_factory=list,
+        description="Filesystem actions actually performed."
     )
 
-    implementation: str = Field(
-        description=(
-            "Description of the code changes or patches actually produced."
-        )
+    files_changed: list[str] = Field(
+        default_factory=list,
+        description="Files modified during execution."
+    )
+
+    validation: list[str] = Field(
+        default_factory=list,
+        description="Checks that passed."
+    )
+
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Errors encountered."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cycle memory
+# ---------------------------------------------------------------------------
+
+class CycleResult(BaseModel):
+    """
+    Compact orchestration record persisted into the next cycle.
+
+    The repository remains the source of truth for code.
+    This object preserves only execution decisions and outcomes.
+    """
+
+    cycle_id: int = Field(
+        description="Sequential orchestration cycle number."
+    )
+
+    plan: Plan = Field(
+        description="Planner output for this cycle."
+    )
+
+    task_batches: list[TaskBatch] = Field(
+        description="Batches produced by the Foreman."
+    )
+
+    task_results: list[TaskResult] = Field(
+        description="Worker execution results."
+    )
+
+    outcome: str = Field(
+        description="overall_success | partial | failure"
     )
