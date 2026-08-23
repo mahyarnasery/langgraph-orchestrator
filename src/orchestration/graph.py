@@ -13,6 +13,7 @@ from .schemas import (
     Task,
     TaskBatch,
     TaskResult,
+    WorkerProfile,
 )
 from .state import WorkflowState
 from .tools import (
@@ -38,29 +39,13 @@ WORKER_TOOL_MAP = _tool_map(WORKER_TOOLS)
 
 def _task_result_from_response(task: Task, response) -> TaskResult:
     """
-    Convert the Worker's final response into compact Alpha01 task state.
-
-    Alpha01 intentionally stores factual execution metadata instead of prose.
+    Convert the Worker's final response into compact Alpha01 state.
     """
-
-    content = response.content
-
-    if isinstance(content, list):
-        text = []
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("text"):
-                    text.append(item["text"])
-            else:
-                text.append(str(item))
-        content = "\n".join(text)
-
-    content = str(content).strip()
 
     return TaskResult(
         task_id=task.task_id,
         status="success",
-        actions=["worker_session"],
+        actions=["read_file", "edit_file"],
         files_changed=task.relevant_files,
         validation=task.acceptance_criteria,
         errors=[],
@@ -73,14 +58,6 @@ def _task_result_from_response(task: Task, response) -> TaskResult:
 
 
 def planner_node(state: WorkflowState) -> dict:
-    """
-    Gemma 4 e4b — Planner
-
-    Alpha01 addition:
-        - Receives WorkerProfile
-        - Receives Previous Cycle
-    """
-
     previous_cycle = (
         state["previous_cycle"].model_dump_json(indent=2)
         if state["previous_cycle"]
@@ -133,13 +110,6 @@ Return only the structured Plan.
 
 
 def foreman_node(state: WorkflowState) -> dict:
-    """
-    Granite 8B — Foreman
-
-    Commit 1 behavior:
-        Creates ONE TaskBatch containing ONE Task.
-    """
-
     plan = state["plan"]
 
     if plan is None:
@@ -171,24 +141,21 @@ Previous cycle:
 Planner plan:
 {plan.model_dump_json(indent=2)}
 
-Create ONE focused worker task.
+Create ONE TaskBatch.
 
-Do not ask the Worker to create files.
+The batch may contain multiple related tasks if they share context.
+
+Important:
+- Worker edits existing files only.
+- Worker never creates files.
+- Repository preparation is your responsibility.
+
+Return only the structured TaskBatch.
 """
 
     with model_session(FOREMAN_MODEL) as llm:
-        structured = llm.with_structured_output(Task)
-        task = structured.invoke(prompt)
-
-        batch = TaskBatch(
-            batch_id="batch-001",
-            objective=task.objective,
-            tasks=[task],
-            shared_context=[],
-            relevant_files=task.relevant_files,
-            constraints=task.constraints,
-            execution_order=[task.task_id],
-        )
+        structured = llm.with_structured_output(TaskBatch)
+        batch = structured.invoke(prompt)
 
         print("\n=== FOREMAN RESULT ===")
         print(batch.model_dump_json(indent=2))
@@ -223,20 +190,14 @@ Do not ask the Worker to create files.
 # ---------------------------------------------------------------------------
 
 
-def worker_node(state: WorkflowState) -> dict:
+def _execute_task(
+    llm_with_tools,
+    batch: TaskBatch,
+    task: Task,
+) -> TaskResult:
     """
-    Granite 3B — Worker
-
-    Commit 1:
-        Executes the first TaskBatch.
-        (Currently that batch contains one task.)
+    Execute one task inside the already-loaded Worker session.
     """
-
-    if not state["task_batches"]:
-        raise RuntimeError("No TaskBatch received.")
-
-    batch = state["task_batches"][0]
-    task = batch.tasks[0]
 
     prompt = f"""
 You are the Worker.
@@ -256,57 +217,106 @@ Rules:
 - Read existing files
 - Edit existing files
 - Never create files
-- Stay inside task scope
+- Never redesign architecture
+- Output raw source code when editing files
 """
 
     messages = [HumanMessage(content=prompt)]
 
+    for iteration in range(5):
+        print(
+            f"\n=== {task.task_id} | iteration {iteration+1}/5 ==="
+        )
+
+        response = llm_with_tools.invoke(messages)
+
+        if not response.tool_calls:
+            result = _task_result_from_response(task, response)
+
+            print("\n=== TASK RESULT ===")
+            print(result.model_dump_json(indent=2))
+
+            return result
+
+        messages.append(response)
+
+        for tool_call in response.tool_calls:
+            name = tool_call["name"]
+
+            if name not in WORKER_TOOL_MAP:
+                raise RuntimeError(
+                    f"Unauthorized tool: {name}"
+                )
+
+            try:
+                tool_result = WORKER_TOOL_MAP[name].invoke(
+                    tool_call["args"]
+                )
+            except Exception as exc:
+                tool_result = (
+                    f"TOOL_ERROR: {type(exc).__name__}: {exc}"
+                )
+
+            messages.append(
+                ToolMessage(
+                    content=str(tool_result),
+                    tool_call_id=tool_call["id"],
+                )
+            )
+
+    return TaskResult(
+        task_id=task.task_id,
+        status="failure",
+        actions=[],
+        files_changed=[],
+        validation=[],
+        errors=["iteration_limit_exceeded"],
+    )
+
+
+def worker_node(state: WorkflowState) -> dict:
+    """
+    Execute ALL tasks inside one TaskBatch using ONE Granite session.
+    """
+
+    if not state["task_batches"]:
+        raise RuntimeError("No TaskBatch received.")
+
+    batch = state["task_batches"][0]
+
+    results: list[TaskResult] = []
+
+    print("\n=== WORKER SESSION START ===")
+    print(f"Batch: {batch.batch_id}")
+
     with model_session(WORKER_MODEL) as llm:
         llm_with_tools = llm.bind_tools(WORKER_TOOLS)
 
-        for iteration in range(5):
-            print(f"\n=== Worker iteration {iteration+1}/5 ===")
+        ordered = []
 
-            response = llm_with_tools.invoke(messages)
+        for task_id in batch.execution_order:
+            for task in batch.tasks:
+                if task.task_id == task_id:
+                    ordered.append(task)
+                    break
 
-            if not response.tool_calls:
-                result = _task_result_from_response(task, response)
+        for task in ordered:
+            print(f"\n----- Executing {task.task_id} -----")
 
-                print("\n=== TASK RESULT ===")
-                print(result.model_dump_json(indent=2))
+            result = _execute_task(
+                llm_with_tools,
+                batch,
+                task,
+            )
 
-                return {
-                    "task_results": [result],
-                    "phase": "worker_complete",
-                }
+            results.append(result)
 
-            messages.append(response)
+    print("\n=== WORKER SESSION COMPLETE ===")
 
-            for tool_call in response.tool_calls:
-                name = tool_call["name"]
-
-                if name not in WORKER_TOOL_MAP:
-                    raise RuntimeError(
-                        f"Unauthorized tool: {name}"
-                    )
-
-                try:
-                    tool_result = WORKER_TOOL_MAP[name].invoke(
-                        tool_call["args"]
-                    )
-                except Exception as exc:
-                    tool_result = (
-                        f"TOOL_ERROR: {type(exc).__name__}: {exc}"
-                    )
-
-                messages.append(
-                    ToolMessage(
-                        content=str(tool_result),
-                        tool_call_id=tool_call["id"],
-                    )
-                )
-
-    raise RuntimeError("Worker exceeded iteration limit.")
+    return {
+        "task_results": results,
+        "phase": "worker_complete",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -334,38 +344,31 @@ app = build_graph()
 
 
 # ---------------------------------------------------------------------------
-# Smoke test
+# Cycle runner
 # ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
-    from .schemas import WorkerProfile
+def run_cycle(
+    *,
+    cycle_id: int,
+    goal: str,
+    architecture: str,
+    worker_profile: WorkerProfile,
+    previous_cycle: CycleResult | None,
+) -> CycleResult:
+    """
+    Execute one complete orchestration cycle.
 
-    result = app.invoke(
+    This is the Alpha01 memory boundary:
+    only CycleResult crosses into the next cycle.
+    """
+
+    state = app.invoke(
         {
-            "project_goal": (
-                "Design a small Python web scraper that retrieves a webpage "
-                "and extracts its title."
-            ),
-            "architecture_context": (
-                "Three-layer orchestration prototype."
-            ),
-            "worker_profile": WorkerProfile(
-                model="ibm/granite4.1:3b",
-                context_limit="limited",
-                strengths=[
-                    "localized edits",
-                    "small functions",
-                    "focused validation",
-                ],
-                avoid=[
-                    "architecture redesign",
-                    "large historical context",
-                    "unrelated repository areas",
-                ],
-                execution_mode="one_session_per_batch",
-            ),
-            "previous_cycle": None,
+            "project_goal": goal,
+            "architecture_context": architecture,
+            "worker_profile": worker_profile,
+            "previous_cycle": previous_cycle,
             "plan": None,
             "task_batches": [],
             "task_results": [],
@@ -373,25 +376,73 @@ if __name__ == "__main__":
         }
     )
 
-    print("\n==============================")
-    print("FINAL WORKFLOW STATE")
-    print("==============================")
-
-    print(result["plan"].model_dump_json(indent=2))
-
-    print("\nTask batch:")
-    print(result["task_batches"][0].model_dump_json(indent=2))
-
-    print("\nTask result:")
-    print(result["task_results"][0].model_dump_json(indent=2))
-
-    cycle = CycleResult(
-        cycle_id=1,
-        plan=result["plan"],
-        task_batches=result["task_batches"],
-        task_results=result["task_results"],
-        outcome="success",
+    outcome = (
+        "success"
+        if all(r.status == "success" for r in state["task_results"])
+        else "partial"
     )
 
-    print("\nCycleResult:")
-    print(cycle.model_dump_json(indent=2))
+    return CycleResult(
+        cycle_id=cycle_id,
+        plan=state["plan"],
+        task_batches=state["task_batches"],
+        task_results=state["task_results"],
+        outcome=outcome,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+
+    worker_profile = WorkerProfile(
+        model="ibm/granite4.1:3b",
+        context_limit="limited",
+        strengths=[
+            "localized edits",
+            "small functions",
+            "focused validation",
+        ],
+        avoid=[
+            "architecture redesign",
+            "large historical context",
+            "unrelated repository areas",
+        ],
+        execution_mode="one_session_per_batch",
+    )
+
+    print("\n==============================")
+    print("CYCLE 1")
+    print("==============================")
+
+    cycle1 = run_cycle(
+        cycle_id=1,
+        goal="Design a Python web scraper that extracts a webpage title.",
+        architecture="Three-layer orchestration prototype.",
+        worker_profile=worker_profile,
+        previous_cycle=None,
+    )
+
+    print("\n=== CYCLE 1 RESULT ===")
+    print(cycle1.model_dump_json(indent=2))
+
+    print("\n==============================")
+    print("CYCLE 2")
+    print("==============================")
+
+    cycle2 = run_cycle(
+        cycle_id=2,
+        goal=(
+            "Extend the same scraper by improving robustness while "
+            "preserving the architecture."
+        ),
+        architecture="Three-layer orchestration prototype.",
+        worker_profile=worker_profile,
+        previous_cycle=cycle1,
+    )
+
+    print("\n=== CYCLE 2 RESULT ===")
+    print(cycle2.model_dump_json(indent=2))
