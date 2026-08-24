@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "alpha01": "src.orchestration.graph:app"
+  },
+  "env": ".env"
+}
