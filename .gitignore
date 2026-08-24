@@ -1,5 +1,16 @@
+# Environment
+.env
 .venv/
+
+# LangGraph
+.langgraph_api/
+
+# Runtime workspace
+sandbox/
+
+# Python
 __pycache__/
 *.pyc
-.pytest_cache/
+
+# VS Code
 .vscode/
