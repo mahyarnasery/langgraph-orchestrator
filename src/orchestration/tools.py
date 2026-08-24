@@ -38,7 +38,7 @@ def _safe_path(path: str) -> Path:
 
 
 @tool
-def read_file(path: str) -> str:
+def read_file(path: str) -> dict:
     """
     Read an existing text file inside the orchestration workspace.
 
@@ -58,13 +58,16 @@ def read_file(path: str) -> str:
         f"\n*** TOOL: read_file({path}) ***"
     )
 
-    return target.read_text(
-        encoding="utf-8"
-    )
+    return {
+    "tool": "read_file",
+    "path": path,
+    "result": "OK",
+    "content": target.read_text(encoding="utf-8"),
+}
 
 
 @tool
-def create_file(path: str, content: str = "") -> str:
+def create_file(path: str, content: str = "") -> dict:
     """
     Create a new text file inside the orchestration workspace.
 
@@ -104,10 +107,11 @@ def create_file(path: str, content: str = "") -> str:
         f"\n*** FOREMAN TOOL: create_file({path}) ***"
     )
 
-    return (
-        f"FILE_CREATED: {path} "
-        f"({len(content)} characters)"
-    )
+    return {
+    "tool": "create_file",
+    "path": path,
+    "result": "FILE_CREATED",
+}
 
 
 @tool
@@ -115,7 +119,7 @@ def edit_file(
     path: str,
     old_text: str,
     new_text: str,
-) -> str:
+) -> dict:
     """
     Apply one narrowly scoped text replacement to an existing file.
 
@@ -143,17 +147,20 @@ def edit_file(
     )
 
     if old_text not in content:
-        return "OLD_TEXT_NOT_FOUND"
+        return {
+    "tool": "edit_file",
+    "path": path,
+    "result": "OLD_TEXT_NOT_FOUND",
+}
 
     occurrences = content.count(old_text)
 
     if occurrences > 1:
-        return (
-            "AMBIGUOUS_EDIT: old_text occurs "
-            f"{occurrences} times in {path}; "
-            "no changes were made."
-        )
-
+        return {
+        "tool": "edit_file",
+        "path": path,
+        "result": "AMBIGUOUS_EDIT",
+    }
     updated = content.replace(
         old_text,
         new_text,
@@ -165,7 +172,11 @@ def edit_file(
         encoding="utf-8",
     )
 
-    return "EDIT_SUCCESS"
+    return {
+        "tool": "edit_file",
+        "path": path,
+        "result": "EDIT_SUCCESS",
+    }
 
 
 # ------------------------------------------------------------

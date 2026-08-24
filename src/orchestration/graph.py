@@ -13,6 +13,7 @@ from .schemas import (
     Task,
     TaskBatch,
     TaskResult,
+    ToolAction,
     WorkerProfile,
 )
 from .state import WorkflowState
@@ -37,19 +38,6 @@ FOREMAN_TOOL_MAP = _tool_map(FOREMAN_TOOLS)
 WORKER_TOOL_MAP = _tool_map(WORKER_TOOLS)
 
 
-def _task_result_from_response(task: Task, response) -> TaskResult:
-    """
-    Convert the Worker's final response into compact Alpha01 state.
-    """
-
-    return TaskResult(
-        task_id=task.task_id,
-        status="success",
-        actions=["read_file", "edit_file"],
-        files_changed=task.relevant_files,
-        validation=task.acceptance_criteria,
-        errors=[],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +136,10 @@ The batch may contain multiple related tasks if they share context.
 Important:
 - Worker edits existing files only.
 - Worker never creates files.
-- Repository preparation is your responsibility.
+- If a task requires a file that does not exist, YOU must prepare/create that file before the Worker executes the task.
+- Every file mentioned in any task's relevant_files MUST be included in TaskBatch.relevant_files.
+- TaskBatch.relevant_files is the complete union of all task-level relevant_files.
+- A task may therefore require creation by the Foreman even though the Worker will only edit the prepared file.
 
 Return only the structured TaskBatch.
 """
@@ -156,6 +147,14 @@ Return only the structured TaskBatch.
     with model_session(FOREMAN_MODEL) as llm:
         structured = llm.with_structured_output(TaskBatch)
         batch = structured.invoke(prompt)
+
+        batch.relevant_files = sorted(
+            {
+                path
+                for task in batch.tasks
+                for path in task.relevant_files
+            }
+        )
 
         print("\n=== FOREMAN RESULT ===")
         print(batch.model_dump_json(indent=2))
@@ -167,15 +166,13 @@ Return only the structured TaskBatch.
                 continue
 
             try:
-                read_file.invoke({"path": relative_path})
+                read_file.func(path=relative_path)
                 print(f"{relative_path} already exists")
 
             except FileNotFoundError:
-                create_file.invoke(
-                    {
-                        "path": relative_path,
-                        "content": "",
-                    }
+                create_file.func(
+                    path=relative_path,
+                    content="",
                 )
                 print(f"Created {relative_path}")
 
@@ -197,6 +194,10 @@ def _execute_task(
 ) -> TaskResult:
     """
     Execute one task inside the already-loaded Worker session.
+
+    Alpha02:
+    TaskResult is built from observed tool execution rather than
+    Worker claims.
     """
 
     prompt = f"""
@@ -218,22 +219,40 @@ Rules:
 - Edit existing files
 - Never create files
 - Never redesign architecture
-- Output raw source code when editing files
+- When using edit_file, provide raw source code (never Markdown).
 """
 
     messages = [HumanMessage(content=prompt)]
 
+    tool_actions: list[ToolAction] = []
+    files_changed: set[str] = set()
+    errors: list[str] = []
+
     for iteration in range(5):
         print(
-            f"\n=== {task.task_id} | iteration {iteration+1}/5 ==="
+            f"\\n=== {task.task_id} | iteration {iteration+1}/5 ==="
         )
 
         response = llm_with_tools.invoke(messages)
 
         if not response.tool_calls:
-            result = _task_result_from_response(task, response)
 
-            print("\n=== TASK RESULT ===")
+            status = (
+                "failure"
+                if errors
+                else "completed"
+            )
+
+            result = TaskResult(
+                task_id=task.task_id,
+                status=status,
+                tool_actions=tool_actions,
+                files_changed=sorted(files_changed),
+                validation=[],
+                errors=errors,
+            )
+
+            print("\\n=== TASK RESULT ===")
             print(result.model_dump_json(indent=2))
 
             return result
@@ -241,6 +260,7 @@ Rules:
         messages.append(response)
 
         for tool_call in response.tool_calls:
+
             name = tool_call["name"]
 
             if name not in WORKER_TOOL_MAP:
@@ -249,17 +269,50 @@ Rules:
                 )
 
             try:
-                tool_result = WORKER_TOOL_MAP[name].invoke(
-                    tool_call["args"]
+                tool_result = WORKER_TOOL_MAP[name].func(
+                    **tool_call["args"]
                 )
+
             except Exception as exc:
-                tool_result = (
-                    f"TOOL_ERROR: {type(exc).__name__}: {exc}"
+
+                tool_result = {
+                    "tool": name,
+                    "path": tool_call["args"].get("path"),
+                    "result": "TOOL_ERROR",
+                }
+
+                errors.append(
+                    f"{type(exc).__name__}: {exc}"
                 )
+
+            action = ToolAction(
+                tool=tool_result["tool"],
+                path=tool_result.get("path"),
+                result=tool_result["result"],
+            )
+
+            tool_actions.append(action)
+
+            if tool_result["result"] == "EDIT_SUCCESS":
+                files_changed.add(tool_result["path"])
+
+            if tool_result["result"] == "TOOL_ERROR":
+                errors.append(
+                    f"{name} failed on {tool_result.get('path')}"
+                )
+
+            tool_message_content = (
+                tool_result["content"]
+                if (
+                    tool_result["tool"] == "read_file"
+                    and tool_result["result"] == "OK"
+                )
+                else tool_result["result"]
+            )
 
             messages.append(
                 ToolMessage(
-                    content=str(tool_result),
+                    content=tool_message_content,
                     tool_call_id=tool_call["id"],
                 )
             )
@@ -267,10 +320,10 @@ Rules:
     return TaskResult(
         task_id=task.task_id,
         status="failure",
-        actions=[],
-        files_changed=[],
+        tool_actions=tool_actions,
+        files_changed=sorted(files_changed),
         validation=[],
-        errors=["iteration_limit_exceeded"],
+        errors=errors + ["iteration_limit_exceeded"],
     )
 
 
@@ -378,7 +431,7 @@ def run_cycle(
 
     outcome = (
         "success"
-        if all(r.status == "success" for r in state["task_results"])
+        if all(r.status == "completed" for r in state["task_results"])
         else "partial"
     )
 

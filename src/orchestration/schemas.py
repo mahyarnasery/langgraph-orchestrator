@@ -144,9 +144,33 @@ class TaskBatch(BaseModel):
 # Worker execution result
 # ---------------------------------------------------------------------------
 
+class ToolAction(BaseModel):
+    """
+    One observed filesystem tool invocation.
+
+    This is evidence collected by the orchestration layer,
+    not something the Worker invents.
+    """
+
+    tool: str = Field(
+        description="Tool name (read_file, edit_file, ...)."
+    )
+
+    path: str | None = Field(
+        default=None,
+        description="Workspace path operated on, if applicable."
+    )
+
+    result: str = Field(
+        description="Observed tool outcome (OK, EDIT_SUCCESS, TOOL_ERROR, ...)."
+    )
+
 class TaskResult(BaseModel):
     """
-    Compact factual record of a completed task.
+    Compact factual record of one completed task.
+
+    Unlike Alpha01v1, this stores observed tool evidence instead of
+    Worker-claimed actions.
     """
 
     task_id: str = Field(
@@ -154,29 +178,28 @@ class TaskResult(BaseModel):
     )
 
     status: str = Field(
-        description="success | partial | failure"
+        description="completed | partial | failure"
     )
 
-    actions: list[str] = Field(
+    tool_actions: list[ToolAction] = Field(
         default_factory=list,
-        description="Filesystem actions actually performed."
+        description="Observed filesystem tool invocations."
     )
 
     files_changed: list[str] = Field(
         default_factory=list,
-        description="Files modified during execution."
+        description="Files successfully modified."
     )
 
     validation: list[str] = Field(
         default_factory=list,
-        description="Checks that passed."
+        description="Checks performed by the orchestration layer."
     )
 
     errors: list[str] = Field(
         default_factory=list,
-        description="Errors encountered."
+        description="Observed execution errors."
     )
-
 
 # ---------------------------------------------------------------------------
 # Cycle memory
@@ -209,3 +232,4 @@ class CycleResult(BaseModel):
     outcome: str = Field(
         description="overall_success | partial | failure"
     )
+
