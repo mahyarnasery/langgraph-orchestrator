@@ -121,14 +121,23 @@ def edit_file(
     new_text: str,
 ) -> dict:
     """
-    Apply one narrowly scoped text replacement to an existing file.
+    Apply one narrowly scoped edit to an existing file.
 
     Available to both the Foreman and Worker.
 
     The target file must already exist.
 
-    Exactly one occurrence of old_text must exist.
-    If zero or multiple occurrences are found, no changes are made.
+    Modes:
+
+    1. Replacement mode
+       - old_text must occur exactly once.
+       - That occurrence is replaced by new_text.
+
+    2. Initial implementation mode
+       - If the file is empty, old_text must be "".
+       - The file is initialized with new_text.
+
+    Any ambiguous or invalid edit leaves the file unchanged.
     """
 
     target = _safe_path(path)
@@ -146,12 +155,34 @@ def edit_file(
         encoding="utf-8"
     )
 
+    # --------------------------------------------------------
+    # Initial implementation mode
+    # --------------------------------------------------------
+    # --------------------------------------------------------
+    # Initial implementation mode
+    # --------------------------------------------------------
+    # Treat an empty or whitespace-only file as blank.
+    if content.strip() == "":
+        target.write_text(
+            new_text,
+            encoding="utf-8",
+        )
+
+        return {
+            "tool": "edit_file",
+            "path": path,
+            "result": "EDIT_SUCCESS",
+        }
+
+    # --------------------------------------------------------
+    # Normal replacement mode
+    # --------------------------------------------------------
     if old_text not in content:
         return {
-    "tool": "edit_file",
-    "path": path,
-    "result": "OLD_TEXT_NOT_FOUND",
-}
+            "tool": "edit_file",
+            "path": path,
+            "result": "OLD_TEXT_NOT_FOUND",
+        }
 
     occurrences = content.count(old_text)
 

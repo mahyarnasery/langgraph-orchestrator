@@ -201,6 +201,31 @@ class TaskResult(BaseModel):
         description="Observed execution errors."
     )
 
+class ForemanReview(BaseModel):
+    """Implementation-level review produced by the Foreman."""
+
+    accepted: bool = Field(
+        description="Whether the current implementation is acceptable."
+    )
+
+    reviewed_task_ids: list[str] = Field(
+        description="Task IDs evaluated during this review."
+    )
+
+    problems: list[str] = Field(
+        default_factory=list,
+        description="Concrete implementation issues identified."
+    )
+
+    corrective_batch: TaskBatch | None = Field(
+        default=None,
+        description="New TaskBatch to execute if implementation is rejected."
+    )
+
+    summary: str = Field(
+        description="Brief explanation of the review decision."
+    )
+
 # ---------------------------------------------------------------------------
 # Cycle memory
 # ---------------------------------------------------------------------------
