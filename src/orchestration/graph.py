@@ -1,5 +1,5 @@
 from langgraph.graph import END, StateGraph
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from .models import (
     FOREMAN_MODEL,
@@ -13,6 +13,7 @@ from .tools import (
     FOREMAN_TOOLS,
     WORKER_TOOLS,
     create_file,
+    edit_file,
     read_file,
 )
 
@@ -102,61 +103,6 @@ Return only the structured Plan.
 # Foreman
 # ---------------------------------------------------------------------------
 
-def _foreman_correction_node(state: WorkflowState) -> dict:
-    """
-    Convert a rejected Foreman review into the next Worker TaskBatch.
-
-    The corrective TaskBatch has already been reasoned about by the Foreman
-    review. This function prepares the repository and makes that batch the
-    active batch for the next Worker session.
-    """
-
-    review = state["foreman_review"]
-
-    if review is None:
-        raise RuntimeError("Foreman review missing.")
-
-    batch = review.corrective_batch
-
-    if batch is None:
-        raise RuntimeError(
-            "Rejected Foreman review has no corrective TaskBatch."
-        )
-
-    batch.relevant_files = sorted(
-        {
-            path
-            for task in batch.tasks
-            for path in task.relevant_files
-        }
-    )
-
-    print("\n=== FOREMAN CORRECTIVE BATCH ===")
-    print(batch.model_dump_json(indent=2))
-
-    print("\n=== FOREMAN CORRECTIVE REPOSITORY PREPARATION ===")
-
-    for relative_path in batch.relevant_files:
-        if relative_path in ("", ".", ".."):
-            continue
-
-        try:
-            read_file.func(path=relative_path)
-            print(f"{relative_path} already exists")
-        except FileNotFoundError:
-            create_file.func(
-                path=relative_path,
-                content="",
-            )
-            print(f"Created {relative_path}")
-
-    return {
-        "task_batches": [batch],
-        "task_results": [],
-        "review_iteration": state["review_iteration"] + 1,
-        "phase": "task_ready",
-    }
-
 
 def foreman_node(state: WorkflowState) -> dict:
     plan = state["plan"]
@@ -164,10 +110,6 @@ def foreman_node(state: WorkflowState) -> dict:
     if plan is None:
         raise RuntimeError("Planner output missing.")
 
-    review = state["foreman_review"]
-
-    if review is not None and not review.accepted:
-        return _foreman_correction_node(state)
 
     previous_cycle = (
         state["previous_cycle"].model_dump_json(indent=2)
@@ -195,17 +137,36 @@ Previous cycle:
 Planner plan:
 {plan.model_dump_json(indent=2)}
 
-Create ONE TaskBatch.
+Create ONE TaskBatch from the Planner's architectural plan.
 
-The batch may contain multiple related tasks if they share context.
+Your responsibility is to translate the Planner's high-level design
+into concrete implementation work.
+
+The Planner decides:
+- what the final product should accomplish
+- the high-level architecture
+- the major components
+- the files/modules that should exist
+- the acceptance criteria
+
+You decide:
+- exact task decomposition
+- task ordering
+- implementation details
+- file preparation
+- dependencies between tasks
+- how to group related tasks into one Worker batch
+
+Do NOT redesign the architecture established by the Planner.
 
 Important:
 - Worker edits existing files only.
 - Worker never creates files.
-- If a task requires a file that does not exist, YOU must prepare/create that file before the Worker executes the task.
+- If a required file does not exist, YOU must create it before Worker execution.
 - Every file mentioned in any task's relevant_files MUST be included in TaskBatch.relevant_files.
-- TaskBatch.relevant_files is the complete union of all task-level relevant_files.
-- A task may therefore require creation by the Foreman even though the Worker will only edit the prepared file.
+- TaskBatch.relevant_files must be the complete union of task-level relevant_files.
+- Keep Worker tasks small enough for the Worker context limit.
+- Group related tasks when doing so allows the Worker to stay in one model session.
 
 Return only the structured TaskBatch.
 """
@@ -492,10 +453,16 @@ def worker_node(state: WorkflowState) -> dict:
 
     print("\n=== WORKER SESSION COMPLETE ===")
 
+    attempts = dict(state["worker_attempts"])
+
+    for result in results:
+        attempts[result.task_id] = attempts.get(result.task_id, 0) + 1
+
     return {
-        "task_results": results,
-        "phase": "worker_complete",
-    }
+    "task_results": results,
+    "worker_attempts": attempts,
+    "phase": "worker_complete",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -531,11 +498,17 @@ def validator_node(state: WorkflowState) -> dict:
 
 def foreman_review_node(state: WorkflowState) -> dict:
     """
-    Review the current Worker implementation using both:
+    Review the current Worker implementation using:
     - observed Worker execution evidence
+    - deterministic Validator evidence
     - actual repository contents
 
-    The Foreman has read-only repository access during review.
+    The Foreman does NOT create a corrective TaskBatch here.
+
+    Instead it decides whether the implementation should be:
+        accept  -> finished
+        repair  -> Foreman directly repairs the repository
+        rebuild -> a failed task is cleared and prepared for a fresh Worker attempt
     """
 
     if not state["task_batches"]:
@@ -556,8 +529,6 @@ def foreman_review_node(state: WorkflowState) -> dict:
     if plan is None:
         raise RuntimeError("Planner output missing.")
 
-    review_iteration = state["review_iteration"]
-
     review_context = "\n\n".join(
         f"TaskResult {result.task_id}:\n"
         f"{result.model_dump_json(indent=2)}"
@@ -567,11 +538,10 @@ def foreman_review_node(state: WorkflowState) -> dict:
     relevant_files = sorted(
         set(batch.relevant_files)
         | {
-            path
+            action.path
             for result in results
             for action in result.tool_actions
             if action.path
-            for path in [action.path]
         }
     )
 
@@ -602,15 +572,18 @@ def foreman_review_node(state: WorkflowState) -> dict:
             )
 
     validation_context = validation.model_dump_json(indent=2)
-
     repository_context = "\n\n".join(repository_evidence)
+
+    worker_attempts = state["worker_attempts"]
 
     prompt = f"""
 You are the Foreman / Integrator performing an implementation review.
 
-Your responsibility is to determine whether the Worker correctly
-implemented the assigned TaskBatch and whether the resulting files form
-a coherent implementation.
+Your responsibility is to inspect the Worker result and determine the
+smallest appropriate next action.
+
+The Planner defines architecture.
+You are responsible for implementation-level integration and repair.
 
 Project goal:
 {state["project_goal"]}
@@ -633,69 +606,88 @@ DETERMINISTIC VALIDATION:
 ACTUAL REPOSITORY CONTENTS:
 {repository_context}
 
-Review iteration:
-{review_iteration}
+WORKER ATTEMPT COUNTS:
+{worker_attempts}
 
-IMPORTANT REVIEW RULES:
+IMPORTANT RULES:
 
-1. DETERMINISTIC VALIDATION is authoritative for:
+1. The deterministic Validator is authoritative for:
    - syntax
    - file existence
    - scope compliance
 
-2. Do NOT report syntax errors unless they appear in the validator evidence
-   or you can directly quote the offending code.
+2. The actual repository contents are the source of truth for implementation.
 
-3. Worker TaskResults are execution evidence only.
-   Do not assume "completed" means correct.
+3. Worker TaskResults are execution evidence.
+   Do not assume that "completed" means the implementation is correct.
 
-4. ACTUAL REPOSITORY CONTENTS are the source of truth for implementation.
+4. Every reported problem must be concrete.
+   Identify the affected file and function/area whenever possible.
 
-5. Every reported problem must reference:
-   - file
-   - function or line (if identifiable)
-   - violated acceptance criterion
+5. Do NOT redesign the architecture.
+   The Planner owns architecture.
 
-6. Corrective tasks must address only the reported problems and remain
-   within the smallest possible file scope.
+6. Choose exactly ONE decision:
 
-7. Do NOT perform a high-level architectural redesign.
-   The Planner is responsible for architecture.
+   "accept"
+       Use when the implementation satisfies the Planner's acceptance
+       criteria and there is no meaningful implementation problem.
 
-8. If implementation is insufficient:
-   - Set accepted=false.
-   - List concrete implementation problems.
-   - Create a NEW corrective TaskBatch.
-   - The corrective batch must contain ONLY the work required to fix
-     the identified problems.
-   - Base corrective tasks on the ACTUAL CURRENT FILE CONTENTS.
-   - Do NOT simply repeat the previous task with different wording.
-   - Make corrective tasks small and deterministic enough for the
-     limited-context Worker.
-   - Worker may edit existing files only.
-   - If a required file does not exist, the Foreman must prepare it
-     before Worker execution.
+   "repair"
+       Use when the implementation is fundamentally correct but has a
+       localized problem that the Foreman can fix directly and efficiently.
+       Examples:
+       - small syntax or logic mistake
+       - incorrect import
+       - missing argument
+       - simple integration mistake
+       - small mismatch with acceptance criteria
 
-9. If implementation is sufficient:
-   - Set accepted=true.
-   - corrective_batch MUST be null.
+   "rebuild"
+       Use when a Worker task should be attempted again from a clean file.
+       This is appropriate when:
+       - the Worker repeatedly failed to edit the existing implementation
+       - the existing implementation is confusing or corrupted
+       - the task requires a substantially different implementation
+       - continuing to patch the existing file would be less reliable than
+         starting clean
 
-10. If implementation is NOT sufficient:
-   - Set accepted=false.
-   - corrective_batch is REQUIRED.
-   - Never return accepted=false with corrective_batch=null.
-   - Every problem listed must be addressed by at least one corrective task.
-   - If only one file needs fixing, create a TaskBatch containing exactly one task.
+7. Prefer "repair" over "rebuild" when the problem is small.
 
-OUTPUT CONTRACT (mandatory):
+8. Prefer "rebuild" over repeatedly asking the Worker to patch a bad
+   implementation.
 
-IF accepted=true:
-    corrective_batch = null
+9. If a task has already failed three Worker attempts, do NOT send that
+   task back to the Worker again. Use "repair" if the Foreman can fix it
+   directly.
 
-IF accepted=false:
-    corrective_batch = valid TaskBatch
+10. For "repair":
+    - accepted MUST be false
+    - decision MUST be "repair"
+    - provide precise repair_instructions
+    - rebuild_task_ids MUST be empty
 
-This contract is mandatory. Do not violate it.
+11. For "rebuild":
+    - accepted MUST be false
+    - decision MUST be "rebuild"
+    - provide precise repair_instructions explaining WHY the previous
+      implementation failed and exactly what the new implementation must
+      avoid
+    - rebuild_task_ids MUST contain the IDs of tasks that need rebuilding
+
+12. The rebuild instructions must use the reason for the original failure.
+    Do not simply repeat the original task description.
+
+13. For "accept":
+    - accepted MUST be true
+    - decision MUST be "accept"
+    - problems MUST be empty
+    - repair_instructions MUST be empty
+    - rebuild_task_ids MUST be empty
+
+14. Do NOT create a TaskBatch in this review.
+    The orchestration layer will handle repair/rebuild according to your
+    decision.
 
 Return only the structured ForemanReview.
 """
@@ -704,31 +696,33 @@ Return only the structured ForemanReview.
         structured = llm.with_structured_output(ForemanReview)
         review = structured.invoke(prompt)
 
-    if not review.accepted and review.corrective_batch is None:
-        failed = [
-            task
-            for task, result in zip(batch.tasks, results)
-            if result.status != "completed"
-        ]
-
-        if not failed:
-            failed = batch.tasks
-
-        repair_batch = TaskBatch(
-            batch_id=f"{batch.batch_id}_repair",
-            objective="Repair issues identified during Foreman review.",
-            tasks=failed,
-            shared_context=[],
-            relevant_files=sorted({
-                f
-                for task in failed
-                for f in task.relevant_files
-            }),
-            constraints=[],
-            execution_order=[t.task_id for t in failed],
+    if review.decision not in {
+        "accept",
+        "repair",
+        "rebuild",
+    }:
+        raise RuntimeError(
+            f"Invalid Foreman review decision: {review.decision}"
         )
 
-        review.corrective_batch = repair_batch
+    if review.decision == "accept":
+        review.accepted = True
+        review.problems = []
+        review.repair_instructions = []
+        review.rebuild_task_ids = []
+
+    else:
+        review.accepted = False
+
+        if review.decision == "repair":
+            review.rebuild_task_ids = []
+
+        elif review.decision == "rebuild":
+            if not review.rebuild_task_ids:
+                raise RuntimeError(
+                    "Foreman selected rebuild without specifying "
+                    "rebuild_task_ids."
+                )
 
     print("\n=== FOREMAN REVIEW ===")
     print(review.model_dump_json(indent=2))
@@ -738,36 +732,383 @@ Return only the structured ForemanReview.
         "phase": (
             "foreman_review_accepted"
             if review.accepted
-            else "foreman_review_rejected"
+            else f"foreman_review_{review.decision}"
         ),
     }
 
-
-def route_after_foreman_review(state: WorkflowState) -> str:
+def foreman_rebuild_node(state: WorkflowState) -> dict:
     """
-    Route accepted implementations toward the next Alpha03 stage or send
-    rejected implementations back through Foreman correction.
+    Prepare failed Worker tasks for a clean rebuild.
+
+    The Foreman:
+    1. identifies the failed tasks selected by the review
+    2. clears their target files
+    3. creates a new TaskBatch containing only those tasks
+    4. injects the review's failure analysis into the task context
+
+    The Worker then receives the rebuilt task from a clean file rather
+    than trying to patch the previous failed implementation.
     """
 
     review = state["foreman_review"]
 
     if review is None:
+        raise RuntimeError("Foreman review missing before rebuild.")
+
+    if review.decision != "rebuild":
+        raise RuntimeError(
+            "foreman_rebuild_node requires a 'rebuild' Foreman decision."
+        )
+
+    if not state["task_batches"]:
+        raise RuntimeError("No TaskBatch available for rebuild.")
+
+    original_batch = state["task_batches"][0]
+
+    rebuild_ids = set(review.rebuild_task_ids)
+
+    if not rebuild_ids:
+        raise RuntimeError(
+            "No task IDs were provided for rebuild."
+        )
+
+    original_tasks = {
+        task.task_id: task
+        for task in original_batch.tasks
+    }
+
+    missing_ids = rebuild_ids - original_tasks.keys()
+
+    if missing_ids:
+        raise RuntimeError(
+            "Foreman requested rebuild for unknown task IDs: "
+            + ", ".join(sorted(missing_ids))
+        )
+
+    selected_tasks = [
+        original_tasks[task_id]
+        for task_id in original_batch.execution_order
+        if task_id in rebuild_ids
+    ]
+
+    if not selected_tasks:
+        raise RuntimeError(
+            "No valid tasks selected for rebuild."
+        )
+
+    print("\n=== FOREMAN REBUILD PREPARATION ===")
+
+    # ------------------------------------------------------------
+    # Determine which files belong to the rebuilt tasks.
+    # ------------------------------------------------------------
+
+    rebuild_files = sorted(
+        {
+            path
+            for task in selected_tasks
+            for path in task.relevant_files
+        }
+    )
+
+    # ------------------------------------------------------------
+    # Clear existing implementations.
+    #
+    # The Worker cannot create files, so the Foreman must ensure
+    # the target file exists and is empty before the Worker starts.
+    # ------------------------------------------------------------
+
+    for relative_path in rebuild_files:
+        if relative_path in ("", ".", ".."):
+            continue
+
+        try:
+            current = read_file.func(path=relative_path)
+
+            current_content = current["content"]
+
+            if current_content.strip():
+                result = edit_file.func(
+                    path=relative_path,
+                    old_text=current_content,
+                    new_text="",
+                )
+
+                if result["result"] != "EDIT_SUCCESS":
+                    raise RuntimeError(
+                        f"Failed to clear {relative_path}: "
+                        f"{result['result']}"
+                    )
+
+                print(f"Cleared {relative_path}")
+
+            else:
+                print(f"{relative_path} is already empty")
+
+        except FileNotFoundError:
+            create_file.func(
+                path=relative_path,
+                content="",
+            )
+
+            print(f"Created empty rebuild file: {relative_path}")
+
+    # ------------------------------------------------------------
+    # Build replacement tasks.
+    #
+    # Do not blindly reuse the old objectives. Add the Foreman's
+    # failure analysis so the Worker knows exactly what went wrong.
+    # ------------------------------------------------------------
+
+    rebuild_context = list(review.repair_instructions)
+
+    rebuilt_tasks: list[Task] = []
+
+    for task in selected_tasks:
+        rebuilt_tasks.append(
+            task.model_copy(
+                update={
+                    "objective": (
+                        f"Rebuild task {task.task_id} from a clean file. "
+                        f"Do not preserve the previous failed implementation."
+                    ),
+                    "constraints": (
+                        list(task.constraints)
+                        + [
+                            "The target file has been cleared by the Foreman.",
+                            "Implement the task from a clean slate.",
+                            "Do not attempt to recover or patch the previous implementation.",
+                            *rebuild_context,
+                        ]
+                    ),
+                }
+            )
+        )
+
+    rebuilt_batch = TaskBatch(
+        batch_id=f"{original_batch.batch_id}_rebuild",
+        objective=(
+            f"Rebuild failed tasks from TaskBatch "
+            f"{original_batch.batch_id} using the Foreman's failure analysis."
+        ),
+        tasks=rebuilt_tasks,
+        shared_context=(
+            list(original_batch.shared_context)
+            + [
+                "This is a clean rebuild after Worker failure.",
+                *review.repair_instructions,
+            ]
+        ),
+        relevant_files=rebuild_files,
+        constraints=list(original_batch.constraints),
+        execution_order=[
+            task.task_id
+            for task in rebuilt_tasks
+        ],
+    )
+
+    print("\n=== FOREMAN REBUILT BATCH ===")
+    print(rebuilt_batch.model_dump_json(indent=2))
+
+    return {
+        "task_batches": [rebuilt_batch],
+        "task_results": [],
+        "phase": "task_ready",
+    }
+
+def foreman_repair_node(state: WorkflowState) -> dict:
+    """
+    Allow the Foreman to directly repair a small implementation problem.
+
+    This node is used only when Foreman review determines that the existing
+    implementation is fundamentally sound and the problem is small enough
+    that another Worker pass would be unnecessary.
+    """
+
+    review = state["foreman_review"]
+
+    if review is None:
+        raise RuntimeError("Foreman review missing before repair.")
+
+    if review.decision != "repair":
+        raise RuntimeError(
+            "foreman_repair_node requires a 'repair' Foreman decision."
+        )
+
+    if not review.repair_instructions:
+        raise RuntimeError(
+            "Foreman selected repair but provided no repair instructions."
+        )
+
+    if not state["task_batches"]:
+        raise RuntimeError("No TaskBatch available for Foreman repair.")
+
+    batch = state["task_batches"][0]
+
+    relevant_files = sorted(
+        set(batch.relevant_files)
+        | {
+            action.path
+            for result in state["task_results"]
+            for action in result.tool_actions
+            if action.path
+        }
+    )
+
+    print("\n=== FOREMAN DIRECT REPAIR ===")
+
+    repository_evidence: list[str] = []
+
+    for relative_path in relevant_files:
+        try:
+            result = read_file.func(path=relative_path)
+
+            repository_evidence.append(
+                f"FILE: {relative_path}\n"
+                f"{result['content']}"
+            )
+
+            print(f"Inspected: {relative_path}")
+
+        except Exception as exc:
+            repository_evidence.append(
+                f"FILE: {relative_path}\n"
+                f"READ_ERROR: {type(exc).__name__}: {exc}"
+            )
+
+    repository_context = "\n\n".join(repository_evidence)
+
+    prompt = f"""
+You are the Foreman / Integrator performing a direct repair.
+
+The implementation has already been reviewed.
+
+The Foreman Review determined that the problem is small enough to repair
+directly rather than sending the task back to the Worker.
+
+Project goal:
+{state["project_goal"]}
+
+Architecture context:
+{state["architecture_context"]}
+
+Current TaskBatch:
+{batch.model_dump_json(indent=2)}
+
+Foreman Review:
+{review.model_dump_json(indent=2)}
+
+Current repository contents:
+{repository_context}
+
+Repair instructions:
+{chr(10).join(f"- {instruction}" for instruction in review.repair_instructions)}
+
+Your job is to directly repair the repository.
+
+Rules:
+
+1. Make ONLY the changes necessary to satisfy the repair instructions.
+
+2. Do NOT redesign the architecture.
+
+3. Do NOT create a new TaskBatch.
+
+4. Do NOT send the task back to the Worker.
+
+5. Preserve correct existing implementation.
+
+6. Inspect the relevant files before editing them.
+
+7. Use the available Foreman tools to make the repair.
+
+8. The repair must directly address the specific problems identified by
+   the Foreman Review.
+
+Complete the repair and then stop.
+"""
+
+    with model_session(FOREMAN_MODEL) as llm:
+        repair_llm = llm.bind_tools(FOREMAN_TOOLS)
+
+        messages = [
+            SystemMessage(
+                content=(
+                    "You are the Foreman. "
+                    "Directly repair the repository using the provided tools. "
+                    "Do not merely describe the repair."
+                )
+            ),
+            HumanMessage(content=prompt),
+        ]
+
+        for iteration in range(5):
+            print(
+                f"\n=== FOREMAN REPAIR | iteration "
+                f"{iteration + 1}/5 ==="
+            )
+
+            response = repair_llm.invoke(messages)
+            messages.append(response)
+
+            if not response.tool_calls:
+                break
+
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+
+                print(
+                    f"\n*** FOREMAN REPAIR TOOL: "
+                    f"{tool_name}({tool_args}) ***"
+                )
+
+                if tool_name == "read_file":
+                    tool_result = read_file.invoke(tool_args)
+
+                elif tool_name == "edit_file":
+                    tool_result = edit_file.invoke(tool_args)
+
+                elif tool_name == "create_file":
+                    tool_result = create_file.invoke(tool_args)
+
+                else:
+                    tool_result = {
+                        "result": "TOOL_ERROR",
+                        "error": (
+                            f"Foreman repair attempted unsupported tool: "
+                            f"{tool_name}"
+                        ),
+                    }
+
+                messages.append(
+                    ToolMessage(
+                        content=str(tool_result),
+                        tool_call_id=tool_call["id"],
+                    )
+                )
+
+    return {
+        "phase": "foreman_repair_complete",
+    }
+
+def route_after_foreman_review(state: WorkflowState) -> str:
+    review = state["foreman_review"]
+
+    if review is None:
         raise RuntimeError("Foreman review missing.")
 
-    if review.accepted:
+    if review.decision == "accept":
         return "accepted"
 
-    if review.corrective_batch is None:
-        raise RuntimeError(
-            "Foreman rejected implementation without a corrective TaskBatch."
-        )
+    if review.decision == "repair":
+        return "repair"
 
-    if state["review_iteration"] >= 3:
-        raise RuntimeError(
-            "Foreman review iteration limit exceeded."
-        )
+    if review.decision == "rebuild":
+        return "rebuild"
 
-    return "rework"
+    raise RuntimeError(
+        f"Unknown Foreman review decision: {review.decision}"
+    )
 
 # ---------------------------------------------------------------------------
 # Graph
@@ -779,9 +1120,13 @@ def build_graph():
 
     graph.add_node("planner", planner_node)
     graph.add_node("foreman", foreman_node)
-    graph.add_node("validator", validator_node)
     graph.add_node("worker", worker_node)
+    graph.add_node("validator", validator_node)
     graph.add_node("foreman_review", foreman_review_node)
+    graph.add_node("foreman_repair", foreman_repair_node)
+    graph.add_node("foreman_rebuild", foreman_rebuild_node)
+
+    graph.set_entry_point("planner")
 
     graph.set_entry_point("planner")
 
@@ -794,10 +1139,14 @@ def build_graph():
         "foreman_review",
         route_after_foreman_review,
         {
-            "rework": "foreman",
             "accepted": END,
+            "repair": "foreman_repair",
+            "rebuild": "foreman_rebuild",
         },
     )
+
+    graph.add_edge("foreman_repair", "validator")
+    graph.add_edge("foreman_rebuild", "worker")
 
     return graph.compile()
 
@@ -834,8 +1183,10 @@ def run_cycle(
             "plan": None,
             "task_batches": [],
             "task_results": [],
+            "worker_attempts": {},
+            "validation_result": None,
             "foreman_review": None,
-            "review_iteration": 0,
+            "rework_mode": "none",
             "phase": "initial",
         }
     )
