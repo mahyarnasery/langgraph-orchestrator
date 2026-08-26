@@ -98,6 +98,8 @@ class Task(BaseModel):
         description="Concrete completion conditions."
     )
 
+    
+
 
 # ---------------------------------------------------------------------------
 # Task batching
@@ -202,7 +204,7 @@ class TaskResult(BaseModel):
     )
 
 class ForemanReview(BaseModel):
-    """Implementation-level review produced by the Foreman."""
+    """Implementation-level review and repair decision produced by the Foreman."""
 
     accepted: bool = Field(
         description="Whether the current implementation is acceptable."
@@ -217,14 +219,33 @@ class ForemanReview(BaseModel):
         description="Concrete implementation issues identified."
     )
 
-    corrective_batch: TaskBatch | None = Field(
-        default=None,
-        description="New TaskBatch to execute if implementation is rejected."
+    decision: str = Field(
+        description=(
+            "Action to take after review: "
+            "accept, repair, or rebuild."
+        )
+    )
+
+    repair_instructions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Precise instructions for the Foreman when performing a "
+            "direct repair or preparing a rebuilt task."
+        )
+    )
+
+    rebuild_task_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Task IDs that must be rebuilt and sent back to the Worker. "
+            "Empty when no Worker rework is required."
+        )
     )
 
     summary: str = Field(
         description="Brief explanation of the review decision."
     )
+
 
 # ---------------------------------------------------------------------------
 # Cycle memory

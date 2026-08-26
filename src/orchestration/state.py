@@ -4,11 +4,13 @@ from .schemas import (
     CycleResult,
     ForemanReview,
     Plan,
+    Task,
     TaskBatch,
     TaskResult,
     WorkerProfile,
     ValidationResult,
 )
+
 
 class WorkflowState(TypedDict):
     """
@@ -41,11 +43,11 @@ class WorkflowState(TypedDict):
     plan: Plan | None
     task_batches: list[TaskBatch]
     task_results: list[TaskResult]
+    worker_attempts: dict[str, int]
 
     validation_result: ValidationResult | None
-
     foreman_review: ForemanReview | None
-    review_iteration: int
-    
+    rework_mode: str
+
     # Runtime phase marker
     phase: str
