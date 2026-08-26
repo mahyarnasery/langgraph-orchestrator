@@ -2,19 +2,12 @@ from typing import TypedDict
 
 from .schemas import (
     CycleResult,
-    Plan,
-    TaskBatch,
-    TaskResult,
-    WorkerProfile,
-)
-
-from .schemas import (
-    CycleResult,
     ForemanReview,
     Plan,
     TaskBatch,
     TaskResult,
     WorkerProfile,
+    ValidationResult,
 )
 
 class WorkflowState(TypedDict):
@@ -48,6 +41,8 @@ class WorkflowState(TypedDict):
     plan: Plan | None
     task_batches: list[TaskBatch]
     task_results: list[TaskResult]
+
+    validation_result: ValidationResult | None
 
     foreman_review: ForemanReview | None
     review_iteration: int

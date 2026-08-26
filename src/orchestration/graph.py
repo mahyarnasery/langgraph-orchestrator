@@ -24,8 +24,11 @@ from .schemas import (
     TaskBatch,
     TaskResult,
     ToolAction,
+    ValidationResult,
     WorkerProfile,
 )
+
+from .validator import validate_batch
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +498,37 @@ def worker_node(state: WorkflowState) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Validator
+# ---------------------------------------------------------------------------
+
+def validator_node(state: WorkflowState) -> dict:
+    """
+    Deterministically validate the completed Worker batch.
+
+    No LLMs are used here. The validator produces objective evidence that
+    will later be consumed by the Foreman review.
+    """
+
+    if not state["task_batches"]:
+        raise RuntimeError("No TaskBatch available for validation.")
+
+    batch = state["task_batches"][0]
+
+    validation = validate_batch(
+        batch=batch,
+        task_results=state["task_results"],
+    )
+
+    print("\n=== VALIDATOR RESULT ===")
+    print(validation.model_dump_json(indent=2))
+
+    return {
+        "validation_result": validation,
+        "phase": "validated",
+    }
+
+
 def foreman_review_node(state: WorkflowState) -> dict:
     """
     Review the current Worker implementation using both:
@@ -509,6 +543,11 @@ def foreman_review_node(state: WorkflowState) -> dict:
 
     if not state["task_results"]:
         raise RuntimeError("No TaskResults available for Foreman review.")
+
+    validation = state["validation_result"]
+
+    if validation is None:
+        raise RuntimeError("ValidationResult missing before Foreman review.")
 
     plan = state["plan"]
     batch = state["task_batches"][0]
@@ -562,6 +601,8 @@ def foreman_review_node(state: WorkflowState) -> dict:
                 f"{type(exc).__name__}: {exc}"
             )
 
+    validation_context = validation.model_dump_json(indent=2)
+
     repository_context = "\n\n".join(repository_evidence)
 
     prompt = f"""
@@ -586,6 +627,9 @@ Current TaskBatch:
 Worker TaskResults:
 {review_context}
 
+DETERMINISTIC VALIDATION:
+{validation_context}
+
 ACTUAL REPOSITORY CONTENTS:
 {repository_context}
 
@@ -594,26 +638,26 @@ Review iteration:
 
 IMPORTANT REVIEW RULES:
 
-1. The ACTUAL REPOSITORY CONTENTS are the source of truth for
-   implementation correctness.
+1. DETERMINISTIC VALIDATION is authoritative for:
+   - syntax
+   - file existence
+   - scope compliance
 
-2. Worker TaskResults are execution evidence only.
-   Do NOT assume that a task was correctly implemented merely because
-   its TaskResult says "completed".
+2. Do NOT report syntax errors unless they appear in the validator evidence
+   or you can directly quote the offending code.
 
-3. Verify every task against:
-   - its objective
-   - its constraints
-   - its acceptance criteria
-   - the actual current source code
+3. Worker TaskResults are execution evidence only.
+   Do not assume "completed" means correct.
 
-4. Verify integration between related files.
+4. ACTUAL REPOSITORY CONTENTS are the source of truth for implementation.
 
-5. Check that functions requested by one task actually exist and are
-   used correctly by other tasks.
+5. Every reported problem must reference:
+   - file
+   - function or line (if identifiable)
+   - violated acceptance criterion
 
-6. Check that the implementation satisfies the stated behavior, not
-   merely that files were edited.
+6. Corrective tasks must address only the reported problems and remain
+   within the smallest possible file scope.
 
 7. Do NOT perform a high-level architectural redesign.
    The Planner is responsible for architecture.
@@ -735,6 +779,7 @@ def build_graph():
 
     graph.add_node("planner", planner_node)
     graph.add_node("foreman", foreman_node)
+    graph.add_node("validator", validator_node)
     graph.add_node("worker", worker_node)
     graph.add_node("foreman_review", foreman_review_node)
 
@@ -742,7 +787,8 @@ def build_graph():
 
     graph.add_edge("planner", "foreman")
     graph.add_edge("foreman", "worker")
-    graph.add_edge("worker", "foreman_review")
+    graph.add_edge("worker", "validator")
+    graph.add_edge("validator", "foreman_review")
 
     graph.add_conditional_edges(
         "foreman_review",

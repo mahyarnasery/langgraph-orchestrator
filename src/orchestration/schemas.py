@@ -258,3 +258,39 @@ class CycleResult(BaseModel):
         description="overall_success | partial | failure"
     )
 
+# ---------------------------------------------------------------------------
+# Validator
+# ---------------------------------------------------------------------------
+
+class ValidationResult(BaseModel):
+    """
+    Deterministic validation produced by the Validator node.
+
+    This model contains only objective facts gathered from repository
+    inspection (syntax, file existence, scope compliance, etc.).
+    No LLM reasoning or subjective review belongs here.
+    """
+
+    passed: bool = Field(
+        description="True only if every deterministic validation check passed."
+    )
+
+    checks: list[str] = Field(
+        default_factory=list,
+        description="Successful validation checks."
+    )
+
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Deterministic validation failures."
+    )
+
+    files_checked: list[str] = Field(
+        default_factory=list,
+        description="Repository files inspected by the validator."
+    )
+
+    changed_files: list[str] = Field(
+        default_factory=list,
+        description="Files modified by the Worker during this batch."
+    )
