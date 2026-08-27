@@ -45,6 +45,8 @@ class WorkflowState(TypedDict):
     task_results: list[TaskResult]
     worker_attempts: dict[str, int]
 
+    foreman_repair_attempts: int
+
     validation_result: ValidationResult | None
     foreman_review: ForemanReview | None
     rework_mode: str

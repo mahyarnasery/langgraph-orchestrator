@@ -919,9 +919,12 @@ def foreman_repair_node(state: WorkflowState) -> dict:
     """
     Allow the Foreman to directly repair a small implementation problem.
 
-    This node is used only when Foreman review determines that the existing
-    implementation is fundamentally sound and the problem is small enough
-    that another Worker pass would be unnecessary.
+    The repair is bounded and tool failures are fed back to the Foreman
+    explicitly so it can reread the current file and retry correctly.
+
+    A repair attempt is considered successful only when at least one
+    edit_file operation returns EDIT_SUCCESS. Read-only iterations do not
+    terminate the repair early.
     """
 
     review = state["foreman_review"]
@@ -942,6 +945,13 @@ def foreman_repair_node(state: WorkflowState) -> dict:
     if not state["task_batches"]:
         raise RuntimeError("No TaskBatch available for Foreman repair.")
 
+    repair_attempts = state["foreman_repair_attempts"] + 1
+
+    if repair_attempts > 3:
+        raise RuntimeError(
+            "Foreman repair attempts exhausted after 3 attempts."
+        )
+
     batch = state["task_batches"][0]
 
     relevant_files = sorted(
@@ -955,6 +965,7 @@ def foreman_repair_node(state: WorkflowState) -> dict:
     )
 
     print("\n=== FOREMAN DIRECT REPAIR ===")
+    print(f"Repair attempt: {repair_attempts}/3")
 
     repository_evidence: list[str] = []
 
@@ -977,8 +988,13 @@ def foreman_repair_node(state: WorkflowState) -> dict:
 
     repository_context = "\n\n".join(repository_evidence)
 
+    repair_instructions = "\n".join(
+        f"- {instruction}"
+        for instruction in review.repair_instructions
+    )
+
     prompt = f"""
-You are the Foreman / Integrator performing a direct repair.
+You are the Foreman / Integrator performing a direct repository repair.
 
 The implementation has already been reviewed.
 
@@ -1001,9 +1017,11 @@ Current repository contents:
 {repository_context}
 
 Repair instructions:
-{chr(10).join(f"- {instruction}" for instruction in review.repair_instructions)}
+{repair_instructions}
 
-Your job is to directly repair the repository.
+This is repair attempt {repair_attempts} of 3.
+
+Your job is to ACTUALLY REPAIR THE REPOSITORY.
 
 Rules:
 
@@ -1015,16 +1033,59 @@ Rules:
 
 4. Do NOT send the task back to the Worker.
 
-5. Preserve correct existing implementation.
+5. Preserve all correct existing implementation.
 
-6. Inspect the relevant files before editing them.
+6. The CURRENT repository contents are the source of truth.
 
-7. Use the available Foreman tools to make the repair.
+7. You MUST inspect the relevant file before editing it.
 
-8. The repair must directly address the specific problems identified by
-   the Foreman Review.
+8. You MUST use edit_file to apply the repair.
 
-Complete the repair and then stop.
+9. Do NOT merely describe the repair in your response.
+
+10. Do NOT finish the repair session after only reading files.
+
+11. A repair is complete only after edit_file returns EDIT_SUCCESS.
+
+12. For edit_file:
+    - old_text MUST exactly match text currently present in the file.
+    - Never guess old_text.
+    - Copy old_text directly from the latest read_file result.
+    - Keep old_text as small and specific as practical.
+    - Do not replace a larger region when a smaller exact replacement
+      is sufficient.
+
+13. If edit_file returns OLD_TEXT_NOT_FOUND:
+    - Do NOT repeat the same edit.
+    - Read the affected file again.
+    - Construct a new old_text from the newly returned contents.
+    - Then retry the repair.
+
+14. If edit_file returns AMBIGUOUS_EDIT:
+    - Do NOT repeat the same edit.
+    - Read the affected file again.
+    - Construct a more specific old_text that matches exactly once.
+    - Then retry the repair.
+
+15. If a previous repair attempt changed the file, use the CURRENT file
+    contents rather than the original repository contents.
+
+16. Do not introduce unrelated changes.
+
+17. For syntax errors, make the smallest possible source-level correction.
+    Preserve the surrounding implementation.
+
+18. After a successful edit, stop making changes.
+    The Validator will verify the repaired repository.
+
+IMPORTANT:
+
+You are not being asked to explain what should be changed.
+
+You are being asked to perform the change using the repository tools.
+
+If the repository already differs from the Foreman Review's original
+description, trust the actual file contents and repair the current state.
 """
 
     with model_session(FOREMAN_MODEL) as llm:
@@ -1033,13 +1094,17 @@ Complete the repair and then stop.
         messages = [
             SystemMessage(
                 content=(
-                    "You are the Foreman. "
-                    "Directly repair the repository using the provided tools. "
-                    "Do not merely describe the repair."
+                    "You are the Foreman performing a direct repository repair. "
+                    "You MUST use the provided tools to make the required edit. "
+                    "Do not merely describe a solution. "
+                    "Read the current file before constructing old_text. "
+                    "Do not repeat failed edits."
                 )
             ),
             HumanMessage(content=prompt),
         ]
+
+        edit_succeeded = False
 
         for iteration in range(5):
             print(
@@ -1051,7 +1116,17 @@ Complete the repair and then stop.
             messages.append(response)
 
             if not response.tool_calls:
-                break
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            "No repository tool was called. "
+                            "Do not finish yet. "
+                            "You must inspect the affected file and use "
+                            "edit_file to perform the required repair."
+                        )
+                    )
+                )
+                continue
 
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
@@ -1063,16 +1138,48 @@ Complete the repair and then stop.
                 )
 
                 if tool_name == "read_file":
-                    tool_result = read_file.invoke(tool_args)
+                    try:
+                        tool_result = read_file.func(**tool_args)
+                    except Exception as exc:
+                        tool_result = {
+                            "tool": "read_file",
+                            "path": tool_args.get("path"),
+                            "result": "TOOL_ERROR",
+                            "error": (
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
 
                 elif tool_name == "edit_file":
-                    tool_result = edit_file.invoke(tool_args)
+                    try:
+                        tool_result = edit_file.func(**tool_args)
+                    except Exception as exc:
+                        tool_result = {
+                            "tool": "edit_file",
+                            "path": tool_args.get("path"),
+                            "result": "TOOL_ERROR",
+                            "error": (
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
 
                 elif tool_name == "create_file":
-                    tool_result = create_file.invoke(tool_args)
+                    try:
+                        tool_result = create_file.func(**tool_args)
+                    except Exception as exc:
+                        tool_result = {
+                            "tool": "create_file",
+                            "path": tool_args.get("path"),
+                            "result": "TOOL_ERROR",
+                            "error": (
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
 
                 else:
                     tool_result = {
+                        "tool": tool_name,
+                        "path": tool_args.get("path"),
                         "result": "TOOL_ERROR",
                         "error": (
                             f"Foreman repair attempted unsupported tool: "
@@ -1080,14 +1187,93 @@ Complete the repair and then stop.
                         ),
                     }
 
+                if not isinstance(tool_result, dict):
+                    tool_result = {
+                        "tool": tool_name,
+                        "path": tool_args.get("path"),
+                        "result": "TOOL_ERROR",
+                        "error": str(tool_result),
+                    }
+
+                result_status = tool_result.get("result")
+
+                if result_status == "OLD_TEXT_NOT_FOUND":
+                    tool_message_content = (
+                        "OLD_TEXT_NOT_FOUND: "
+                        "The supplied old_text does not exactly match "
+                        "the current file.\n"
+                        "Do NOT repeat this edit.\n"
+                        "Read the affected file again and construct "
+                        "old_text directly from the current contents."
+                    )
+
+                elif result_status == "AMBIGUOUS_EDIT":
+                    tool_message_content = (
+                        "AMBIGUOUS_EDIT: "
+                        "The supplied old_text matched more than once.\n"
+                        "Do NOT repeat this edit.\n"
+                        "Read the affected file again and construct a "
+                        "more specific exact substring."
+                    )
+
+                elif result_status == "TOOL_ERROR":
+                    tool_message_content = (
+                        "TOOL_ERROR: "
+                        + str(
+                            tool_result.get(
+                                "error",
+                                tool_result.get(
+                                    "content",
+                                    "Unknown tool error.",
+                                ),
+                            )
+                        )
+                        + "\n"
+                        "Do NOT repeat the same tool call. "
+                        "Inspect the repository again and construct "
+                        "a valid tool call."
+                    )
+
+                elif result_status == "EDIT_SUCCESS":
+                    tool_message_content = (
+                        "EDIT_SUCCESS: "
+                        "The requested repository edit was applied "
+                        "successfully. "
+                        "The Validator will verify the result."
+                    )
+
+                    edit_succeeded = True
+
+                elif (
+                    tool_name == "read_file"
+                    and result_status == "OK"
+                ):
+                    tool_message_content = tool_result["content"]
+
+                else:
+                    tool_message_content = str(tool_result)
+
                 messages.append(
                     ToolMessage(
-                        content=str(tool_result),
+                        content=tool_message_content,
                         tool_call_id=tool_call["id"],
                     )
                 )
 
+                if edit_succeeded:
+                    break
+
+            if edit_succeeded:
+                break
+
+    if not edit_succeeded:
+        raise RuntimeError(
+            "Foreman failed to perform a successful repository edit "
+            f"during repair attempt {repair_attempts}/3."
+        )
+
     return {
+        "foreman_repair_attempts": repair_attempts,
         "phase": "foreman_repair_complete",
     }
 
@@ -1125,8 +1311,6 @@ def build_graph():
     graph.add_node("foreman_review", foreman_review_node)
     graph.add_node("foreman_repair", foreman_repair_node)
     graph.add_node("foreman_rebuild", foreman_rebuild_node)
-
-    graph.set_entry_point("planner")
 
     graph.set_entry_point("planner")
 
@@ -1184,6 +1368,7 @@ def run_cycle(
             "task_batches": [],
             "task_results": [],
             "worker_attempts": {},
+            "foreman_repair_attempts": 0,
             "validation_result": None,
             "foreman_review": None,
             "rework_mode": "none",

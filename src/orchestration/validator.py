@@ -45,9 +45,26 @@ def _check_python_syntax(path: str, checks: list[str], errors: list[str]) -> Non
         checks.append(f"syntax OK: {path}")
 
     except SyntaxError as exc:
-        errors.append(
-            f"syntax error in {path} (line {exc.lineno}): {exc.msg}"
-        )
+        line_number = exc.lineno
+        source_line = ""
+
+        if line_number is not None:
+            try:
+                source_line = source.splitlines()[line_number - 1].strip()
+            except IndexError:
+                source_line = ""
+
+        if source_line:
+            errors.append(
+                f"syntax error in {path} (line {line_number}): "
+                f"{exc.msg}\n"
+                f"Source: {source_line}"
+            )
+        else:
+            errors.append(
+                f"syntax error in {path} (line {line_number}): "
+                f"{exc.msg}"
+            )
 
     except Exception as exc:
         errors.append(f"unable to parse {path}: {exc}")
