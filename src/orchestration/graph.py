@@ -15,6 +15,7 @@ from .tools import (
     create_file,
     edit_file,
     read_file,
+    replace_file,
 )
 
 from .schemas import (
@@ -717,6 +718,35 @@ Return only the structured ForemanReview.
         if review.decision == "repair":
             review.rebuild_task_ids = []
 
+            # --------------------------------------------------
+            # Fallback: Granite sometimes returns decision="repair"
+            # but leaves repair_instructions empty.
+            # Convert validator errors into concrete instructions.
+            # --------------------------------------------------
+            if not review.repair_instructions:
+                review.repair_instructions = []
+
+                for error in validation.errors:
+                    if "main.py" in error:
+                        review.repair_instructions.append(
+                            "Repair main.py and replace any smart quotes (U+201C/U+201D) with normal ASCII double quotes."
+                        )
+
+                    elif "scraper.py" in error:
+                        review.repair_instructions.append(
+                            "Repair scraper.py and replace any smart quotes (U+201C/U+201D) with normal ASCII double quotes."
+                        )
+
+                    elif "processor.py" in error:
+                        review.repair_instructions.append(
+                            "Repair processor.py by correcting the malformed function structure and restoring valid Python syntax."
+                        )
+
+                if not review.repair_instructions:
+                    review.repair_instructions.append(
+                        "Repair the files identified by the validator and eliminate all reported syntax errors."
+                    )
+
         elif review.decision == "rebuild":
             if not review.rebuild_task_ids:
                 raise RuntimeError(
@@ -915,16 +945,35 @@ def foreman_rebuild_node(state: WorkflowState) -> dict:
         "phase": "task_ready",
     }
 
+
 def foreman_repair_node(state: WorkflowState) -> dict:
     """
     Allow the Foreman to directly repair a small implementation problem.
 
-    The repair is bounded and tool failures are fed back to the Foreman
-    explicitly so it can reread the current file and retry correctly.
+    The Foreman operates through the normal LangChain tool-calling protocol:
 
-    A repair attempt is considered successful only when at least one
-    edit_file operation returns EDIT_SUCCESS. Read-only iterations do not
-    terminate the repair early.
+        AIMessage
+            -> tool execution
+            -> ToolMessage(tool_call_id=...)
+            -> next AIMessage
+
+    Python owns the repair state machine and termination conditions.
+
+    A repair is considered successful only when:
+
+        1. An edit/create operation succeeds.
+        2. The affected file is reread successfully.
+        3. The verification read confirms that the repository is readable
+           after the edit.
+
+    The LLM is never given another iteration after a successful edit has
+    been deterministically verified. This prevents the model from
+    repeating an already-successful repair.
+
+    Failed edits are returned to the LLM through normal ToolMessages so
+    that the model can reread the file and construct a corrected edit.
+
+    The exact same failed edit is never executed twice.
     """
 
     review = state["foreman_review"]
@@ -945,6 +994,10 @@ def foreman_repair_node(state: WorkflowState) -> dict:
     if not state["task_batches"]:
         raise RuntimeError("No TaskBatch available for Foreman repair.")
 
+    # ------------------------------------------------------------------
+    # Repair-attempt accounting
+    # ------------------------------------------------------------------
+
     repair_attempts = state["foreman_repair_attempts"] + 1
 
     if repair_attempts > 3:
@@ -953,6 +1006,18 @@ def foreman_repair_node(state: WorkflowState) -> dict:
         )
 
     batch = state["task_batches"][0]
+
+    # ------------------------------------------------------------------
+    # Determine which files the Foreman should inspect.
+    #
+    # Include both:
+    #
+    #   1. files declared relevant by the TaskBatch
+    #   2. files actually touched by Workers
+    #
+    # This prevents the Foreman from being blind to a file that was
+    # modified even if TaskBatch metadata was incomplete.
+    # ------------------------------------------------------------------
 
     relevant_files = sorted(
         set(batch.relevant_files)
@@ -964,21 +1029,44 @@ def foreman_repair_node(state: WorkflowState) -> dict:
         }
     )
 
+    if not relevant_files:
+        raise RuntimeError(
+            "Foreman repair has no repository files available for inspection."
+        )
+
     print("\n=== FOREMAN DIRECT REPAIR ===")
     print(f"Repair attempt: {repair_attempts}/3")
+
+    # ------------------------------------------------------------------
+    # Initial repository inspection.
+    #
+    # This is deliberately performed by Python before the LLM session,
+    # exactly as the previous implementation did.
+    # ------------------------------------------------------------------
 
     repository_evidence: list[str] = []
 
     for relative_path in relevant_files:
         try:
-            result = read_file.func(path=relative_path)
+            result = read_file.invoke({"path": relative_path})
 
-            repository_evidence.append(
-                f"FILE: {relative_path}\n"
-                f"{result['content']}"
-            )
+            if (
+                isinstance(result, dict)
+                and result.get("result") == "OK"
+            ):
+                repository_evidence.append(
+                    f"FILE: {relative_path}\n"
+                    f"{result.get('content', '')}"
+                )
 
-            print(f"Inspected: {relative_path}")
+                print(f"Inspected: {relative_path}")
+
+            else:
+                repository_evidence.append(
+                    f"FILE: {relative_path}\n"
+                    f"READ_ERROR: "
+                    f"{result.get('error', result)}"
+                )
 
         except Exception as exc:
             repository_evidence.append(
@@ -988,105 +1076,216 @@ def foreman_repair_node(state: WorkflowState) -> dict:
 
     repository_context = "\n\n".join(repository_evidence)
 
-    repair_instructions = "\n".join(
-        f"- {instruction}"
-        for instruction in review.repair_instructions
-    )
+    # ------------------------------------------------------------------
+    # Repair prompt.
+    # ------------------------------------------------------------------
 
     prompt = f"""
-You are the Foreman / Integrator performing a direct repository repair.
+        You are the Foreman / Integrator performing a direct repository repair.
 
-The implementation has already been reviewed.
+        The implementation has already been reviewed.
 
-The Foreman Review determined that the problem is small enough to repair
-directly rather than sending the task back to the Worker.
+        The Foreman Review determined that the problem is small enough to repair
+        directly rather than sending the task back to the Worker.
 
-Project goal:
-{state["project_goal"]}
+        Project goal:
+        {state["project_goal"]}
 
-Architecture context:
-{state["architecture_context"]}
+        Architecture context:
+        {state["architecture_context"]}
 
-Current TaskBatch:
-{batch.model_dump_json(indent=2)}
+        Current TaskBatch:
+        {batch.model_dump_json(indent=2)}
 
-Foreman Review:
-{review.model_dump_json(indent=2)}
+        Foreman Review:
+        {review.model_dump_json(indent=2)}
 
-Current repository contents:
-{repository_context}
+        Current repository contents:
+        {repository_context}
 
-Repair instructions:
-{repair_instructions}
+        Repair instructions:
+        {chr(10).join(f"- {instruction}" for instruction in review.repair_instructions)}
 
-This is repair attempt {repair_attempts} of 3.
+        This is direct repair attempt {repair_attempts} of 3.
 
-Your job is to ACTUALLY REPAIR THE REPOSITORY.
+        Your job is to actually repair the repository using the available tools.
 
-Rules:
+        IMPORTANT RULES:
 
-1. Make ONLY the changes necessary to satisfy the repair instructions.
+        1. Make ONLY the changes necessary to satisfy the repair instructions.
 
-2. Do NOT redesign the architecture.
+        2. Do NOT redesign the architecture.
 
-3. Do NOT create a new TaskBatch.
+        3. Do NOT create a new TaskBatch.
 
-4. Do NOT send the task back to the Worker.
+        4. Do NOT send the task back to the Worker.
 
-5. Preserve all correct existing implementation.
+        5. Preserve correct existing implementation.
 
-6. The CURRENT repository contents are the source of truth.
+        6. Before editing a file, READ the current file with read_file.
 
-7. You MUST inspect the relevant file before editing it.
+        7. Never guess old_text for edit_file.
 
-8. You MUST use edit_file to apply the repair.
+        8. For edit_file, old_text MUST exactly match text currently present
+        in the file.
 
-9. Do NOT merely describe the repair in your response.
+        9. If edit_file returns OLD_TEXT_NOT_FOUND:
+        - do NOT repeat the same edit;
+        - read the file again;
+        - inspect the newly returned contents;
+        - construct a new exact edit from those contents.
 
-10. Do NOT finish the repair session after only reading files.
+        10. If edit_file returns AMBIGUOUS_EDIT:
+            - do NOT repeat the same edit;
+            - read the file again;
+            - construct a more specific exact old_text.
 
-11. A repair is complete only after edit_file returns EDIT_SUCCESS.
+        11. If a tool returns TOOL_ERROR:
+            - do NOT blindly repeat the same tool call;
+            - inspect the relevant file again;
+            - recover using the actual current repository contents.
 
-12. For edit_file:
-    - old_text MUST exactly match text currently present in the file.
-    - Never guess old_text.
-    - Copy old_text directly from the latest read_file result.
-    - Keep old_text as small and specific as practical.
-    - Do not replace a larger region when a smaller exact replacement
-      is sufficient.
+        12. If an edit succeeds, do NOT perform another edit on the same repair.
+            The repository will be verified automatically after the successful edit.
 
-13. If edit_file returns OLD_TEXT_NOT_FOUND:
-    - Do NOT repeat the same edit.
-    - Read the affected file again.
-    - Construct a new old_text from the newly returned contents.
-    - Then retry the repair.
+        13. Do not merely explain what should be changed.
+            Perform the change with the tools.
 
-14. If edit_file returns AMBIGUOUS_EDIT:
-    - Do NOT repeat the same edit.
-    - Read the affected file again.
-    - Construct a more specific old_text that matches exactly once.
-    - Then retry the repair.
+        14. If the requested repair is already present, read the relevant file and
+            report the current state. Do not manufacture an unnecessary edit.
 
-15. If a previous repair attempt changed the file, use the CURRENT file
-    contents rather than the original repository contents.
+        15. Keep the repair localized to the files identified by the review.
 
-16. Do not introduce unrelated changes.
+        16. Never repeat an identical failed edit.
 
-17. For syntax errors, make the smallest possible source-level correction.
-    Preserve the surrounding implementation.
+        17. Once the requested repair has been performed, stop calling tools.
+        """
 
-18. After a successful edit, stop making changes.
-    The Validator will verify the repaired repository.
+    # ------------------------------------------------------------------
+    # Repair session state.
+    # ------------------------------------------------------------------
 
-IMPORTANT:
+    max_iterations = 5
 
-You are not being asked to explain what should be changed.
+    # True only after a successful repository modification has been
+    # followed by a successful deterministic read.
+    repair_verified = False
 
-You are being asked to perform the change using the repository tools.
+    # Exact edit calls that have already failed.
+    failed_edit_calls: set[tuple[str, str, str]] = set()
 
-If the repository already differs from the Foreman Review's original
-description, trust the actual file contents and repair the current state.
-"""
+    # Exact edit calls that have already succeeded.
+    #
+    # Normally the session terminates immediately after verification,
+    # but this also protects against multiple edit calls appearing in
+    # the same AI response.
+    successful_edit_calls: set[tuple[str, str, str]] = set()
+
+    # ------------------------------------------------------------------
+    # Tool execution helper.
+    #
+    # This converts every repository-tool result into a ToolMessage
+    # compatible with the exact AIMessage -> ToolMessage protocol already
+    # used by _execute_task().
+    # ------------------------------------------------------------------
+
+    def _tool_message_content(
+        tool_name: str,
+        tool_result: object,
+    ) -> str:
+        if not isinstance(tool_result, dict):
+            return str(tool_result)
+
+        result_status = tool_result.get("result")
+
+        if result_status == "TOOL_ERROR":
+            return (
+                "TOOL_ERROR: "
+                + str(
+                    tool_result.get(
+                        "error",
+                        tool_result.get(
+                            "content",
+                            "Unknown tool error.",
+                        ),
+                    )
+                )
+                + "\n\n"
+                "Do not repeat the same tool call. "
+                "Inspect the current repository state and recover "
+                "using the actual file contents."
+            )
+
+        if result_status == "OLD_TEXT_NOT_FOUND":
+            return (
+                "OLD_TEXT_NOT_FOUND: "
+                "The supplied old_text does not exactly match the "
+                "current file contents.\n\n"
+                "Do NOT repeat the same edit. "
+                "Read the file again and construct old_text from "
+                "the newly returned contents."
+            )
+
+        if result_status == "AMBIGUOUS_EDIT":
+            return (
+                "AMBIGUOUS_EDIT: "
+                "The supplied old_text matched more than once in "
+                "the current file.\n\n"
+                "Do NOT repeat the same edit. "
+                "Read the file again and use a more specific exact "
+                "old_text."
+            )
+
+        elif result_status == "NO_CHANGE":
+            tool_message_content = (
+                "NO_CHANGE: The requested replacement matched, but it produced "
+                "no modification to the repository.\n\n"
+                "The file still contains the problem.\n"
+                "Read the file again and choose a different exact old_text/new_text "
+                "that actually changes the file."
+            )
+
+        if result_status == "DUPLICATE_EDIT":
+            return (
+                "DUPLICATE_EDIT: "
+                "This exact edit has already been executed successfully. "
+                "Do not repeat it. Read the file and verify the current "
+                "repository state instead."
+            )
+
+        if (
+            tool_name == "read_file"
+            and result_status == "OK"
+        ):
+            return str(tool_result.get("content", ""))
+
+        if result_status == "EDIT_SUCCESS":
+            return (
+                "EDIT_SUCCESS: "
+                "The requested edit was successfully applied."
+            )
+
+        if result_status in {
+            "CREATE_SUCCESS",
+            "OK",
+        }:
+            return str(
+                tool_result.get(
+                    "content",
+                    result_status,
+                )
+            )
+
+        return str(tool_result)
+
+    # ------------------------------------------------------------------
+    # Tool execution.
+    #
+    # IMPORTANT:
+    #
+    # We intentionally use FOREMAN_TOOL_MAP, exactly like the Worker
+    # execution path, instead of directly hard-coding each tool call.
+    # ------------------------------------------------------------------
 
     with model_session(FOREMAN_MODEL) as llm:
         repair_llm = llm.bind_tools(FOREMAN_TOOLS)
@@ -1094,39 +1293,69 @@ description, trust the actual file contents and repair the current state.
         messages = [
             SystemMessage(
                 content=(
-                    "You are the Foreman performing a direct repository repair. "
-                    "You MUST use the provided tools to make the required edit. "
-                    "Do not merely describe a solution. "
-                    "Read the current file before constructing old_text. "
-                    "Do not repeat failed edits."
+                    "You are the Foreman. "
+                    "You are responsible for directly repairing the "
+                    "repository. "
+                    "Use the provided repository tools instead of "
+                    "merely describing changes. "
+                    "Always inspect current file contents before editing. "
+                    "Never repeat a failed edit."
                 )
             ),
             HumanMessage(content=prompt),
         ]
 
-        edit_succeeded = False
-
-        for iteration in range(5):
+        for iteration in range(max_iterations):
             print(
                 f"\n=== FOREMAN REPAIR | iteration "
-                f"{iteration + 1}/5 ==="
+                f"{iteration + 1}/{max_iterations} ==="
             )
 
+            # ----------------------------------------------------------
+            # Ask Granite for the next repository action.
+            # ----------------------------------------------------------
+
             response = repair_llm.invoke(messages)
+
+            # ----------------------------------------------------------
+            # Preserve the exact AIMessage in the conversation.
+            # ----------------------------------------------------------
+
             messages.append(response)
 
+            # ----------------------------------------------------------
+            # No tool calls.
+            #
+            # If the model stops without having performed a verified
+            # edit, the repair is NOT successful.
+            #
+            # This prevents a textual "done" response from being treated
+            # as repository evidence.
+            # ----------------------------------------------------------
+
             if not response.tool_calls:
-                messages.append(
-                    HumanMessage(
-                        content=(
-                            "No repository tool was called. "
-                            "Do not finish yet. "
-                            "You must inspect the affected file and use "
-                            "edit_file to perform the required repair."
-                        )
-                    )
+                print(
+                    "*** FOREMAN REPAIR: "
+                    "LLM produced no tool calls."
                 )
-                continue
+
+                if repair_verified:
+                    break
+
+                print(
+                    "*** FOREMAN REPAIR: "
+                    "No verified repository repair exists."
+                )
+                break
+
+            # ----------------------------------------------------------
+            # Execute every requested tool call.
+            #
+            # Every executed call gets exactly one ToolMessage carrying
+            # the corresponding tool_call_id.
+            # ----------------------------------------------------------
+
+            successful_edit_path: str | None = None
 
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
@@ -1137,145 +1366,336 @@ description, trust the actual file contents and repair the current state.
                     f"{tool_name}({tool_args}) ***"
                 )
 
-                if tool_name == "read_file":
-                    try:
-                        tool_result = read_file.func(**tool_args)
-                    except Exception as exc:
-                        tool_result = {
-                            "tool": "read_file",
-                            "path": tool_args.get("path"),
-                            "result": "TOOL_ERROR",
-                            "error": (
-                                f"{type(exc).__name__}: {exc}"
-                            ),
-                        }
+                # ------------------------------------------------------
+                # Authorization.
+                # ------------------------------------------------------
 
-                elif tool_name == "edit_file":
-                    try:
-                        tool_result = edit_file.func(**tool_args)
-                    except Exception as exc:
-                        tool_result = {
-                            "tool": "edit_file",
-                            "path": tool_args.get("path"),
-                            "result": "TOOL_ERROR",
-                            "error": (
-                                f"{type(exc).__name__}: {exc}"
-                            ),
-                        }
-
-                elif tool_name == "create_file":
-                    try:
-                        tool_result = create_file.func(**tool_args)
-                    except Exception as exc:
-                        tool_result = {
-                            "tool": "create_file",
-                            "path": tool_args.get("path"),
-                            "result": "TOOL_ERROR",
-                            "error": (
-                                f"{type(exc).__name__}: {exc}"
-                            ),
-                        }
-
-                else:
+                if tool_name not in FOREMAN_TOOL_MAP:
                     tool_result = {
                         "tool": tool_name,
                         "path": tool_args.get("path"),
                         "result": "TOOL_ERROR",
-                        "error": (
-                            f"Foreman repair attempted unsupported tool: "
+                        "content": (
+                            "Unauthorized Foreman repair tool: "
                             f"{tool_name}"
                         ),
                     }
 
-                if not isinstance(tool_result, dict):
-                    tool_result = {
-                        "tool": tool_name,
-                        "path": tool_args.get("path"),
-                        "result": "TOOL_ERROR",
-                        "error": str(tool_result),
-                    }
+                # ------------------------------------------------------
+                # EDIT FILE.
+                # ------------------------------------------------------
 
-                result_status = tool_result.get("result")
+                elif tool_name == "edit_file":
+                    path = str(tool_args.get("path", ""))
+                    old_text = str(tool_args.get("old_text", ""))
+                    new_text = str(tool_args.get("new_text", ""))
 
-                if result_status == "OLD_TEXT_NOT_FOUND":
-                    tool_message_content = (
-                        "OLD_TEXT_NOT_FOUND: "
-                        "The supplied old_text does not exactly match "
-                        "the current file.\n"
-                        "Do NOT repeat this edit.\n"
-                        "Read the affected file again and construct "
-                        "old_text directly from the current contents."
+                    edit_signature = (
+                        path,
+                        old_text,
+                        new_text,
                     )
 
-                elif result_status == "AMBIGUOUS_EDIT":
-                    tool_message_content = (
-                        "AMBIGUOUS_EDIT: "
-                        "The supplied old_text matched more than once.\n"
-                        "Do NOT repeat this edit.\n"
-                        "Read the affected file again and construct a "
-                        "more specific exact substring."
-                    )
+                    # ----------------------------------------------
+                    # Prevent repeating an edit that already succeeded.
+                    # ----------------------------------------------
 
-                elif result_status == "TOOL_ERROR":
-                    tool_message_content = (
-                        "TOOL_ERROR: "
-                        + str(
-                            tool_result.get(
-                                "error",
-                                tool_result.get(
-                                    "content",
-                                    "Unknown tool error.",
-                                ),
+                    if edit_signature in successful_edit_calls:
+                        tool_result = {
+                            "tool": "edit_file",
+                            "path": path,
+                            "result": "DUPLICATE_EDIT",
+                            "content": (
+                                "This exact edit already succeeded."
+                            ),
+                        }
+
+                    # ----------------------------------------------
+                    # Prevent repeating an edit that already failed.
+                    # ----------------------------------------------
+
+                    elif edit_signature in failed_edit_calls:
+                        tool_result = {
+                            "tool": "edit_file",
+                            "path": path,
+                            "result": "TOOL_ERROR",
+                            "content": (
+                                "This exact edit already failed during "
+                                "the current repair. "
+                                "Read the file again before attempting "
+                                "a different edit."
+                            ),
+                        }
+
+                    else:
+                        try:
+                            tool_result = FOREMAN_TOOL_MAP[
+                                tool_name
+                            ].func(
+                                **tool_args
                             )
+
+                        except Exception as exc:
+                            tool_result = {
+                                "tool": tool_name,
+                                "path": path,
+                                "result": "TOOL_ERROR",
+                                "content": (
+                                    f"{type(exc).__name__}: {exc}"
+                                ),
+                            }
+
+                    # ----------------------------------------------
+                    # Record edit outcome.
+                    # ----------------------------------------------
+
+                    if isinstance(tool_result, dict):
+                        result_status = tool_result.get("result")
+                    else:
+                        result_status = None
+
+                    if result_status == "EDIT_SUCCESS":
+                        successful_edit_calls.add(edit_signature)
+
+                        successful_edit_path = path
+
+                    elif result_status in {
+                        "OLD_TEXT_NOT_FOUND",
+                        "AMBIGUOUS_EDIT",
+                        "NO_CHANGE",
+                        "TOOL_ERROR",
+                    }:
+                        failed_edit_calls.add(edit_signature)
+
+                # ------------------------------------------------------
+                # CREATE FILE.
+                # ------------------------------------------------------
+
+                elif tool_name == "create_file":
+                    path = str(tool_args.get("path", ""))
+
+                    try:
+                        tool_result = FOREMAN_TOOL_MAP[
+                            tool_name
+                        ].func(
+                            **tool_args
                         )
-                        + "\n"
-                        "Do NOT repeat the same tool call. "
-                        "Inspect the repository again and construct "
-                        "a valid tool call."
-                    )
 
-                elif result_status == "EDIT_SUCCESS":
-                    tool_message_content = (
-                        "EDIT_SUCCESS: "
-                        "The requested repository edit was applied "
-                        "successfully. "
-                        "The Validator will verify the result."
-                    )
+                    except Exception as exc:
+                        tool_result = {
+                            "tool": tool_name,
+                            "path": path,
+                            "result": "TOOL_ERROR",
+                            "content": (
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
 
-                    edit_succeeded = True
+                    if isinstance(tool_result, dict):
+                        if tool_result.get("result") in {
+                            "CREATE_SUCCESS",
+                            "EDIT_SUCCESS",
+                        }:
+                            successful_edit_path = path
 
-                elif (
-                    tool_name == "read_file"
-                    and result_status == "OK"
-                ):
-                    tool_message_content = tool_result["content"]
+                # ------------------------------------------------------
+                # REPLACE FILE.
+                # ------------------------------------------------------
+
+                elif tool_name == "replace_file":
+                    path = str(tool_args.get("path", ""))
+                    content = str(tool_args.get("content", ""))
+
+                    try:
+                        tool_result = FOREMAN_TOOL_MAP[
+                            tool_name
+                        ].func(
+                            **tool_args
+                        )
+
+                    except Exception as exc:
+                        tool_result = {
+                            "tool": "replace_file",
+                            "path": path,
+                            "result": "TOOL_ERROR",
+                            "content": (
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
+
+                    if isinstance(tool_result, dict):
+                        result_status = tool_result.get("result")
+                    else:
+                        result_status = None
+
+                    if result_status == "EDIT_SUCCESS":
+                        successful_edit_path = path
+
+            
+                # ------------------------------------------------------
+                # READ FILE.
+                # ------------------------------------------------------
 
                 else:
-                    tool_message_content = str(tool_result)
+                    try:
+                        tool_result = FOREMAN_TOOL_MAP[
+                            tool_name
+                        ].func(
+                            **tool_args
+                        )
+
+                    except Exception as exc:
+                        tool_result = {
+                            "tool": tool_name,
+                            "path": tool_args.get("path"),
+                            "result": "TOOL_ERROR",
+                            "content": (
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
+
+                # ------------------------------------------------------
+                # Print tool result.
+                # ------------------------------------------------------
+
+                print(
+                    f"*** TOOL RESULT: "
+                    f"{tool_result} ***"
+                )
+
+                # ------------------------------------------------------
+                # Append EXACTLY ONE ToolMessage for this tool call.
+                #
+                # This is the same protocol already used by the Worker.
+                # ------------------------------------------------------
 
                 messages.append(
                     ToolMessage(
-                        content=tool_message_content,
+                        content=_tool_message_content(
+                            tool_name,
+                            tool_result,
+                        ),
                         tool_call_id=tool_call["id"],
                     )
                 )
 
-                if edit_succeeded:
+                # ------------------------------------------------------
+                # If an edit succeeded, we do not execute additional
+                # model-requested modifications from the same response.
+                #
+                # The successful edit is enough to trigger deterministic
+                # verification immediately below.
+                #
+                # Any remaining tool calls in the AI response are ignored
+                # because continuing to modify the repository after a
+                # successful repair would violate the "small localized
+                # repair" contract.
+                # ------------------------------------------------------
+
+                if successful_edit_path is not None:
                     break
 
-            if edit_succeeded:
-                break
+            # ----------------------------------------------------------
+            # Deterministic verification after successful modification.
+            #
+            # This read is controlled by Python, not requested by Granite.
+            #
+            # IMPORTANT:
+            #
+            # It is NOT inserted into messages because there is no
+            # corresponding AI tool_call for it. The LLM does not need
+            # another turn after successful verification.
+            # ----------------------------------------------------------
 
-    if not edit_succeeded:
+            if successful_edit_path is not None:
+                path = successful_edit_path
+
+                print(
+                    f"*** FOREMAN REPAIR VERIFY: "
+                    f"read_file({path}) ***"
+                )
+
+                try:
+                    verification_result = read_file.invoke(
+                        {"path": path}
+                    )
+
+                except Exception as exc:
+                    verification_result = {
+                        "result": "TOOL_ERROR",
+                        "error": (
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    }
+
+                print(
+                    f"*** FOREMAN REPAIR VERIFY RESULT: "
+                    f"{verification_result} ***"
+                )
+
+                if (
+                    isinstance(verification_result, dict)
+                    and verification_result.get("result") == "OK"
+                ):
+                    repair_verified = True
+
+                    print(
+                        "*** FOREMAN REPAIR: "
+                        "Successful edit verified."
+                    )
+
+                    # --------------------------------------------------
+                    # CRITICAL:
+                    #
+                    # Stop the LLM session immediately.
+                    #
+                    # This prevents the exact Cycle 2 failure:
+                    #
+                    #   edit
+                    #   -> read
+                    #   -> edit same thing again
+                    #
+                    # The model never receives another invocation after
+                    # a successful verified repair.
+                    # --------------------------------------------------
+
+                    break
+
+                print(
+                    "*** FOREMAN REPAIR: "
+                    "Edit succeeded but verification failed."
+                )
+
+                # ------------------------------------------------------
+                # Verification failure is NOT success.
+                #
+                # The LLM may receive another turn and inspect the file.
+                # The original successful edit ToolMessage is already in
+                # the conversation, so the tool-call protocol remains
+                # valid.
+                # ------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Final validation.
+    # ------------------------------------------------------------------
+
+    if not repair_verified:
         raise RuntimeError(
-            "Foreman failed to perform a successful repository edit "
-            f"during repair attempt {repair_attempts}/3."
+            "Foreman failed to perform and verify a successful "
+            f"repository edit during repair attempt "
+            f"{repair_attempts}/3."
         )
+
+    print("\n=== FOREMAN REPAIR COMPLETE ===")
+    print(
+        f"Repair attempt {repair_attempts}/3 completed successfully."
+    )
 
     return {
         "foreman_repair_attempts": repair_attempts,
         "phase": "foreman_repair_complete",
     }
+
 
 def route_after_foreman_review(state: WorkflowState) -> str:
     review = state["foreman_review"]
