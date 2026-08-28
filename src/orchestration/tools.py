@@ -121,23 +121,106 @@ def edit_file(
     new_text: str,
 ) -> dict:
     """
-    Apply one narrowly scoped edit to an existing file.
+    Apply one deterministic edit to an existing file.
 
-    Available to both the Foreman and Worker.
+    Modes
+    -----
+    1. Initial implementation:
+       - Target file is empty/whitespace only.
+       - Entire file becomes new_text.
 
-    The target file must already exist.
+    2. Replacement:
+       - old_text must exist exactly once.
+       - Exactly one occurrence is replaced.
 
-    Modes:
+    Safety
+    ------
+    - Never reports success if nothing actually changed.
+    - Rejects ambiguous matches.
+    - Leaves the file untouched on failure.
 
-    1. Replacement mode
-       - old_text must occur exactly once.
-       - That occurrence is replaced by new_text.
+    If the file is structurally broken (indentation, malformed docstrings,
+    merged lines, multiple syntax errors, or old_text cannot be matched
+    reliably), use replace_file to rewrite the complete corrected file.
+    Always read the file first before replacing it.
+    """
 
-    2. Initial implementation mode
-       - If the file is empty, old_text must be "".
-       - The file is initialized with new_text.
+    target = _safe_path(path)
 
-    Any ambiguous or invalid edit leaves the file unchanged.
+    if not target.is_file():
+        raise FileNotFoundError(f"File does not exist: {path}")
+
+    print(f"\n*** TOOL: edit_file({path}) ***")
+
+    content = target.read_text(encoding="utf-8")
+
+    # --------------------------------------------------------
+    # Initial implementation mode
+    # --------------------------------------------------------
+    if content.strip() == "":
+        if content == new_text:
+            return {
+                "tool": "edit_file",
+                "path": path,
+                "result": "NO_CHANGE",
+            }
+
+        target.write_text(new_text, encoding="utf-8")
+
+        return {
+            "tool": "edit_file",
+            "path": path,
+            "result": "EDIT_SUCCESS",
+        }
+
+    # --------------------------------------------------------
+    # Replacement mode
+    # --------------------------------------------------------
+    if old_text not in content:
+        return {
+            "tool": "edit_file",
+            "path": path,
+            "result": "OLD_TEXT_NOT_FOUND",
+        }
+
+    if content.count(old_text) > 1:
+        return {
+            "tool": "edit_file",
+            "path": path,
+            "result": "AMBIGUOUS_EDIT",
+        }
+
+    updated = content.replace(old_text, new_text, 1)
+
+    # -------- CRITICAL FIX --------
+    # Replacement matched but produced identical content.
+    if updated == content:
+        return {
+            "tool": "edit_file",
+            "path": path,
+            "result": "NO_CHANGE",
+        }
+
+    target.write_text(updated, encoding="utf-8")
+
+    return {
+        "tool": "edit_file",
+        "path": path,
+        "result": "EDIT_SUCCESS",
+    }
+
+
+@tool
+def replace_file(
+    path: str,
+    content: str,
+) -> dict:
+    """
+    Replace the entire contents of an existing file.
+
+    Use this only after reading the current file.
+    It is intended for repairing malformed files where a
+    precise substring replacement is unreliable.
     """
 
     target = _safe_path(path)
@@ -147,68 +230,27 @@ def edit_file(
             f"File does not exist: {path}"
         )
 
-    print(
-        f"\n*** TOOL: edit_file({path}) ***"
-    )
+    print(f"\n*** TOOL: replace_file({path}) ***")
 
-    content = target.read_text(
-        encoding="utf-8"
-    )
+    current = target.read_text(encoding="utf-8")
 
-    # --------------------------------------------------------
-    # Initial implementation mode
-    # --------------------------------------------------------
-    # --------------------------------------------------------
-    # Initial implementation mode
-    # --------------------------------------------------------
-    # Treat an empty or whitespace-only file as blank.
-    if content.strip() == "":
-        target.write_text(
-            new_text,
-            encoding="utf-8",
-        )
-
+    if current == content:
         return {
-            "tool": "edit_file",
+            "tool": "replace_file",
             "path": path,
-            "result": "EDIT_SUCCESS",
+            "result": "NO_CHANGE",
         }
-
-    # --------------------------------------------------------
-    # Normal replacement mode
-    # --------------------------------------------------------
-    if old_text not in content:
-        return {
-            "tool": "edit_file",
-            "path": path,
-            "result": "OLD_TEXT_NOT_FOUND",
-        }
-
-    occurrences = content.count(old_text)
-
-    if occurrences > 1:
-        return {
-        "tool": "edit_file",
-        "path": path,
-        "result": "AMBIGUOUS_EDIT",
-    }
-    updated = content.replace(
-        old_text,
-        new_text,
-        1,
-    )
 
     target.write_text(
-        updated,
+        content,
         encoding="utf-8",
     )
 
     return {
-        "tool": "edit_file",
+        "tool": "replace_file",
         "path": path,
         "result": "EDIT_SUCCESS",
     }
-
 
 # ------------------------------------------------------------
 # Tool access by orchestration layer
@@ -230,6 +272,7 @@ FOREMAN_TOOLS = [
     read_file,
     create_file,
     edit_file,
+    replace_file,
 ]
 
 
