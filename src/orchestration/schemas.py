@@ -59,14 +59,12 @@ class WorkerProfile(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Foreman task
+# Task
 # ---------------------------------------------------------------------------
 
 class Task(BaseModel):
     """
-    A concrete executable task produced by the Foreman.
-
-    Tasks are intentionally small and suitable for a limited-context Worker.
+    Concrete implementation task assigned to the Worker harness.
     """
 
     task_id: str = Field(
@@ -78,11 +76,11 @@ class Task(BaseModel):
     )
 
     scope: str = Field(
-        description="Explicit boundaries of what the Worker may modify."
+        description="Explicit boundaries of what may be modified."
     )
 
     relevant_files: list[str] = Field(
-        description="Existing files the Worker may inspect or edit."
+        description="Files relevant to the task."
     )
 
     dependencies: list[str] = Field(
@@ -98,8 +96,6 @@ class Task(BaseModel):
         description="Concrete completion conditions."
     )
 
-    
-
 
 # ---------------------------------------------------------------------------
 # Task batching
@@ -107,11 +103,11 @@ class Task(BaseModel):
 
 class TaskBatch(BaseModel):
     """
-    Group of related tasks executed during one Worker model session.
+    Group of related tasks executed during one Worker harness session.
     """
 
     batch_id: str = Field(
-        description="Unique batch identifier."
+        description="Unique identifier for the batch."
     )
 
     objective: str = Field(
@@ -119,7 +115,7 @@ class TaskBatch(BaseModel):
     )
 
     tasks: list[Task] = Field(
-        description="Tasks included in this batch."
+        description="Tasks included in the batch."
     )
 
     shared_context: list[str] = Field(
@@ -143,36 +139,14 @@ class TaskBatch(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Worker execution result
+# Worker / harness execution result
 # ---------------------------------------------------------------------------
-
-class ToolAction(BaseModel):
-    """
-    One observed filesystem tool invocation.
-
-    This is evidence collected by the orchestration layer,
-    not something the Worker invents.
-    """
-
-    tool: str = Field(
-        description="Tool name (read_file, edit_file, ...)."
-    )
-
-    path: str | None = Field(
-        default=None,
-        description="Workspace path operated on, if applicable."
-    )
-
-    result: str = Field(
-        description="Observed tool outcome (OK, EDIT_SUCCESS, TOOL_ERROR, ...)."
-    )
 
 class TaskResult(BaseModel):
     """
-    Compact factual record of one completed task.
+    Compact result returned by the coding harness after task execution.
 
-    Unlike Alpha01v1, this stores observed tool evidence instead of
-    Worker-claimed actions.
+    The orchestration layer does not store individual tool calls.
     """
 
     task_id: str = Field(
@@ -183,31 +157,42 @@ class TaskResult(BaseModel):
         description="completed | partial | failure"
     )
 
-    tool_actions: list[ToolAction] = Field(
-        default_factory=list,
-        description="Observed filesystem tool invocations."
+    summary: str = Field(
+        description="Concise summary of what was accomplished."
     )
 
     files_changed: list[str] = Field(
         default_factory=list,
-        description="Files successfully modified."
-    )
-
-    validation: list[str] = Field(
-        default_factory=list,
-        description="Checks performed by the orchestration layer."
+        description="Files modified by the harness."
     )
 
     errors: list[str] = Field(
         default_factory=list,
-        description="Observed execution errors."
+        description="Execution or validation errors."
     )
 
-class ForemanReview(BaseModel):
-    """Implementation-level review and repair decision produced by the Foreman."""
 
-    accepted: bool = Field(
-        description="Whether the current implementation is acceptable."
+# ---------------------------------------------------------------------------
+# Foreman review
+# ---------------------------------------------------------------------------
+
+class ForemanReview(BaseModel):
+    """
+    Review and integration decision produced by the Foreman.
+
+    approve:
+        Current implementation is acceptable.
+
+    integrate:
+        Implementation is fundamentally correct but requires a small,
+        targeted Foreman fix.
+
+    repair:
+        Implementation requires substantive Worker rework.
+    """
+
+    decision: str = Field(
+        description="approve | integrate | repair"
     )
 
     reviewed_task_ids: list[str] = Field(
@@ -219,27 +204,14 @@ class ForemanReview(BaseModel):
         description="Concrete implementation issues identified."
     )
 
-    decision: str = Field(
-        description=(
-            "Action to take after review: "
-            "accept, repair, or rebuild."
-        )
+    integration_instructions: list[str] = Field(
+        default_factory=list,
+        description="Precise instructions for targeted Foreman fixes."
     )
 
     repair_instructions: list[str] = Field(
         default_factory=list,
-        description=(
-            "Precise instructions for the Foreman when performing a "
-            "direct repair or preparing a rebuilt task."
-        )
-    )
-
-    rebuild_task_ids: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Task IDs that must be rebuilt and sent back to the Worker. "
-            "Empty when no Worker rework is required."
-        )
+        description="Instructions for substantive Worker rework."
     )
 
     summary: str = Field(
@@ -256,7 +228,7 @@ class CycleResult(BaseModel):
     Compact orchestration record persisted into the next cycle.
 
     The repository remains the source of truth for code.
-    This object preserves only execution decisions and outcomes.
+    This object preserves execution decisions and outcomes.
     """
 
     cycle_id: int = Field(
@@ -268,16 +240,17 @@ class CycleResult(BaseModel):
     )
 
     task_batches: list[TaskBatch] = Field(
-        description="Batches produced by the Foreman."
+        description="Batches produced for Worker execution."
     )
 
     task_results: list[TaskResult] = Field(
-        description="Worker execution results."
+        description="Coding harness execution results."
     )
 
     outcome: str = Field(
         description="overall_success | partial | failure"
     )
+
 
 # ---------------------------------------------------------------------------
 # Validator
@@ -285,11 +258,10 @@ class CycleResult(BaseModel):
 
 class ValidationResult(BaseModel):
     """
-    Deterministic validation produced by the Validator node.
+    Deterministic validation produced by the Validator.
 
     This model contains only objective facts gathered from repository
-    inspection (syntax, file existence, scope compliance, etc.).
-    No LLM reasoning or subjective review belongs here.
+    inspection. No LLM reasoning or subjective review belongs here.
     """
 
     passed: bool = Field(
@@ -313,5 +285,5 @@ class ValidationResult(BaseModel):
 
     changed_files: list[str] = Field(
         default_factory=list,
-        description="Files modified by the Worker during this batch."
+        description="Files modified during the batch."
     )
