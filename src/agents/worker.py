@@ -1,9 +1,12 @@
-class WorkerAgent:
-    """Granite 3B implementation agent."""
+from src.harnesses.base import CodingHarness
+from src.orchestration.schemas import TaskBatch, TaskResult
 
-    def __init__(self, model, harness):
-        self.model = model
+
+class WorkerAgent:
+    """Implementation agent executed through a coding harness."""
+
+    def __init__(self, harness: CodingHarness):
         self.harness = harness
 
-    def execute(self, task):
-        raise NotImplementedError
+    def run(self, batch: TaskBatch) -> list[TaskResult]:
+        return self.harness.execute(batch)

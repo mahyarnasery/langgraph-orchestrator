@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Any
+
+from src.orchestration.schemas import TaskBatch, TaskResult
 
 
 class CodingHarness(ABC):
-    """Interface for a coding-agent execution harness."""
+    """Execution boundary for coding agents."""
 
     @abstractmethod
-    def execute(self, task: Any) -> Any:
-        """Execute a coding task and return the result."""
+    def execute(self, batch: TaskBatch) -> list[TaskResult]:
+        """Execute a TaskBatch and return observed task results."""
         raise NotImplementedError

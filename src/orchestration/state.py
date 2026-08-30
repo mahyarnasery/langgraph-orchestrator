@@ -2,54 +2,29 @@ from typing import TypedDict
 
 from .schemas import (
     CycleResult,
-    ForemanReview,
     Plan,
-    Task,
     TaskBatch,
     TaskResult,
     WorkerProfile,
     ValidationResult,
+    ForemanReview,
 )
 
 
 class WorkflowState(TypedDict):
-    """
-    Compact shared orchestration state.
+    """State owned and transitioned by the LangGraph workflow."""
 
-    Planner receives:
-        - project_goal
-        - architecture_context
-        - worker_profile
-        - previous_cycle
-
-    Foreman additionally receives:
-        - current plan
-
-    Worker receives only:
-        - current TaskBatch
-    """
-
-    # Persistent project context
     project_goal: str
     architecture_context: str
-
-    # Static execution profile
     worker_profile: WorkerProfile
 
-    # Previous-cycle memory (None during Cycle 1)
     previous_cycle: CycleResult | None
 
-    # Current cycle
     plan: Plan | None
-    task_batches: list[TaskBatch]
+    task_batch: TaskBatch | None
     task_results: list[TaskResult]
-    worker_attempts: dict[str, int]
-
-    foreman_repair_attempts: int
 
     validation_result: ValidationResult | None
     foreman_review: ForemanReview | None
-    rework_mode: str
 
-    # Runtime phase marker
-    phase: str
+    outcome: str
