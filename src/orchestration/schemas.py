@@ -1,5 +1,7 @@
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
 from typing import Literal
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +25,28 @@ class Plan(BaseModel):
 
     acceptance_criteria: list[str] = Field(
         description="Conditions that must be satisfied for the work to be considered complete."
+    )
+
+
+class PlannerReview(BaseModel):
+    """Final acceptance review produced by the Planner."""
+
+    accepted: bool = Field(
+        description="True if the integrated solution fully satisfies the original blueprint and goal."
+    )
+
+    criteria_evaluation: list[str] = Field(
+        default_factory=list,
+        description="Evaluation against each acceptance criterion."
+    )
+
+    feedback: list[str] = Field(
+        default_factory=list,
+        description="Constructive architectural feedback or missing elements."
+    )
+
+    summary: str = Field(
+        description="Concise summary of final assessment."
     )
 
 
@@ -174,15 +198,43 @@ class TaskResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Foreman review
+# Foreman review & self-repair
 # ---------------------------------------------------------------------------
+
+class DirectRepairPatch(BaseModel):
+    """Specific localized file fix performed directly by Foreman."""
+
+    path: str = Field(
+        description="Workspace relative file path to patch."
+    )
+
+    action: Literal["overwrite", "edit"] = Field(
+        default="overwrite",
+        description="overwrite entire content or replace target text."
+    )
+
+    content: str = Field(
+        default="",
+        description="Full content to write if action is overwrite."
+    )
+
+    target_text: str = Field(
+        default="",
+        description="Existing text snippet to replace if action is edit."
+    )
+
+    replacement_text: str = Field(
+        default="",
+        description="Replacement text snippet if action is edit."
+    )
+
 
 class ForemanReview(BaseModel):
     """
     Review and integration decision produced by the Foreman.
     """
 
-    decision: str = Field(
+    decision: Literal["accept", "repair", "rebuild"] = Field(
         description="accept | repair | rebuild"
     )
 
@@ -203,6 +255,11 @@ class ForemanReview(BaseModel):
     repair_instructions: list[str] = Field(
         default_factory=list,
         description="Precise instructions for repairing or rebuilding the implementation."
+    )
+
+    direct_repairs: list[DirectRepairPatch] = Field(
+        default_factory=list,
+        description="Concrete patches if Foreman decides to repair directly."
     )
 
     rebuild_task_ids: list[str] = Field(
@@ -241,6 +298,11 @@ class CycleResult(BaseModel):
 
     task_results: list[TaskResult] = Field(
         description="Coding harness execution results."
+    )
+
+    planner_review: PlannerReview | None = Field(
+        default=None,
+        description="Planner final review result."
     )
 
     outcome: str = Field(

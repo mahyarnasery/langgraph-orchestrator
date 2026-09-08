@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from langgraph.graph import END, StateGraph
 
 from src.agents.foreman import ForemanAgent
@@ -10,6 +12,7 @@ from .schemas import (
     CycleResult,
     ForemanReview,
     Plan,
+    PlannerReview,
     TaskBatch,
     TaskResult,
     ValidationResult,
@@ -18,10 +21,9 @@ from .schemas import (
 from .state import WorkflowState
 from .validator import validate_batch
 
-from pathlib import Path
-
 REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
 WORKER_WORKSPACE = (REPO_ROOT / "sandbox").resolve()
+MAX_FOREMAN_REPAIRS = 2
 
 
 def _sandbox_repo_path(path: str) -> str:
@@ -29,13 +31,42 @@ def _sandbox_repo_path(path: str) -> str:
     Convert a logical TaskBatch path into its physical repository path
     inside the Worker sandbox.
     """
-
     normalized = path.removeprefix("sandbox/")
 
     if normalized in ("", ".", ".."):
         raise ValueError(f"Invalid Worker path: {path}")
 
     return f"sandbox/{normalized}"
+
+
+def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult]) -> str:
+    """Inspect the sandbox repository files and construct textual evidence."""
+    from .tools import read_file
+
+    relevant_files = sorted(
+        set(batch.relevant_files)
+        | {
+            file_path
+            for result in task_results
+            for file_path in result.files_changed
+        }
+    )
+
+    repository_evidence: list[str] = []
+
+    for path in relevant_files:
+        physical_path = _sandbox_repo_path(path)
+        try:
+            result = read_file.func(path=physical_path)
+            repository_evidence.append(
+                f"FILE: {path}\n{result.get('content', '')}"
+            )
+        except Exception as exc:
+            repository_evidence.append(
+                f"FILE: {path}\nREAD_ERROR: {type(exc).__name__}: {exc}"
+            )
+
+    return "\n\n".join(repository_evidence)
 
 
 # ============================================================================
@@ -56,7 +87,7 @@ def build_worker() -> AiderHarness:
 
 
 # ============================================================================
-# Planner
+# Planner — Blueprinting
 # ============================================================================
 
 
@@ -85,7 +116,7 @@ def planner_node(state: WorkflowState) -> dict:
 
 
 # ============================================================================
-# Foreman — task decomposition
+# Foreman — Task decomposition & preparation
 # ============================================================================
 
 
@@ -112,8 +143,6 @@ def foreman_node(state: WorkflowState) -> dict:
             "ForemanAgent.create_batch() must return TaskBatch."
         )
 
-    # TaskBatch.relevant_files must be the complete union of
-    # task-level relevant_files.
     batch.relevant_files = sorted(
         {
             path
@@ -124,13 +153,6 @@ def foreman_node(state: WorkflowState) -> dict:
 
     print("\n=== FOREMAN RESULT ===")
     print(batch.model_dump_json(indent=2))
-
-    # ------------------------------------------------------------------
-    # Repository preparation
-    #
-    # The Foreman prepares the repository before Worker execution.
-    # Workers edit existing files only.
-    # ------------------------------------------------------------------
 
     from .tools import create_file, read_file
 
@@ -145,7 +167,6 @@ def foreman_node(state: WorkflowState) -> dict:
         try:
             read_file.func(path=physical_path)
             print(f"{physical_path} already exists")
-
         except FileNotFoundError:
             create_file.func(
                 path=physical_path,
@@ -160,7 +181,7 @@ def foreman_node(state: WorkflowState) -> dict:
 
 
 # ============================================================================
-# Worker / coding harness
+# Worker
 # ============================================================================
 
 
@@ -170,8 +191,7 @@ def worker_node(state: WorkflowState) -> dict:
             "No TaskBatch received."
         )
 
-    batch = state["task_batches"][0]
-
+    batch = state["task_batches"][-1]
     worker = build_worker()
 
     print("\n=== WORKER SESSION START ===")
@@ -193,11 +213,8 @@ def worker_node(state: WorkflowState) -> dict:
     print("\n=== WORKER SESSION COMPLETE ===")
 
     attempts = dict(state["worker_attempts"])
-
     for result in results:
-        attempts[result.task_id] = (
-            attempts.get(result.task_id, 0) + 1
-        )
+        attempts[result.task_id] = attempts.get(result.task_id, 0) + 1
 
     return {
         "task_results": results,
@@ -217,8 +234,9 @@ def validator_node(state: WorkflowState) -> dict:
             "No TaskBatch available for validation."
         )
 
+    batch = state["task_batches"][-1]
     validation = validate_batch(
-        batch=state["task_batches"][0],
+        batch=batch,
         task_results=state["task_results"],
     )
 
@@ -237,89 +255,28 @@ def validator_node(state: WorkflowState) -> dict:
 
 
 # ============================================================================
-# Foreman — implementation review
+# Foreman — Review & Self-Repair
 # ============================================================================
 
 
 def foreman_review_node(state: WorkflowState) -> dict:
     if not state["task_batches"]:
-        raise RuntimeError(
-            "No TaskBatch available for Foreman review."
-        )
-
+        raise RuntimeError("No TaskBatch available for Foreman review.")
     if not state["task_results"]:
-        raise RuntimeError(
-            "No TaskResults available for Foreman review."
-        )
+        raise RuntimeError("No TaskResults available for Foreman review.")
 
     validation = state["validation_result"]
-
     if validation is None:
-        raise RuntimeError(
-            "ValidationResult missing before Foreman review."
-        )
+        raise RuntimeError("ValidationResult missing before Foreman review.")
 
     plan = state["plan"]
-
     if plan is None:
-        raise RuntimeError(
-            "Planner output missing before Foreman review."
-        )
+        raise RuntimeError("Planner output missing before Foreman review.")
 
-    batch = state["task_batches"][0]
-
-    # Repository inspection is deterministic and remains outside the
-    # ForemanAgent. The agent receives the resulting evidence.
-    #
-    # Files are gathered from:
-    #   1. files declared relevant by the Foreman
-    #   2. files actually reported as changed by the harness
-    #
-    # The harness does not expose Aider's internal tool calls.
-    relevant_files = sorted(
-        set(batch.relevant_files)
-        | {
-            file_path
-            for result in state["task_results"]
-            for file_path in result.files_changed
-        }
-    )
-
-    repository_evidence: list[str] = []
-
-    # Import here so graph.py owns orchestration-time repository
-    # inspection without making the agent responsible for it.
-    from .tools import read_file
-
-    for path in relevant_files:
-        physical_path = _sandbox_repo_path(path)
-
-        try:
-            result = read_file.func(path=physical_path)
-
-            repository_evidence.append(
-                f"FILE: {path}\n"
-                f"{result.get('content', '')}"
-            )
-
-        except Exception as exc:
-            repository_evidence.append(
-                f"FILE: {path}\n"
-                f"READ_ERROR: {type(exc).__name__}: {exc}"
-            )
-
-        except Exception as exc:
-            repository_evidence.append(
-                f"FILE: {path}\n"
-                f"READ_ERROR: {type(exc).__name__}: {exc}"
-            )
-
-    repository_context = "\n\n".join(
-        repository_evidence
-    )
+    batch = state["task_batches"][-1]
+    repository_context = _gather_repository_context(batch, state["task_results"])
 
     foreman = build_foreman()
-
     review = foreman.review(
         project_goal=state["project_goal"],
         architecture_context=state["architecture_context"],
@@ -332,62 +289,100 @@ def foreman_review_node(state: WorkflowState) -> dict:
     )
 
     if not isinstance(review, ForemanReview):
-        raise TypeError(
-            "ForemanAgent.review() must return ForemanReview."
-        )
-
-    if review.decision not in {
-        "accept",
-        "repair",
-        "rebuild",
-    }:
-        raise RuntimeError(
-            f"Invalid Foreman review decision: "
-            f"{review.decision}"
-        )
-
-    if review.decision == "accept":
-        review.accepted = True
-        review.problems = []
-        review.repair_instructions = []
-        review.rebuild_task_ids = []
-
-    elif review.decision == "repair":
-        review.accepted = False
-
-        if review.rebuild_task_ids:
-            raise RuntimeError(
-                "Foreman returned rebuild_task_ids for a repair decision."
-            )
-
-        if not review.repair_instructions:
-            raise RuntimeError(
-                "Foreman selected repair without repair_instructions."
-            )
-
-    elif review.decision == "rebuild":
-        review.accepted = False
-
-        if not review.rebuild_task_ids:
-            raise RuntimeError(
-                "Foreman selected rebuild without rebuild_task_ids."
-            )
-
-        if not review.repair_instructions:
-            raise RuntimeError(
-                "Foreman selected rebuild without repair_instructions."
-            )
+        raise TypeError("ForemanAgent.review() must return ForemanReview.")
 
     print("\n=== FOREMAN REVIEW ===")
     print(review.model_dump_json(indent=2))
 
     return {
         "foreman_review": review,
-        "phase": (
-            "foreman_review_accepted"
-            if review.accepted
-            else f"foreman_review_{review.decision}"
-        ),
+        "phase": f"foreman_review_{review.decision}",
+    }
+
+
+def foreman_self_repair_node(state: WorkflowState) -> dict:
+    """Foreman executes direct localized repairs without re-invoking Worker."""
+    from .tools import edit_file, write_file
+
+    review = state["foreman_review"]
+    print("\n=== FOREMAN DIRECT SELF-REPAIR ===")
+
+    repaired_files: list[str] = []
+    for repair in review.direct_repairs:
+        physical_path = _sandbox_repo_path(repair.path)
+        print(f"Applying Foreman self-repair to {physical_path} ({repair.action})")
+        if repair.action == "edit" and repair.target_text:
+            edit_file.func(
+                path=physical_path,
+                old_text=repair.target_text,
+                new_text=repair.replacement_text,
+            )
+        else:
+            write_file.func(
+                path=physical_path,
+                content=repair.content,
+            )
+        repaired_files.append(repair.path)
+
+    # Record repair as a TaskResult so validation & tracking stay unified
+    repair_task_result = TaskResult(
+        task_id="foreman_self_repair",
+        status="completed",
+        summary=f"Foreman direct repair: {', '.join(review.repair_instructions or ['self-repaired'])}",
+        files_changed=repaired_files,
+        errors=[],
+    )
+
+    return {
+        "task_results": state["task_results"] + [repair_task_result],
+        "foreman_repair_attempts": state["foreman_repair_attempts"] + 1,
+        "phase": "foreman_repaired",
+    }
+
+
+def foreman_corrective_node(state: WorkflowState) -> dict:
+    """Foreman constructs a new corrective TaskBatch for Worker rebuild."""
+    foreman = build_foreman()
+    batch = state["task_batches"][-1]
+    review = state["foreman_review"]
+
+    print("\n=== FOREMAN GENERATING CORRECTIVE BATCH ===")
+    corrective_batch = foreman.create_corrective_batch(
+        batch=batch,
+        review=review,
+        task_results=state["task_results"],
+    )
+
+    return {
+        "task_batches": state["task_batches"] + [corrective_batch],
+        "phase": "corrective_task_ready",
+    }
+
+
+# ============================================================================
+# Planner — Acceptance Review
+# ============================================================================
+
+
+def planner_review_node(state: WorkflowState) -> dict:
+    """Planner performs the final evaluation against the initial blueprint."""
+    planner = build_planner()
+    plan = state["plan"]
+    batch = state["task_batches"][-1]
+    repository_context = _gather_repository_context(batch, state["task_results"])
+
+    print("\n=== PLANNER FINAL ACCEPTANCE REVIEW ===")
+    review = planner.review(
+        project_goal=state["project_goal"],
+        plan=plan,
+        repository_context=repository_context,
+    )
+
+    print(review.model_dump_json(indent=2))
+
+    return {
+        "planner_review": review,
+        "phase": "planner_accepted" if review.accepted else "planner_revision_needed",
     }
 
 
@@ -398,97 +393,64 @@ def foreman_review_node(state: WorkflowState) -> dict:
 
 def route_after_foreman_review(state: WorkflowState) -> str:
     review = state["foreman_review"]
-
     if review is None:
-        raise RuntimeError(
-            "Foreman review missing."
-        )
-
-    if review.decision == "accept":
-        return "accepted"
+        raise RuntimeError("Foreman review missing.")
 
     if review.decision == "repair":
-        return "repair"
+        if state["foreman_repair_attempts"] >= MAX_FOREMAN_REPAIRS:
+            print("Foreman self-repair attempts exceeded limit. Escalating to rebuild.")
+            return "rebuild"
+        return "self_repair"
 
     if review.decision == "rebuild":
         return "rebuild"
 
-    raise RuntimeError(
-        f"Unsupported Foreman decision: "
-        f"{review.decision}"
-    )
+    return "accepted"
 
 
 # ============================================================================
-# Graph
+# Graph construction
 # ============================================================================
 
 
 def build_graph():
     graph = StateGraph(WorkflowState)
 
-    graph.add_node(
-        "planner",
-        planner_node,
-    )
-
-    graph.add_node(
-        "foreman",
-        foreman_node,
-    )
-
-    graph.add_node(
-        "worker",
-        worker_node,
-    )
-
-    graph.add_node(
-        "validator",
-        validator_node,
-    )
-
-    graph.add_node(
-        "foreman_review",
-        foreman_review_node,
-    )
+    graph.add_node("planner", planner_node)
+    graph.add_node("foreman", foreman_node)
+    graph.add_node("worker", worker_node)
+    graph.add_node("validator", validator_node)
+    graph.add_node("foreman_review", foreman_review_node)
+    graph.add_node("foreman_self_repair", foreman_self_repair_node)
+    graph.add_node("foreman_corrective", foreman_corrective_node)
+    graph.add_node("planner_review", planner_review_node)
 
     graph.set_entry_point("planner")
 
-    graph.add_edge(
-        "planner",
-        "foreman",
-    )
+    graph.add_edge("planner", "foreman")
+    graph.add_edge("foreman", "worker")
+    graph.add_edge("worker", "validator")
+    graph.add_edge("validator", "foreman_review")
 
-    graph.add_edge(
-        "foreman",
-        "worker",
-    )
-
-    graph.add_edge(
-        "worker",
-        "validator",
-    )
-
-    graph.add_edge(
-        "validator",
-        "foreman_review",
-    )
-
-    # Alpha04 Step 4 deliberately stops here.
-    #
-    # Repair/rebuild execution will be added only after the agent/harness
-    # boundary is proven. There is no duplicated Foreman execution logic
-    # inside graph.py.
-
+    # Routing based on Foreman review
     graph.add_conditional_edges(
         "foreman_review",
         route_after_foreman_review,
         {
-            "accepted": END,
-            "repair": END,
-            "rebuild": END,
+            "self_repair": "foreman_self_repair",
+            "rebuild": "foreman_corrective",
+            "accepted": "planner_review",
         },
     )
+
+    # Direct repairs run through validation again
+    graph.add_edge("foreman_self_repair", "validator")
+
+    # Corrective batches are sent to Worker
+    graph.add_edge("foreman_corrective", "worker")
+
+    # Final review ends cycle
+    graph.add_edge("planner_review", END)
 
     return graph.compile()
 
@@ -526,74 +488,29 @@ def run_cycle(
 
             "validation_result": None,
             "foreman_review": None,
+            "planner_review": None,
 
             "rework_mode": "none",
             "phase": "initial",
         }
     )
 
-    review = final_state["foreman_review"]
+    foreman_review = final_state.get("foreman_review")
+    planner_review = final_state.get("planner_review")
 
-    if (
-        review is not None
-        and review.accepted
-        and all(
-            result.status == "completed"
-            for result in final_state["task_results"]
-        )
-    ):
-        outcome = "overall_success"
-    else:
-        outcome = "partial"
+    success = (
+        planner_review is not None
+        and planner_review.accepted
+        and (foreman_review is None or foreman_review.accepted)
+    )
+
+    outcome = "overall_success" if success else "partial"
 
     return CycleResult(
         cycle_id=cycle_id,
         plan=final_state["plan"],
         task_batches=final_state["task_batches"],
         task_results=final_state["task_results"],
+        planner_review=planner_review,
         outcome=outcome,
     )
-
-
-# ============================================================================
-# Smoke test
-# ============================================================================
-
-
-if __name__ == "__main__":
-
-    worker_profile = WorkerProfile(
-        model="ibm/granite4.1:3b",
-        context_limit="limited",
-        strengths=[
-            "localized edits",
-            "small functions",
-            "focused validation",
-        ],
-        avoid=[
-            "architecture redesign",
-            "large historical context",
-            "unrelated repository areas",
-        ],
-        execution_mode="one_session_per_batch",
-    )
-
-    print("\n==============================")
-    print("CYCLE 1")
-    print("==============================")
-
-    cycle1 = run_cycle(
-        cycle_id=1,
-        goal=(
-            "Design a Python web scraper that extracts "
-            "a webpage title."
-        ),
-        architecture=(
-            "Three-layer orchestration prototype."
-        ),
-        worker_profile=worker_profile,
-        previous_cycle=None,
-    )
-
-    print("\n=== CYCLE 1 RESULT ===")
-    print(cycle1.model_dump_json(indent=2))

@@ -11,7 +11,7 @@ from src.orchestration.schemas import (
 
 
 class ForemanAgent:
-    """Implementation coordination and integration agent."""
+    """Implementation coordination, review, and integration agent."""
 
     def create_batch(
         self,
@@ -65,6 +65,38 @@ The Worker edits existing files only.
 If a required file does not exist, the orchestration layer will prepare it.
 
 Every file mentioned by a task must appear in TaskBatch.relevant_files.
+
+Return only the structured TaskBatch.
+"""
+
+        with model_session(FOREMAN_MODEL) as llm:
+            structured = llm.with_structured_output(TaskBatch)
+            return structured.invoke(prompt)
+
+    def create_corrective_batch(
+        self,
+        *,
+        batch: TaskBatch,
+        review: ForemanReview,
+        task_results: list[TaskResult],
+    ) -> TaskBatch:
+        """Create a targeted corrective TaskBatch to rebuild/fix failed tasks."""
+
+        prompt = f"""
+You are the Foreman creating a corrective TaskBatch for the Worker.
+
+Original batch:
+{batch.model_dump_json(indent=2)}
+
+Foreman review and rebuild instructions:
+{review.model_dump_json(indent=2)}
+
+Previous task execution outcomes:
+{', '.join(f'{r.task_id}: {r.status}' for r in task_results)}
+
+Generate a new, focused TaskBatch addressing only the tasks needing rebuild/correction.
+All tasks must specify unambiguous scope, constraints, and acceptance criteria.
+Ensure every referenced file is listed in relevant_files.
 
 Return only the structured TaskBatch.
 """
@@ -143,60 +175,24 @@ Choose exactly ONE decision:
 
 "repair"
     The implementation is fundamentally correct but has a small,
-    localized problem that the Foreman can repair directly.
+    localized problem that you (Foreman) can repair directly yourself.
+    When choosing "repair", you MUST provide direct_repairs with the exact
+    file path and changes (overwrite or edit).
 
 "rebuild"
-    One or more Worker tasks should be rebuilt from clean files because
-    the existing implementation is substantially wrong, corrupted,
-    incomplete, or unreliable to patch.
+    One or more Worker tasks should be sent back to Worker because the
+    implementation needs substantial changes, logic rewrite, or additions.
 
 Rules:
-
 1. Do not redesign the architecture.
+2. The deterministic Validator is authoritative for syntax, file existence, and scope checks.
+3. Actual repository contents are the source of truth.
+4. Prefer "repair" when the fix is small/minor (e.g. typos, single missing print/return, small syntax tweak).
+5. For "repair", populate direct_repairs with precise actions.
+6. For "rebuild", populate rebuild_task_ids and repair_instructions.
+7. For "accept", accepted must be true, and problems, repair_instructions, direct_repairs, and rebuild_task_ids must be empty.
 
-2. The deterministic Validator is authoritative for:
-   - syntax
-   - file existence
-   - deterministic scope checks
-
-3. The actual repository contents are the source of truth for
-   implementation correctness.
-
-4. Worker results are execution evidence, not proof of correctness.
-
-5. Every reported problem must be concrete.
-
-6. Identify the affected file and function or implementation area
-   whenever possible.
-
-7. Prefer "repair" over "rebuild" when the problem is small and localized.
-
-8. Prefer "rebuild" when patching the existing implementation would be
-   less reliable than starting from a clean file.
-
-9. If a task has already reached three Worker attempts, do not request
-   another Worker attempt for that task. Use "repair" if the Foreman can
-   fix it directly. Otherwise report the problem clearly.
-
-10. For "accept":
-    - accepted must be true
-    - problems must be empty
-    - repair_instructions must be empty
-    - rebuild_task_ids must be empty
-
-11. For "repair":
-    - accepted must be false
-    - provide precise repair_instructions
-    - rebuild_task_ids must be empty
-
-12. For "rebuild":
-    - accepted must be false
-    - provide precise repair_instructions explaining the failure
-    - rebuild_task_ids must contain the task IDs requiring rebuild
-
-13. Do not invent a TaskBatch during review.
-
-14. Return only the structured ForemanReview.
+Return only the structured ForemanReview.
 """
 
         with model_session(FOREMAN_MODEL) as llm:

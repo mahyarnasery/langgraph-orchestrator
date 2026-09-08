@@ -1,9 +1,9 @@
 from src.orchestration.models import PLANNER_MODEL, model_session
-from src.orchestration.schemas import Plan, WorkerProfile, CycleResult
+from src.orchestration.schemas import CycleResult, Plan, PlannerReview, WorkerProfile
 
 
 class PlannerAgent:
-    """High-level planning agent."""
+    """High-level planning and acceptance agent."""
 
     def run(
         self,
@@ -51,4 +51,35 @@ Return only the structured Plan.
 
         with model_session(PLANNER_MODEL) as llm:
             structured = llm.with_structured_output(Plan)
+            return structured.invoke(prompt)
+
+    def review(
+        self,
+        *,
+        project_goal: str,
+        plan: Plan,
+        repository_context: str,
+    ) -> PlannerReview:
+        """Evaluate whether the integrated repository code satisfies the blueprint."""
+
+        prompt = f"""
+You are the Planner / Architect conducting the final acceptance review.
+
+Project goal:
+{project_goal}
+
+Initial architectural blueprint & acceptance criteria:
+{plan.model_dump_json(indent=2)}
+
+Final integrated repository content:
+{repository_context}
+
+Evaluate each acceptance criterion against the actual repository content.
+Determine whether the overall solution is accepted.
+
+Return only the structured PlannerReview.
+"""
+
+        with model_session(PLANNER_MODEL) as llm:
+            structured = llm.with_structured_output(PlannerReview)
             return structured.invoke(prompt)

@@ -67,3 +67,32 @@ def create_file(path: str, content: str = "") -> dict:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(content, encoding="utf-8")
     return {"path": path, "status": "created"}
+
+
+@tool
+def write_file(path: str, content: str) -> dict:
+    """
+    Overwrite or write content to a file within the workspace.
+    """
+    file_path = _safe_path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content, encoding="utf-8")
+    return {"path": path, "status": "written"}
+
+
+@tool
+def edit_file(path: str, old_text: str, new_text: str) -> dict:
+    """
+    Replace target text in a file within the workspace.
+    """
+    file_path = _safe_path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    current_content = file_path.read_text(encoding="utf-8")
+    if old_text not in current_content:
+        raise ValueError(f"Target text not found in {path}")
+
+    updated_content = current_content.replace(old_text, new_text, 1)
+    file_path.write_text(updated_content, encoding="utf-8")
+    return {"path": path, "status": "edited"}

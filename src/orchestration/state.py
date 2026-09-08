@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 from typing import TypedDict
 
 from .schemas import (
     CycleResult,
     ForemanReview,
     Plan,
+    PlannerReview,
     TaskBatch,
     TaskResult,
     ValidationResult,
@@ -40,6 +43,8 @@ class WorkflowState(TypedDict):
     validation_result: ValidationResult | None
 
     foreman_review: ForemanReview | None
+
+    planner_review: PlannerReview | None
 
     rework_mode: str
 
