@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field
+from typing import Literal
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +154,8 @@ class TaskResult(BaseModel):
         description="Completed task identifier."
     )
 
-    status: str = Field(
-        description="completed | partial | failure"
+    status: Literal["completed", "partial", "failure"] = Field(
+        description="Execution outcome of the task."
     )
 
     summary: str = Field(
@@ -179,39 +180,34 @@ class TaskResult(BaseModel):
 class ForemanReview(BaseModel):
     """
     Review and integration decision produced by the Foreman.
-
-    approve:
-        Current implementation is acceptable.
-
-    integrate:
-        Implementation is fundamentally correct but requires a small,
-        targeted Foreman fix.
-
-    repair:
-        Implementation requires substantive Worker rework.
     """
 
     decision: str = Field(
-        description="approve | integrate | repair"
+        description="accept | repair | rebuild"
+    )
+
+    accepted: bool = Field(
+        description="True only when the implementation is accepted."
     )
 
     reviewed_task_ids: list[str] = Field(
+        default_factory=list,
         description="Task IDs evaluated during this review."
     )
 
     problems: list[str] = Field(
         default_factory=list,
-        description="Concrete implementation issues identified."
-    )
-
-    integration_instructions: list[str] = Field(
-        default_factory=list,
-        description="Precise instructions for targeted Foreman fixes."
+        description="Concrete implementation problems identified."
     )
 
     repair_instructions: list[str] = Field(
         default_factory=list,
-        description="Instructions for substantive Worker rework."
+        description="Precise instructions for repairing or rebuilding the implementation."
+    )
+
+    rebuild_task_ids: list[str] = Field(
+        default_factory=list,
+        description="Task IDs that must be rebuilt from clean files."
     )
 
     summary: str = Field(

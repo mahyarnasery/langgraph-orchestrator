@@ -1,5 +1,5 @@
 from src.orchestration.models import PLANNER_MODEL, model_session
-from src.orchestration.schemas import Plan
+from src.orchestration.schemas import Plan, WorkerProfile, CycleResult
 
 
 class PlannerAgent:
@@ -10,9 +10,19 @@ class PlannerAgent:
         *,
         project_goal: str,
         architecture_context: str,
-        worker_profile: str,
-        previous_cycle: str,
+        worker_profile: WorkerProfile,
+        previous_cycle: CycleResult | None,
     ) -> Plan:
+        previous_cycle_text = (
+            previous_cycle.model_dump_json(indent=2)
+            if previous_cycle is not None
+            else "None (Cycle 1)"
+        )
+
+        worker_profile_text = worker_profile.model_dump_json(
+            indent=2
+        )
+
         prompt = f"""
 You are the Planner / Architect.
 
@@ -31,10 +41,10 @@ Architecture context:
 {architecture_context}
 
 Worker profile:
-{worker_profile}
+{worker_profile_text}
 
 Previous cycle:
-{previous_cycle}
+{previous_cycle_text}
 
 Return only the structured Plan.
 """
