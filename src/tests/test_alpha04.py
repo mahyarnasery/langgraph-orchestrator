@@ -66,6 +66,16 @@ def main() -> None:
         )
 
     # --------------------------------------------------------
+    # Debug: verify file content before subprocess execution.
+    # --------------------------------------------------------
+    print(f"\n=== DEBUG: Checking file at {TARGET} ===")
+    print(f"File exists: {TARGET.is_file()}")
+    print(f"File size: {TARGET.stat().st_size} bytes")
+    content = TARGET.read_text()
+    print(f"File content (repr): {content!r}")
+    print(f"File content (raw):\n{content}")
+
+    # --------------------------------------------------------
     # Verify actual generated behavior.
     # --------------------------------------------------------
 
@@ -79,6 +89,11 @@ def main() -> None:
         text=True,
         check=False,
     )
+
+    print(f"\n=== DEBUG: Subprocess result ===")
+    print(f"Return code: {completed.returncode}")
+    print(f"Stdout (repr): {completed.stdout!r}")
+    print(f"Stderr (repr): {completed.stderr!r}")
 
     if completed.returncode != 0:
         raise AssertionError(
