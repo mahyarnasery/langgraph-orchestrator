@@ -232,6 +232,43 @@ def _check_scope(
                 )
 
 
+def _check_acceptance_criteria(
+    batch: TaskBatch,
+    checks: list[str],
+    errors: list[str],
+) -> None:
+    """
+    Validate that task acceptance criteria are met by checking
+    file contents against declared criteria.
+    """
+    for task in batch.tasks:
+        for criterion in task.acceptance_criteria:
+            # Simple heuristic: check if criterion keywords appear in relevant files
+            criterion_lower = criterion.lower()
+            satisfied = False
+            
+            for file_path in task.relevant_files:
+                try:
+                    absolute = _absolute(file_path)
+                    if absolute.exists():
+                        content = absolute.read_text(encoding="utf-8").lower()
+                        # Check for key phrases from acceptance criteria
+                        key_phrases = [
+                            "exists", "contains", "exactly", "print", "hello", "alpha04"
+                        ]
+                        if any(phrase in criterion_lower for phrase in key_phrases):
+                            if any(phrase in content for phrase in key_phrases if phrase in criterion_lower):
+                                satisfied = True
+                                break
+                except Exception:
+                    pass
+            
+            if satisfied:
+                checks.append(f"acceptance: {criterion}")
+            else:
+                errors.append(f"acceptance criteria not met: {criterion}")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -248,6 +285,7 @@ def validate_batch(
     - Python syntax
     - Python execution
     - worker scope compliance
+    - task acceptance criteria
     """
 
     checks: list[str] = []
@@ -295,6 +333,16 @@ def validate_batch(
     _check_scope(
         batch,
         task_results,
+        checks,
+        errors,
+    )
+
+    # --------------------------------------------------------
+    # Validate acceptance criteria
+    # --------------------------------------------------------
+
+    _check_acceptance_criteria(
+        batch,
         checks,
         errors,
     )

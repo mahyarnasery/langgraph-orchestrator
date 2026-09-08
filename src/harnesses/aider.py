@@ -148,9 +148,10 @@ class AiderHarness(CodingHarness):
                 f for f in task_files
                 if before.get(f) != after.get(f)
             ]
+            status = "completed" if changed else "no_change"
             task_results.append(TaskResult(
                 task_id=task.task_id,
-                status="completed" if changed else "completed",
+                status=status,
                 summary="Aider completed the Worker session. Task acceptance is verified separately by the validator.",
                 files_changed=changed,
                 errors=[],

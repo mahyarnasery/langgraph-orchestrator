@@ -178,7 +178,7 @@ class TaskResult(BaseModel):
         description="Completed task identifier."
     )
 
-    status: Literal["completed", "partial", "failure"] = Field(
+    status: Literal["completed", "partial", "failure", "no_change"] = Field(
         description="Execution outcome of the task."
     )
 

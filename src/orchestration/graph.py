@@ -74,6 +74,33 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
     return "\n\n".join(repository_evidence)
 
 
+def _gather_full_repository_context() -> str:
+    """Gather context from all Python files in the sandbox for Planner review."""
+    from .tools import read_file
+
+    repository_evidence: list[str] = []
+
+    for py_file in WORKER_WORKSPACE.rglob("*.py"):
+        try:
+            relative_path = py_file.relative_to(WORKER_WORKSPACE)
+            logical_path = str(relative_path)
+            result = read_file.func(path=f"sandbox/{logical_path}")
+            content = result.get("content", "")
+            if not content.strip():
+                content_display = "[EMPTY FILE - 0 bytes]"
+            else:
+                content_display = content
+            repository_evidence.append(
+                f"FILE: {logical_path}\n```\n{content_display}\n```"
+            )
+        except Exception as exc:
+            repository_evidence.append(
+                f"FILE: {logical_path}\nREAD_ERROR: {type(exc).__name__}: {exc}"
+            )
+
+    return "\n\n".join(repository_evidence) if repository_evidence else "[No Python files in sandbox]"
+
+
 # ============================================================================
 # Agent / harness construction
 # ============================================================================
@@ -374,7 +401,7 @@ def planner_review_node(state: WorkflowState) -> dict:
     planner = build_planner()
     plan = state["plan"]
     batch = state["task_batches"][-1]
-    repository_context = _gather_repository_context(batch, state["task_results"])
+    repository_context = _gather_full_repository_context()
 
     print("\n=== PLANNER FINAL ACCEPTANCE REVIEW ===")
     review = planner.review(
@@ -410,7 +437,10 @@ def route_after_foreman_review(state: WorkflowState) -> str:
     if review.decision == "rebuild":
         return "rebuild"
 
-    return "accepted"
+    if review.decision == "accept":
+        return "accepted"
+
+    raise ValueError(f"Unknown Foreman decision: {review.decision}")
 
 
 # ============================================================================

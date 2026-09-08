@@ -29,8 +29,19 @@ class ForemanAgent:
         previous_cycle_text = (
             previous_cycle.model_dump_json(indent=2)
             if previous_cycle is not None
-            else "None"
+            else "None (Cycle 1)"
         )
+
+        # Include previous cycle execution evidence if available
+        previous_evidence = ""
+        if previous_cycle is not None:
+            previous_evidence = f"""
+Previous Cycle Execution Evidence:
+- Plan: {previous_cycle.plan.objective}
+- Outcome: {previous_cycle.outcome}
+- Task Results: {len(previous_cycle.task_results)} tasks executed
+- Planner Review: {'Accepted' if previous_cycle.planner_review and previous_cycle.planner_review.accepted else 'Rejected/Revision Needed'}
+"""
 
         prompt = f"""
 You are the Foreman / Integrator.
@@ -48,6 +59,7 @@ Worker profile:
 
 Previous cycle:
 {previous_cycle_text}
+{previous_evidence}
 
 Planner plan:
 {plan.model_dump_json(indent=2)}
@@ -60,6 +72,7 @@ Responsibilities:
 - Define acceptance criteria.
 - Keep tasks small enough for the Worker.
 - Do not redesign the Planner's architecture.
+- Use previous cycle evidence to avoid repeating failures.
 
 The Worker edits existing files only.
 If a required file does not exist, the orchestration layer will prepare it.
