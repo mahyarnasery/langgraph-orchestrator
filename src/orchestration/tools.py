@@ -35,3 +35,35 @@ def _safe_path(path: str) -> Path:
         raise ValueError(
             f"Path escapes orchestration workspace: {path}"
         ) from exc
+
+    return resolved
+
+
+@tool
+def read_file(path: str) -> dict:
+    """
+    Read content of a file within the workspace.
+    """
+    file_path = _safe_path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    if not file_path.is_file():
+        raise ValueError(f"Path is not a file: {path}")
+
+    content = file_path.read_text(encoding="utf-8")
+    return {"path": path, "content": content}
+
+
+@tool
+def create_file(path: str, content: str = "") -> dict:
+    """
+    Create a new file within the workspace with optional initial content.
+    Creates parent directories if necessary.
+    """
+    file_path = _safe_path(path)
+    if file_path.exists():
+        raise FileExistsError(f"File already exists: {path}")
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content, encoding="utf-8")
+    return {"path": path, "status": "created"}
