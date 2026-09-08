@@ -58,8 +58,13 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
         physical_path = _sandbox_repo_path(path)
         try:
             result = read_file.func(path=physical_path)
+            content = result.get("content", "")
+            if not content.strip():
+                content_display = "[EMPTY FILE - 0 bytes]"
+            else:
+                content_display = content
             repository_evidence.append(
-                f"FILE: {path}\n{result.get('content', '')}"
+                f"FILE: {path}\n```\n{content_display}\n```"
             )
         except Exception as exc:
             repository_evidence.append(
