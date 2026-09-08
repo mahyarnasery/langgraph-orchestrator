@@ -137,3 +137,80 @@ class AiderHarness(CodingHarness):
             env=env,
             text=True,
         )
+
+        # Collect results
+        after = self._snapshot_files(files)
+        task_results = []
+
+        for task in ordered_tasks:
+            task_files = task.relevant_files
+            changed = [
+                f for f in task_files
+                if before.get(f) != after.get(f)
+            ]
+            task_results.append(TaskResult(
+                task_id=task.task_id,
+                status="completed" if changed else "completed",
+                summary="Aider completed the Worker session. Task acceptance is verified separately by the validator.",
+                files_changed=changed,
+                errors=[],
+            ))
+
+        return task_results
+
+    def _safe_workspace_path(self, path: str) -> Path:
+        """Resolve a path relative to the workspace root, preventing directory traversal."""
+        requested = (WORKSPACE_ROOT / path).resolve()
+        if not requested.is_relative_to(WORKSPACE_ROOT):
+            raise ValueError(f"Path {path} escapes workspace root")
+        return requested
+
+    def _build_prompt(self, *, batch: TaskBatch, ordered_tasks: list) -> str:
+        """Build the prompt for the Aider session."""
+        lines = [
+            f"# Batch: {batch.batch_id}",
+            f"# Objective: {batch.objective}",
+            "",
+            "## Tasks (in execution order):",
+        ]
+        for task in ordered_tasks:
+            lines.append(f"### Task {task.task_id}: {task.objective}")
+            lines.append(f"Scope: {task.scope}")
+            if task.constraints:
+                lines.append("Constraints:")
+                for c in task.constraints:
+                    lines.append(f"  - {c}")
+            lines.append("Acceptance Criteria:")
+            for ac in task.acceptance_criteria:
+                lines.append(f"  - {ac}")
+            lines.append("")
+
+        lines.append("## Shared Context:")
+        for ctx in batch.shared_context:
+            lines.append(f"  - {ctx}")
+        lines.append("")
+
+        lines.append("## Relevant Files:")
+        for f in batch.relevant_files:
+            lines.append(f"  - {f}")
+        lines.append("")
+
+        lines.append("## Constraints:")
+        for c in batch.constraints:
+            lines.append(f"  - {c}")
+        lines.append("")
+
+        lines.append("Execute each task in order. Make minimal, focused changes.")
+        lines.append("Do not add extra code, comments, or formatting beyond what is specified.")
+        return "\n".join(lines)
+
+    def _snapshot_files(self, files: list[str]) -> dict[str, str]:
+        """Capture current content of each file (empty string if not exists)."""
+        snapshot = {}
+        for f in files:
+            path = self._safe_workspace_path(f)
+            if path.exists():
+                snapshot[f] = path.read_text()
+            else:
+                snapshot[f] = ""
+        return snapshot
