@@ -31,7 +31,12 @@ def _absolute(path: str) -> Path:
             f"Absolute paths are not allowed: {path}"
         )
 
-    resolved = (WORKSPACE_ROOT / candidate).resolve()
+    # Normalize sandbox prefix if present
+    normalized = candidate
+    if str(candidate).startswith("sandbox/"):
+        normalized = Path(str(candidate).removeprefix("sandbox/"))
+
+    resolved = (WORKSPACE_ROOT / normalized).resolve()
 
     try:
         resolved.relative_to(WORKSPACE_ROOT)
@@ -87,6 +92,12 @@ def _check_python_syntax(
         source = absolute.read_text(
             encoding="utf-8"
         )
+
+        if not source.strip():
+            errors.append(
+                f"empty file: {path} has no content"
+            )
+            return
 
         ast.parse(source)
 
@@ -263,11 +274,10 @@ def validate_batch(
                 errors,
             )
 
-            # Only execute if syntax is valid.
+            # Only execute if syntax is valid and file not empty.
             syntax_failed = any(
-                error.startswith(
-                    f"syntax error in {path}"
-                )
+                error.startswith(f"syntax error in {path}")
+                or error.startswith(f"empty file: {path}")
                 for error in errors
             )
 
