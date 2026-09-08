@@ -200,11 +200,25 @@ def foreman_node(state: WorkflowState) -> dict:
             read_file.func(path=physical_path)
             print(f"{physical_path} already exists")
         except FileNotFoundError:
+            # Create parent directories and empty file
             create_file.func(
                 path=physical_path,
                 content="",
             )
             print(f"Created {physical_path}")
+        except Exception as exc:
+            # If read fails for other reasons, still try to create
+            print(f"Warning: could not read {physical_path}: {exc}")
+            try:
+                create_file.func(
+                    path=physical_path,
+                    content="",
+                )
+                print(f"Created {physical_path} (after read error)")
+            except FileExistsError:
+                print(f"{physical_path} already exists (race condition)")
+            except Exception as create_exc:
+                print(f"Error creating {physical_path}: {create_exc}")
 
     return {
         "task_batches": [batch],

@@ -99,9 +99,11 @@ class AiderHarness(CodingHarness):
 
         before = self._snapshot_files(files)
 
-        # Pass relative paths from within WORKSPACE_ROOT to prevent path traversal confusion
+        # Pass relative paths from within WORKSPACE_ROOT.
+        # Files in TaskBatch are logical paths (e.g., "hello.py" or "src/module/file.py").
+        # Aider runs with cwd=WORKSPACE_ROOT, so we pass paths relative to that.
         rel_files = [
-            str(Path(path).name if not str(path).startswith("sandbox/") else Path(str(path).removeprefix("sandbox/")).name)
+            str(Path(path).relative_to("sandbox") if str(path).startswith("sandbox/") else Path(path))
             for path in files
         ]
 
