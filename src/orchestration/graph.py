@@ -445,13 +445,21 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
         physical_path = _sandbox_repo_path(repair.path)
         print(f"Applying Foreman self-repair to {physical_path} ({repair.action})")
         try:
-            if repair.action == "edit" and repair.target_text:
+            if repair.action == "edit":
+                if not repair.target_text:
+                    raise ValueError(
+                        "Foreman 'edit' repair requires non-empty target_text."
+                    )
                 edit_file.func(
                     path=physical_path,
                     old_text=repair.target_text,
                     new_text=repair.replacement_text,
                 )
             else:
+                if not repair.content.strip():
+                    raise ValueError(
+                        "Foreman 'overwrite' repair requires non-empty content."
+                    )
                 write_file.func(
                     path=physical_path,
                     content=repair.content,

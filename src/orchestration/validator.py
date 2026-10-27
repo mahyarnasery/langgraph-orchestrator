@@ -260,20 +260,28 @@ def _extract_quoted_literals(
 def _pattern_matches(pattern: str, content: str, stdout: str) -> bool:
     """
     Check if an expected literal pattern matches the file's source code,
-    normalized source code, function definitions, or execution stdout.
+    normalized source code, class/function/method definitions, or execution stdout.
     """
     if pattern in content or pattern in stdout:
         return True
 
-    # Whitespace-insensitive match (e.g. `add(a,b)` vs `add(a, b)`)
-    compact_pattern = re.sub(r"\s+", "", pattern)
-    compact_content = re.sub(r"\s+", "", content)
+    # Whitespace-insensitive and `self.`-normalized match
+    # (e.g. `price * quantity` matches `self.price * self.quantity`)
+    compact_pattern = re.sub(r"\s+", "", pattern).replace("self.", "")
+    compact_content = re.sub(r"\s+", "", content).replace("self.", "")
     compact_stdout = re.sub(r"\s+", "", stdout)
     if compact_pattern in compact_content or compact_pattern in compact_stdout:
         return True
 
-    # Function signature match (e.g. criterion says `add(a, b)` and code has `def add(a: int, b: int)`)
-    fn_match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", pattern)
+    # Class definition match (e.g. `class Item` vs `class Item:`)
+    cls_match = re.match(r"^(?:class\s+)?([A-Z][a-zA-Z0-9_]*)(?:\s*\(.*\))?:?$", pattern)
+    if cls_match:
+        cls_name = cls_match.group(1)
+        if f"class {cls_name}" in content or f"{cls_name}(" in content or cls_name in content:
+            return True
+
+    # Function or method signature match (e.g. `add_item(self, item)` or `inv.total_value()`)
+    fn_match = re.match(r"^(?:def\s+)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", pattern)
     if fn_match:
         fn_name = fn_match.group(1)
         if f"def {fn_name}(" in content or f"{fn_name}(" in content:

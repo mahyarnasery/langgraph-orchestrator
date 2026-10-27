@@ -306,6 +306,12 @@ class ForemanReview(BaseModel):
         description="Brief explanation of the review decision."
     )
 
+    @model_validator(mode="after")
+    def _clean_empty_list_items(self) -> "ForemanReview":
+        self.rollback_files = [f.strip() for f in self.rollback_files if f and f.strip()]
+        self.rebuild_task_ids = [t.strip() for t in self.rebuild_task_ids if t and t.strip()]
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Cycle memory
