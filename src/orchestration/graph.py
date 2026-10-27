@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from langgraph.graph import END, StateGraph
@@ -24,6 +25,7 @@ from .validator import validate_batch
 REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
 WORKER_WORKSPACE = (REPO_ROOT / "sandbox").resolve()
 MAX_FOREMAN_REPAIRS = 2
+MAX_WORKER_REBUILDS = 3
 
 
 def _sandbox_repo_path(path: str) -> str:
@@ -39,6 +41,136 @@ def _sandbox_repo_path(path: str) -> str:
     return f"sandbox/{normalized}"
 
 
+def _build_repository_map() -> str:
+    """
+    Build a compact AST-based map of existing files, classes, and functions
+    in the sandbox so Planner and Foreman have upfront codebase awareness.
+    """
+    if not WORKER_WORKSPACE.exists():
+        return "[Workspace is currently empty]"
+
+    py_files = sorted(WORKER_WORKSPACE.rglob("*.py"))
+    if not py_files:
+        return "[No Python files currently in sandbox workspace]"
+
+    entries: list[str] = []
+    for py_file in py_files:
+        rel_path = str(py_file.relative_to(WORKER_WORKSPACE))
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            if not source.strip():
+                entries.append(f"- {rel_path} (empty file)")
+                continue
+
+            tree = ast.parse(source)
+            symbols: list[str] = []
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    methods = [
+                        n.name for n in node.body if isinstance(n, ast.FunctionDef)
+                    ]
+                    symbols.append(f"class {node.name}({', '.join(methods)})")
+                elif isinstance(node, ast.FunctionDef):
+                    args = [a.arg for a in node.args.args]
+                    symbols.append(f"def {node.name}({', '.join(args)})")
+
+            summary = "; ".join(symbols) if symbols else f"{len(source.splitlines())} lines"
+            entries.append(f"- {rel_path}: {summary}")
+        except Exception:
+            entries.append(f"- {rel_path} (unparsed)")
+
+    return "Existing Workspace Repository Map:\n" + "\n".join(entries)
+
+
+def _enrich_architecture_context(architecture_context: str) -> str:
+    """Combine user-supplied architecture context with live sandbox repo map."""
+    repo_map = _build_repository_map()
+    return f"{architecture_context}\n\n{repo_map}"
+
+
+def _prepare_batch_and_workspace(
+    batch: TaskBatch,
+    existing_snapshots: dict[str, str],
+) -> tuple[TaskBatch, dict[str, str]]:
+    """
+    Normalize batch relevant_files and execution_order, pre-create missing
+    files in sandbox, and snapshot pre-batch file contents for rollback support.
+    """
+    from .tools import create_file, read_file
+
+    # Ensure every task has relevant_files and batch.relevant_files is the full union
+    union_files = sorted(
+        {
+            path.removeprefix("sandbox/")
+            for task in batch.tasks
+            for path in task.relevant_files
+            if path not in ("", ".", "..")
+        }
+        | {
+            path.removeprefix("sandbox/")
+            for path in batch.relevant_files
+            if path not in ("", ".", "..")
+        }
+    )
+    batch.relevant_files = union_files
+
+    for task in batch.tasks:
+        task.relevant_files = [
+            p.removeprefix("sandbox/")
+            for p in (task.relevant_files or union_files)
+            if p not in ("", ".", "..")
+        ]
+
+    # Prune redundant "file creation only" tasks when other tasks already populate the file
+    if len(batch.tasks) > 1:
+        filtered_tasks = [
+            t for t in batch.tasks
+            if not (
+                t.scope.strip().lower() in ("file creation", "create file", "empty file creation")
+                and len(t.acceptance_criteria) == 1
+                and "exists" in t.acceptance_criteria[0].lower()
+            )
+        ]
+        if filtered_tasks:
+            batch.tasks = filtered_tasks
+
+    # Ensure execution_order and task.dependencies only reference valid task IDs
+    valid_ids = {t.task_id for t in batch.tasks}
+    for task in batch.tasks:
+        task.dependencies = [
+            dep for dep in task.dependencies if dep in valid_ids and dep != task.task_id
+        ]
+    ordered_ids = [tid for tid in batch.execution_order if tid in valid_ids]
+    for task in batch.tasks:
+        if task.task_id not in ordered_ids:
+            ordered_ids.append(task.task_id)
+    batch.execution_order = ordered_ids
+
+    snapshots = dict(existing_snapshots)
+
+    print("\n=== FOREMAN REPOSITORY PREPARATION ===")
+    for path in batch.relevant_files:
+        physical_path = _sandbox_repo_path(path)
+        try:
+            res = read_file.func(path=physical_path)
+            snapshots.setdefault(path, res.get("content", ""))
+            print(f"{physical_path} already exists")
+        except FileNotFoundError:
+            create_file.func(path=physical_path, content="")
+            snapshots.setdefault(path, "")
+            print(f"Created {physical_path}")
+        except Exception as exc:
+            print(f"Warning: could not read {physical_path}: {exc}")
+            try:
+                create_file.func(path=physical_path, content="")
+                snapshots.setdefault(path, "")
+                print(f"Created {physical_path} (after read error)")
+            except Exception as create_exc:
+                print(f"Error creating {physical_path}: {create_exc}")
+
+    return batch, snapshots
+
+
 def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult]) -> str:
     """Inspect the sandbox repository files and construct textual evidence."""
     from .tools import read_file
@@ -46,7 +178,7 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
     relevant_files = sorted(
         set(batch.relevant_files)
         | {
-            file_path
+            file_path.removeprefix("sandbox/")
             for result in task_results
             for file_path in result.files_changed
         }
@@ -59,13 +191,8 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
         try:
             result = read_file.func(path=physical_path)
             content = result.get("content", "")
-            if not content.strip():
-                content_display = "[EMPTY FILE - 0 bytes]"
-            else:
-                content_display = content
-            repository_evidence.append(
-                f"FILE: {path}\n```\n{content_display}\n```"
-            )
+            content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
+            repository_evidence.append(f"FILE: {path}\n```\n{content_display}\n```")
         except Exception as exc:
             repository_evidence.append(
                 f"FILE: {path}\nREAD_ERROR: {type(exc).__name__}: {exc}"
@@ -80,16 +207,13 @@ def _gather_full_repository_context() -> str:
 
     repository_evidence: list[str] = []
 
-    for py_file in WORKER_WORKSPACE.rglob("*.py"):
+    for py_file in sorted(WORKER_WORKSPACE.rglob("*.py")):
         try:
             relative_path = py_file.relative_to(WORKER_WORKSPACE)
             logical_path = str(relative_path)
             result = read_file.func(path=f"sandbox/{logical_path}")
             content = result.get("content", "")
-            if not content.strip():
-                content_display = "[EMPTY FILE - 0 bytes]"
-            else:
-                content_display = content
+            content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
             repository_evidence.append(
                 f"FILE: {logical_path}\n```\n{content_display}\n```"
             )
@@ -98,7 +222,11 @@ def _gather_full_repository_context() -> str:
                 f"FILE: {logical_path}\nREAD_ERROR: {type(exc).__name__}: {exc}"
             )
 
-    return "\n\n".join(repository_evidence) if repository_evidence else "[No Python files in sandbox]"
+    return (
+        "\n\n".join(repository_evidence)
+        if repository_evidence
+        else "[No Python files in sandbox]"
+    )
 
 
 # ============================================================================
@@ -125,18 +253,17 @@ def build_worker() -> AiderHarness:
 
 def planner_node(state: WorkflowState) -> dict:
     planner = build_planner()
+    enriched_arch = _enrich_architecture_context(state["architecture_context"])
 
     plan = planner.run(
         project_goal=state["project_goal"],
-        architecture_context=state["architecture_context"],
+        architecture_context=enriched_arch,
         worker_profile=state["worker_profile"],
         previous_cycle=state["previous_cycle"],
     )
 
     if not isinstance(plan, Plan):
-        raise TypeError(
-            "PlannerAgent.run() must return Plan."
-        )
+        raise TypeError("PlannerAgent.run() must return Plan.")
 
     print("\n=== PLANNER RESULT ===")
     print(plan.model_dump_json(indent=2))
@@ -154,74 +281,33 @@ def planner_node(state: WorkflowState) -> dict:
 
 def foreman_node(state: WorkflowState) -> dict:
     plan = state["plan"]
-
     if plan is None:
-        raise RuntimeError(
-            "Planner output missing."
-        )
+        raise RuntimeError("Planner output missing.")
 
     foreman = build_foreman()
+    enriched_arch = _enrich_architecture_context(state["architecture_context"])
 
     batch = foreman.create_batch(
         project_goal=state["project_goal"],
-        architecture_context=state["architecture_context"],
+        architecture_context=enriched_arch,
         worker_profile=state["worker_profile"],
         previous_cycle=state["previous_cycle"],
         plan=plan,
     )
 
     if not isinstance(batch, TaskBatch):
-        raise TypeError(
-            "ForemanAgent.create_batch() must return TaskBatch."
-        )
+        raise TypeError("ForemanAgent.create_batch() must return TaskBatch.")
 
-    batch.relevant_files = sorted(
-        {
-            path
-            for task in batch.tasks
-            for path in task.relevant_files
-        }
+    batch, snapshots = _prepare_batch_and_workspace(
+        batch, state.get("file_snapshots", {})
     )
 
     print("\n=== FOREMAN RESULT ===")
     print(batch.model_dump_json(indent=2))
 
-    from .tools import create_file, read_file
-
-    print("\n=== FOREMAN REPOSITORY PREPARATION ===")
-
-    for path in batch.relevant_files:
-        if path in ("", ".", ".."):
-            continue
-
-        physical_path = _sandbox_repo_path(path)
-
-        try:
-            read_file.func(path=physical_path)
-            print(f"{physical_path} already exists")
-        except FileNotFoundError:
-            # Create parent directories and empty file
-            create_file.func(
-                path=physical_path,
-                content="",
-            )
-            print(f"Created {physical_path}")
-        except Exception as exc:
-            # If read fails for other reasons, still try to create
-            print(f"Warning: could not read {physical_path}: {exc}")
-            try:
-                create_file.func(
-                    path=physical_path,
-                    content="",
-                )
-                print(f"Created {physical_path} (after read error)")
-            except FileExistsError:
-                print(f"{physical_path} already exists (race condition)")
-            except Exception as create_exc:
-                print(f"Error creating {physical_path}: {create_exc}")
-
     return {
         "task_batches": [batch],
+        "file_snapshots": snapshots,
         "phase": "task_ready",
     }
 
@@ -233,9 +319,7 @@ def foreman_node(state: WorkflowState) -> dict:
 
 def worker_node(state: WorkflowState) -> dict:
     if not state["task_batches"]:
-        raise RuntimeError(
-            "No TaskBatch received."
-        )
+        raise RuntimeError("No TaskBatch received.")
 
     batch = state["task_batches"][-1]
     worker = build_worker()
@@ -246,15 +330,11 @@ def worker_node(state: WorkflowState) -> dict:
     results = worker.execute(batch)
 
     if not isinstance(results, list):
-        raise TypeError(
-            "CodingHarness.execute() must return list[TaskResult]."
-        )
+        raise TypeError("CodingHarness.execute() must return list[TaskResult].")
 
     for result in results:
         if not isinstance(result, TaskResult):
-            raise TypeError(
-                "CodingHarness.execute() returned a non-TaskResult."
-            )
+            raise TypeError("CodingHarness.execute() returned a non-TaskResult.")
 
     print("\n=== WORKER SESSION COMPLETE ===")
 
@@ -262,8 +342,13 @@ def worker_node(state: WorkflowState) -> dict:
     for result in results:
         attempts[result.task_id] = attempts.get(result.task_id, 0) + 1
 
+    # Merge task results by task_id so previously completed tasks are preserved
+    merged_by_id = {r.task_id: r for r in state["task_results"]}
+    for result in results:
+        merged_by_id[result.task_id] = result
+
     return {
-        "task_results": results,
+        "task_results": list(merged_by_id.values()),
         "worker_attempts": attempts,
         "phase": "worker_complete",
     }
@@ -276,10 +361,9 @@ def worker_node(state: WorkflowState) -> dict:
 
 def validator_node(state: WorkflowState) -> dict:
     if not state["task_batches"]:
-        raise RuntimeError(
-            "No TaskBatch available for validation."
-        )
+        raise RuntimeError("No TaskBatch available for validation.")
 
+    # Always validate against the primary/latest batch requirements
     batch = state["task_batches"][-1]
     validation = validate_batch(
         batch=batch,
@@ -287,9 +371,7 @@ def validator_node(state: WorkflowState) -> dict:
     )
 
     if not isinstance(validation, ValidationResult):
-        raise TypeError(
-            "validate_batch() must return ValidationResult."
-        )
+        raise TypeError("validate_batch() must return ValidationResult.")
 
     print("\n=== VALIDATOR RESULT ===")
     print(validation.model_dump_json(indent=2))
@@ -301,7 +383,7 @@ def validator_node(state: WorkflowState) -> dict:
 
 
 # ============================================================================
-# Foreman — Review & Self-Repair
+# Foreman — Review, Self-Repair & Corrective Rebuild
 # ============================================================================
 
 
@@ -321,17 +403,20 @@ def foreman_review_node(state: WorkflowState) -> dict:
 
     batch = state["task_batches"][-1]
     repository_context = _gather_repository_context(batch, state["task_results"])
+    enriched_arch = _enrich_architecture_context(state["architecture_context"])
 
     foreman = build_foreman()
     review = foreman.review(
         project_goal=state["project_goal"],
-        architecture_context=state["architecture_context"],
+        architecture_context=enriched_arch,
         plan=plan,
         batch=batch,
         task_results=state["task_results"],
         validation_result=validation,
         repository_context=repository_context,
         worker_attempts=state["worker_attempts"],
+        foreman_repair_attempts=state["foreman_repair_attempts"],
+        max_foreman_repairs=MAX_FOREMAN_REPAIRS,
     )
 
     if not isinstance(review, ForemanReview):
@@ -347,36 +432,43 @@ def foreman_review_node(state: WorkflowState) -> dict:
 
 
 def foreman_self_repair_node(state: WorkflowState) -> dict:
-    """Foreman executes direct localized repairs without re-invoking Worker."""
+    """Foreman executes direct localized repairs with exception safety."""
     from .tools import edit_file, write_file
 
     review = state["foreman_review"]
     print("\n=== FOREMAN DIRECT SELF-REPAIR ===")
 
     repaired_files: list[str] = []
+    repair_errors: list[str] = []
+
     for repair in review.direct_repairs:
         physical_path = _sandbox_repo_path(repair.path)
         print(f"Applying Foreman self-repair to {physical_path} ({repair.action})")
-        if repair.action == "edit" and repair.target_text:
-            edit_file.func(
-                path=physical_path,
-                old_text=repair.target_text,
-                new_text=repair.replacement_text,
-            )
-        else:
-            write_file.func(
-                path=physical_path,
-                content=repair.content,
-            )
-        repaired_files.append(repair.path)
+        try:
+            if repair.action == "edit" and repair.target_text:
+                edit_file.func(
+                    path=physical_path,
+                    old_text=repair.target_text,
+                    new_text=repair.replacement_text,
+                )
+            else:
+                write_file.func(
+                    path=physical_path,
+                    content=repair.content,
+                )
+            repaired_files.append(repair.path.removeprefix("sandbox/"))
+        except Exception as exc:
+            err_msg = f"Foreman self-repair failed on {repair.path}: {type(exc).__name__}: {exc}"
+            print(f"WARNING: {err_msg}")
+            repair_errors.append(err_msg)
 
-    # Record repair as a TaskResult so validation & tracking stay unified
+    status = "completed" if repaired_files and not repair_errors else "failure"
     repair_task_result = TaskResult(
-        task_id="foreman_self_repair",
-        status="completed",
+        task_id=f"foreman_self_repair_{state['foreman_repair_attempts'] + 1}",
+        status=status,
         summary=f"Foreman direct repair: {', '.join(review.repair_instructions or ['self-repaired'])}",
         files_changed=repaired_files,
-        errors=[],
+        errors=repair_errors,
     )
 
     return {
@@ -387,10 +479,23 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
 
 
 def foreman_corrective_node(state: WorkflowState) -> dict:
-    """Foreman constructs a new corrective TaskBatch for Worker rebuild."""
+    """Foreman rolls back corrupted files (if requested) and creates a corrective TaskBatch."""
+    from .tools import write_file
+
     foreman = build_foreman()
     batch = state["task_batches"][-1]
     review = state["foreman_review"]
+    snapshots = state.get("file_snapshots", {})
+
+    # Roll back any files Foreman flagged for reset before rebuilding
+    if review and review.rollback_files:
+        print("\n=== FOREMAN ROLLING BACK CORRUPTED FILES ===")
+        for path in review.rollback_files:
+            logical = path.removeprefix("sandbox/")
+            if logical in snapshots:
+                physical_path = _sandbox_repo_path(logical)
+                write_file.func(path=physical_path, content=snapshots[logical])
+                print(f"Reverted {physical_path} to pre-batch snapshot")
 
     print("\n=== FOREMAN GENERATING CORRECTIVE BATCH ===")
     corrective_batch = foreman.create_corrective_batch(
@@ -399,8 +504,14 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         task_results=state["task_results"],
     )
 
+    corrective_batch, updated_snapshots = _prepare_batch_and_workspace(
+        corrective_batch, snapshots
+    )
+
     return {
         "task_batches": state["task_batches"] + [corrective_batch],
+        "file_snapshots": updated_snapshots,
+        "rebuild_attempts": state["rebuild_attempts"] + 1,
         "phase": "corrective_task_ready",
     }
 
@@ -414,7 +525,6 @@ def planner_review_node(state: WorkflowState) -> dict:
     """Planner performs the final evaluation against the initial blueprint."""
     planner = build_planner()
     plan = state["plan"]
-    batch = state["task_batches"][-1]
     repository_context = _gather_full_repository_context()
 
     print("\n=== PLANNER FINAL ACCEPTANCE REVIEW ===")
@@ -422,6 +532,7 @@ def planner_review_node(state: WorkflowState) -> dict:
         project_goal=state["project_goal"],
         plan=plan,
         repository_context=repository_context,
+        validation_result=state.get("validation_result"),
     )
 
     print(review.model_dump_json(indent=2))
@@ -442,19 +553,23 @@ def route_after_foreman_review(state: WorkflowState) -> str:
     if review is None:
         raise RuntimeError("Foreman review missing.")
 
-    if review.decision == "repair":
-        if state["foreman_repair_attempts"] >= MAX_FOREMAN_REPAIRS:
-            print("Foreman self-repair attempts exceeded limit. Escalating to rebuild.")
-            return "rebuild"
-        return "self_repair"
-
-    if review.decision == "rebuild":
-        return "rebuild"
-
     if review.decision == "accept":
         return "accepted"
 
-    raise ValueError(f"Unknown Foreman decision: {review.decision}")
+    if review.decision == "repair":
+        if state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS:
+            return "self_repair"
+        print("Foreman self-repair attempts exceeded limit. Escalating to rebuild.")
+
+    # Handle "rebuild" (or escalated "repair")
+    if state["rebuild_attempts"] >= MAX_WORKER_REBUILDS:
+        print(
+            f"Worker rebuild attempts reached limit ({MAX_WORKER_REBUILDS}). "
+            "Escalating to Planner review."
+        )
+        return "accepted"
+
+    return "rebuild"
 
 
 # ============================================================================
@@ -481,7 +596,6 @@ def build_graph():
     graph.add_edge("worker", "validator")
     graph.add_edge("validator", "foreman_review")
 
-    # Routing based on Foreman review
     graph.add_conditional_edges(
         "foreman_review",
         route_after_foreman_review,
@@ -492,13 +606,8 @@ def build_graph():
         },
     )
 
-    # Direct repairs run through validation again
     graph.add_edge("foreman_self_repair", "validator")
-
-    # Corrective batches are sent to Worker
     graph.add_edge("foreman_corrective", "worker")
-
-    # Final review ends cycle
     graph.add_edge("planner_review", END)
 
     return graph.compile()
@@ -508,7 +617,7 @@ app = build_graph()
 
 
 # ============================================================================
-# Cycle runner
+# Cycle & Multi-Cycle Runners
 # ============================================================================
 
 
@@ -520,25 +629,23 @@ def run_cycle(
     worker_profile: WorkerProfile,
     previous_cycle: CycleResult | None,
 ) -> CycleResult:
-
+    """Execute a single orchestration cycle."""
     final_state = app.invoke(
         {
             "project_goal": goal,
             "architecture_context": architecture,
             "worker_profile": worker_profile,
             "previous_cycle": previous_cycle,
-
             "plan": None,
             "task_batches": [],
             "task_results": [],
-
+            "file_snapshots": {},
             "worker_attempts": {},
             "foreman_repair_attempts": 0,
-
+            "rebuild_attempts": 0,
             "validation_result": None,
             "foreman_review": None,
             "planner_review": None,
-
             "rework_mode": "none",
             "phase": "initial",
         }
@@ -563,3 +670,41 @@ def run_cycle(
         planner_review=planner_review,
         outcome=outcome,
     )
+
+
+def run_project(
+    *,
+    goal: str,
+    architecture: str,
+    worker_profile: WorkerProfile,
+    max_cycles: int = 3,
+) -> list[CycleResult]:
+    """
+    Execute the outer Planner loop across multiple cycles until
+    Planner accepts the integrated solution or max_cycles is reached.
+    """
+    history: list[CycleResult] = []
+    previous_cycle: CycleResult | None = None
+
+    for cycle_id in range(1, max_cycles + 1):
+        print(f"\n==========================================")
+        print(f"=== STARTING ORCHESTRATION CYCLE {cycle_id}/{max_cycles} ===")
+        print(f"==========================================")
+
+        result = run_cycle(
+            cycle_id=cycle_id,
+            goal=goal,
+            architecture=architecture,
+            worker_profile=worker_profile,
+            previous_cycle=previous_cycle,
+        )
+        history.append(result)
+
+        if result.outcome == "overall_success":
+            print(f"\n=== PROJECT ACCEPTED IN CYCLE {cycle_id} ===")
+            break
+
+        print(f"\n=== CYCLE {cycle_id} INCOMPLETE ({result.outcome}) — RE-PLANNING ===")
+        previous_cycle = result
+
+    return history

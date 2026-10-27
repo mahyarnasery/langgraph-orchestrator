@@ -11,18 +11,12 @@ def _safe_path(path: str) -> Path:
     """
     Resolve a relative path and ensure it remains inside the
     orchestration workspace.
-
-    Absolute paths and path traversal outside WORKSPACE_ROOT
-    are rejected.
     """
     candidate = Path(path)
 
     if candidate.is_absolute():
-        raise ValueError(
-            f"Absolute paths are not allowed: {path}"
-        )
+        raise ValueError(f"Absolute paths are not allowed: {path}")
 
-    # Normalize sandbox-prefixed paths if provided
     normalized = candidate
     if str(candidate).startswith("sandbox/"):
         normalized = Path(str(candidate).removeprefix("sandbox/"))
@@ -32,18 +26,21 @@ def _safe_path(path: str) -> Path:
     try:
         resolved.relative_to(WORKSPACE_ROOT)
     except ValueError as exc:
-        raise ValueError(
-            f"Path escapes orchestration workspace: {path}"
-        ) from exc
+        raise ValueError(f"Path escapes orchestration workspace: {path}") from exc
 
     return resolved
 
 
+def _ensure_trailing_newline(content: str) -> str:
+    """Ensure non-empty file content ends with a newline to prevent line concatenation."""
+    if content and not content.endswith("\n"):
+        return content + "\n"
+    return content
+
+
 @tool
 def read_file(path: str) -> dict:
-    """
-    Read content of a file within the workspace.
-    """
+    """Read content of a file within the workspace."""
     file_path = _safe_path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -65,26 +62,22 @@ def create_file(path: str, content: str = "") -> dict:
         raise FileExistsError(f"File already exists: {path}")
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content, encoding="utf-8")
+    file_path.write_text(_ensure_trailing_newline(content), encoding="utf-8")
     return {"path": path, "status": "created"}
 
 
 @tool
 def write_file(path: str, content: str) -> dict:
-    """
-    Overwrite or write content to a file within the workspace.
-    """
+    """Overwrite or write content to a file within the workspace."""
     file_path = _safe_path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content, encoding="utf-8")
+    file_path.write_text(_ensure_trailing_newline(content), encoding="utf-8")
     return {"path": path, "status": "written"}
 
 
 @tool
 def edit_file(path: str, old_text: str, new_text: str) -> dict:
-    """
-    Replace target text in a file within the workspace.
-    """
+    """Replace target text in a file within the workspace."""
     file_path = _safe_path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -94,5 +87,5 @@ def edit_file(path: str, old_text: str, new_text: str) -> dict:
         raise ValueError(f"Target text not found in {path}")
 
     updated_content = current_content.replace(old_text, new_text, 1)
-    file_path.write_text(updated_content, encoding="utf-8")
+    file_path.write_text(_ensure_trailing_newline(updated_content), encoding="utf-8")
     return {"path": path, "status": "edited"}

@@ -22,9 +22,7 @@ class ForemanAgent:
         previous_cycle: CycleResult | None,
         plan: Plan,
     ) -> TaskBatch:
-        worker_profile_text = worker_profile.model_dump_json(
-            indent=2
-        )
+        worker_profile_text = worker_profile.model_dump_json(indent=2)
 
         previous_cycle_text = (
             previous_cycle.model_dump_json(indent=2)
@@ -32,7 +30,6 @@ class ForemanAgent:
             else "None (Cycle 1)"
         )
 
-        # Include previous cycle execution evidence if available
         previous_evidence = ""
         if previous_cycle is not None:
             previous_evidence = f"""
@@ -66,18 +63,16 @@ Planner plan:
 
 Responsibilities:
 - Decompose the plan into concrete implementation tasks.
-- Define task dependencies.
-- Define task scope.
-- Define relevant files.
-- Define acceptance criteria.
-- Keep tasks small enough for the Worker.
+- CRITICAL: The orchestration layer automatically pre-creates all empty files before the Worker runs. NEVER create a separate task just to create an empty file. Every task must write or modify actual code.
+- If a single file only needs one small implementation, use a SINGLE task for that file.
+- For multi-file plans, create ONE task per file in dependency order (e.g., Task 1 creates the helper/library module, Task 2 creates the entry-point script with `dependencies: ["t1"]`).
+- CRITICAL: Each task's `relevant_files` must list ONLY the file(s) that specific task writes or modifies. Do NOT list imported dependency files in `task.relevant_files` (the harness automatically passes dependency files as read-only context).
+- Define task dependencies and populate execution_order with all task_ids.
+- Define task scope, relevant_files, and concrete acceptance_criteria.
+- Leave verification_command as null unless a specific pytest/unittest suite must be executed (NEVER use shell pipes like `|` or `grep` in verification_command; the Validator already checks syntax, file contents, and executes Python scripts automatically).
 - Do not redesign the Planner's architecture.
-- Use previous cycle evidence to avoid repeating failures.
 
-The Worker edits existing files only.
-If a required file does not exist, the orchestration layer will prepare it.
-
-Every file mentioned by a task must appear in TaskBatch.relevant_files.
+Every file mentioned by a task must appear in both task.relevant_files and TaskBatch.relevant_files.
 
 Return only the structured TaskBatch.
 """
@@ -108,8 +103,10 @@ Previous task execution outcomes:
 {', '.join(f'{r.task_id}: {r.status}' for r in task_results)}
 
 Generate a new, focused TaskBatch addressing only the tasks needing rebuild/correction.
-All tasks must specify unambiguous scope, constraints, and acceptance criteria.
-Ensure every referenced file is listed in relevant_files.
+- Populate execution_order with the exact task_ids in this corrective batch.
+- Specify unambiguous scope, constraints, and acceptance criteria.
+- Leave verification_command as null unless running a dedicated test runner without shell pipes.
+- Ensure every referenced file is listed in both task.relevant_files and TaskBatch.relevant_files.
 
 Return only the structured TaskBatch.
 """
@@ -129,23 +126,20 @@ Return only the structured TaskBatch.
         validation_result: ValidationResult,
         repository_context: str,
         worker_attempts: dict[str, int],
+        foreman_repair_attempts: int = 0,
+        max_foreman_repairs: int = 2,
     ) -> ForemanReview:
         """Review the Worker implementation and choose the next action."""
 
         task_results_context = "\n\n".join(
-            result.model_dump_json(indent=2)
-            for result in task_results
+            result.model_dump_json(indent=2) for result in task_results
         )
 
-        validation_context = validation_result.model_dump_json(
-            indent=2
-        )
+        validation_context = validation_result.model_dump_json(indent=2)
 
         worker_attempts_context = "\n".join(
             f"{task_id}: {attempts}"
-            for task_id, attempts in sorted(
-                worker_attempts.items()
-            )
+            for task_id, attempts in sorted(worker_attempts.items())
         )
 
         prompt = f"""
@@ -178,31 +172,37 @@ Actual repository contents:
 Worker attempt counts:
 {worker_attempts_context}
 
+Foreman direct self-repair attempts used: {foreman_repair_attempts} / {max_foreman_repairs}
+{"CRITICAL: You have exhausted all direct self-repair attempts. Do NOT choose 'repair'. Choose 'accept' (if the code works) or 'rebuild'." if foreman_repair_attempts >= max_foreman_repairs else ""}
+
 Determine the smallest appropriate next action.
 
 Choose exactly ONE decision:
 
 "accept"
     The implementation satisfies the Planner's acceptance criteria
-    and has no meaningful implementation problem.
+    and passes deterministic validation with no meaningful problem.
 
 "repair"
-    The implementation is fundamentally correct but has a small,
-    localized problem that you (Foreman) can repair directly yourself.
+    The implementation is fundamentally close or small enough that you
+    (Foreman) can repair it directly yourself.
     When choosing "repair", you MUST provide direct_repairs with the exact
-    file path and changes (overwrite or edit).
+    file path and changes (prefer action="overwrite" with full file content
+    for small files, or action="edit" with exact target_text/replacement_text).
 
 "rebuild"
     One or more Worker tasks should be sent back to Worker because the
     implementation needs substantial changes, logic rewrite, or additions.
+    If the Worker corrupted a file and it should be reset before rebuilding,
+    list those paths in rollback_files.
 
 Rules:
 1. Do not redesign the architecture.
 2. The deterministic Validator is authoritative for syntax, file existence, and scope checks.
 3. Actual repository contents are the source of truth.
-4. Prefer "repair" when the fix is small/minor (e.g. typos, single missing print/return, small syntax tweak).
+4. Prefer "repair" when the fix is small/minor (e.g. typos, single missing print/return, small syntax tweak, or empty file needing a 1-5 line implementation).
 5. For "repair", populate direct_repairs with precise actions.
-6. For "rebuild", populate rebuild_task_ids and repair_instructions.
+6. For "rebuild", populate rebuild_task_ids and repair_instructions (and rollback_files if corrupted).
 7. For "accept", accepted must be true, and problems, repair_instructions, direct_repairs, and rebuild_task_ids must be empty.
 
 Return only the structured ForemanReview.

@@ -1,5 +1,11 @@
 from src.orchestration.models import PLANNER_MODEL, model_session
-from src.orchestration.schemas import CycleResult, Plan, PlannerReview, WorkerProfile
+from src.orchestration.schemas import (
+    CycleResult,
+    Plan,
+    PlannerReview,
+    ValidationResult,
+    WorkerProfile,
+)
 
 
 class PlannerAgent:
@@ -19,9 +25,7 @@ class PlannerAgent:
             else "None (Cycle 1)"
         )
 
-        worker_profile_text = worker_profile.model_dump_json(
-            indent=2
-        )
+        worker_profile_text = worker_profile.model_dump_json(indent=2)
 
         prompt = f"""
 You are the Planner / Architect.
@@ -59,11 +63,18 @@ Return only the structured Plan.
         project_goal: str,
         plan: Plan,
         repository_context: str,
+        validation_result: ValidationResult | None = None,
     ) -> PlannerReview:
         """Evaluate whether the integrated repository code satisfies the blueprint."""
 
+        validation_text = (
+            validation_result.model_dump_json(indent=2)
+            if validation_result is not None
+            else "Not available"
+        )
+
         prompt = f"""
-You are the Planner / Architect conducting the final acceptance review.
+You are the Planner / Architect conducting the final acceptance review AFTER the Worker and Foreman have finished modifying the repository.
 
 Project goal:
 {project_goal}
@@ -71,11 +82,17 @@ Project goal:
 Initial architectural blueprint & acceptance criteria:
 {plan.model_dump_json(indent=2)}
 
-Final integrated repository content:
+Deterministic Validator results (post-implementation):
+{validation_text}
+
+Final integrated repository content (post-implementation state on disk):
 {repository_context}
 
-Evaluate each acceptance criterion against the actual repository content.
-Determine whether the overall solution is accepted.
+Instructions:
+1. Evaluate each acceptance criterion against the final repository content and Validator results.
+2. Note that the Worker has ALREADY applied the fixes/changes to produce the repository content shown above.
+3. If every acceptance criterion is satisfied by the current repository content and deterministic validation passed, you MUST set `accepted` to `true`.
+4. Only set `accepted` to `false` if a required file, function, or behavior is still missing or broken in the final repository content.
 
 Return only the structured PlannerReview.
 """

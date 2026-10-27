@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -31,23 +31,48 @@ class Plan(BaseModel):
 class PlannerReview(BaseModel):
     """Final acceptance review produced by the Planner."""
 
-    accepted: bool = Field(
-        description="True if the integrated solution fully satisfies the original blueprint and goal."
-    )
-
     criteria_evaluation: list[str] = Field(
         default_factory=list,
-        description="Evaluation against each acceptance criterion."
+        description="Step-by-step evaluation against each acceptance criterion (mark each PASS or FAIL)."
     )
 
     feedback: list[str] = Field(
         default_factory=list,
-        description="Constructive architectural feedback or missing elements."
+        description="Constructive architectural feedback or missing elements (empty if all criteria pass)."
     )
 
     summary: str = Field(
         description="Concise summary of final assessment."
     )
+
+    accepted: bool = Field(
+        description="MUST be True if all acceptance criteria pass in criteria_evaluation; False only if a criterion failed."
+    )
+
+    @model_validator(mode="after")
+    def _sync_accepted_with_evaluation(self) -> "PlannerReview":
+        """If the LLM evaluated all criteria as passing and reported no failures, ensure accepted is True."""
+        if not self.accepted and self.criteria_evaluation:
+            eval_text = " ".join(self.criteria_evaluation).lower()
+            summary_lower = self.summary.lower()
+            has_pass = any(w in eval_text for w in ("pass", "passed", "accepted", "satisfied", "met"))
+            has_fail = any(
+                w in eval_text
+                for w in ("fail", "failed", "missing", "incorrect", "not met", "error:")
+            )
+            summary_confirms = any(
+                phrase in summary_lower
+                for phrase in (
+                    "all acceptance criteria are met",
+                    "meets all stated requirements",
+                    "meets all specified requirements",
+                    "satisfies all",
+                    "fully functional",
+                )
+            )
+            if has_pass and not has_fail and summary_confirms:
+                self.accepted = True
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +104,7 @@ class WorkerProfile(BaseModel):
     )
 
     execution_mode: str = Field(
-        description="Execution strategy (e.g. one_session_per_batch)."
+        description="Execution strategy (e.g. one_session_per_task)."
     )
 
 
@@ -128,7 +153,7 @@ class Task(BaseModel):
 
 class TaskBatch(BaseModel):
     """
-    Group of related tasks executed during one Worker harness session.
+    Group of related tasks executed during a Worker harness phase.
     """
 
     batch_id: str = Field(
@@ -160,6 +185,11 @@ class TaskBatch(BaseModel):
 
     execution_order: list[str] = Field(
         description="Ordered list of task IDs."
+    )
+
+    verification_command: str | None = Field(
+        default=None,
+        description="Optional command to verify batch behavior (e.g. 'pytest' or 'python main.py')."
     )
 
 
@@ -264,7 +294,12 @@ class ForemanReview(BaseModel):
 
     rebuild_task_ids: list[str] = Field(
         default_factory=list,
-        description="Task IDs that must be rebuilt from clean files."
+        description="Task IDs that must be rebuilt."
+    )
+
+    rollback_files: list[str] = Field(
+        default_factory=list,
+        description="Files to revert to pre-batch snapshot before rebuilding."
     )
 
     summary: str = Field(
