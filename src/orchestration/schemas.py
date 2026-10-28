@@ -5,6 +5,28 @@ from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
+# Execution Ledger (Concise Shared Context)
+# ---------------------------------------------------------------------------
+
+class LedgerEntry(BaseModel):
+    """Single concise record of an orchestration step and its outcome."""
+
+    cycle_id: int = Field(description="Cycle number.")
+    step: int = Field(description="Sequential step number within the cycle.")
+    layer: Literal[
+        "planner", "foreman", "worker", "assembler", "validator"
+    ] = Field(description="Which orchestration layer executed this step.")
+    action: str = Field(description="Short action identifier.")
+    target: str = Field(description="Target file, task_id, or symbol.")
+    status: Literal["success", "warning", "failure"] = Field(
+        description="Outcome status of the step."
+    )
+    detail: str = Field(
+        description="Concise 1-line summary of what happened and why."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Planner
 # ---------------------------------------------------------------------------
 
@@ -80,57 +102,35 @@ class PlannerReview(BaseModel):
 # ---------------------------------------------------------------------------
 
 class WorkerProfile(BaseModel):
-    """
-    Compact description of the Worker model's capabilities.
+    """Compact description of the Worker model's capabilities."""
 
-    This is planning metadata consumed by the Planner and Foreman.
-    It is not runtime telemetry.
-    """
-
-    model: str = Field(
-        description="Worker model identifier."
-    )
-
-    context_limit: str = Field(
-        description="Qualitative context constraint (e.g. 'limited')."
-    )
-
-    strengths: list[str] = Field(
-        description="Kinds of implementation work the Worker performs well."
-    )
-
-    avoid: list[str] = Field(
-        description="Work the Worker should not be assigned."
-    )
-
-    execution_mode: str = Field(
-        description="Execution strategy (e.g. one_session_per_task)."
-    )
+    model: str = Field(description="Worker model identifier.")
+    context_limit: str = Field(description="Qualitative context constraint.")
+    strengths: list[str] = Field(description="Work the Worker performs well.")
+    avoid: list[str] = Field(description="Work the Worker should not be assigned.")
+    execution_mode: str = Field(description="Execution strategy.")
 
 
 # ---------------------------------------------------------------------------
-# Task
+# Task & Batch
 # ---------------------------------------------------------------------------
 
 class Task(BaseModel):
-    """
-    Concrete implementation task assigned to the Worker harness.
-    """
+    """Concrete implementation task assigned to the Worker harness."""
 
-    task_id: str = Field(
-        description="Unique task identifier."
+    task_id: str = Field(description="Unique task identifier (e.g. 't1').")
+
+    objective: str = Field(description="Specific implementation objective.")
+
+    target_symbol: str | None = Field(
+        default=None,
+        description="Optional single function or class name this task implements (e.g. 'parse_scores')."
     )
 
-    objective: str = Field(
-        description="Specific implementation objective."
-    )
-
-    scope: str = Field(
-        description="Explicit boundaries of what may be modified."
-    )
+    scope: str = Field(description="Explicit boundaries of what may be modified.")
 
     relevant_files: list[str] = Field(
-        description="Files relevant to the task."
+        description="Target file(s) where this task's code belongs."
     )
 
     dependencies: list[str] = Field(
@@ -139,6 +139,7 @@ class Task(BaseModel):
     )
 
     constraints: list[str] = Field(
+        default_factory=list,
         description="Technical or architectural constraints."
     )
 
@@ -147,49 +148,30 @@ class Task(BaseModel):
     )
 
 
-# ---------------------------------------------------------------------------
-# Task batching
-# ---------------------------------------------------------------------------
-
 class TaskBatch(BaseModel):
-    """
-    Group of related tasks executed during a Worker harness phase.
-    """
+    """Group of related tasks executed during a Worker harness phase."""
 
-    batch_id: str = Field(
-        description="Unique identifier for the batch."
-    )
-
-    objective: str = Field(
-        description="Shared objective of the batch."
-    )
-
-    tasks: list[Task] = Field(
-        description="Tasks included in the batch."
-    )
-
+    batch_id: str = Field(description="Unique identifier for the batch.")
+    objective: str = Field(description="Shared objective of the batch.")
+    tasks: list[Task] = Field(description="Tasks included in the batch.")
     shared_context: list[str] = Field(
         default_factory=list,
         description="Compact context shared across every task."
     )
-
     relevant_files: list[str] = Field(
         default_factory=list,
         description="Union of repository files relevant to the batch."
     )
-
     constraints: list[str] = Field(
         default_factory=list,
         description="Batch-wide constraints."
     )
-
     execution_order: list[str] = Field(
         description="Ordered list of task IDs."
     )
-
     verification_command: str | None = Field(
         default=None,
-        description="Optional command to verify batch behavior (e.g. 'pytest' or 'python main.py')."
+        description="Optional command to verify batch behavior."
     )
 
 
@@ -198,29 +180,21 @@ class TaskBatch(BaseModel):
 # ---------------------------------------------------------------------------
 
 class TaskResult(BaseModel):
-    """
-    Compact result returned by the coding harness after task execution.
+    """Compact result returned by the coding harness after task execution."""
 
-    The orchestration layer does not store individual tool calls.
-    """
-
-    task_id: str = Field(
-        description="Completed task identifier."
-    )
-
+    task_id: str = Field(description="Completed task identifier.")
     status: Literal["completed", "partial", "failure", "no_change"] = Field(
         description="Execution outcome of the task."
     )
-
-    summary: str = Field(
-        description="Concise summary of what was accomplished."
-    )
-
+    summary: str = Field(description="Concise summary of what was accomplished.")
     files_changed: list[str] = Field(
         default_factory=list,
-        description="Files modified by the harness."
+        description="Logical files modified or staged by the harness."
     )
-
+    staged_file: str | None = Field(
+        default=None,
+        description="Path to isolated staging snippet if task was staged."
+    )
     errors: list[str] = Field(
         default_factory=list,
         description="Execution or validation errors."
@@ -228,31 +202,38 @@ class TaskResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Foreman review & self-repair
+# Foreman Assembly, Review & Self-Repair
 # ---------------------------------------------------------------------------
+
+class AssembledModule(BaseModel):
+    """Output produced when Foreman assembles multiple staged Worker snippets into a module."""
+
+    path: str = Field(description="Target module file path (e.g. 'analytics.py').")
+    assembled_code: str = Field(
+        description="Complete, coherent Python module code combining all task snippets."
+    )
+    notes: str = Field(
+        default="",
+        description="Brief note on how snippets were integrated or adjusted."
+    )
+
 
 class DirectRepairPatch(BaseModel):
     """Specific localized file fix performed directly by Foreman."""
 
-    path: str = Field(
-        description="Workspace relative file path to patch."
-    )
-
+    path: str = Field(description="Workspace relative file path to patch.")
     action: Literal["overwrite", "edit"] = Field(
         default="overwrite",
         description="overwrite entire content or replace target text."
     )
-
     content: str = Field(
         default="",
         description="Full content to write if action is overwrite."
     )
-
     target_text: str = Field(
         default="",
         description="Existing text snippet to replace if action is edit."
     )
-
     replacement_text: str = Field(
         default="",
         description="Replacement text snippet if action is edit."
@@ -260,48 +241,38 @@ class DirectRepairPatch(BaseModel):
 
 
 class ForemanReview(BaseModel):
-    """
-    Review and integration decision produced by the Foreman.
-    """
+    """Review and integration decision produced by the Foreman."""
 
     decision: Literal["accept", "repair", "rebuild"] = Field(
         description="accept | repair | rebuild"
     )
-
     accepted: bool = Field(
         description="True only when the implementation is accepted."
     )
-
     reviewed_task_ids: list[str] = Field(
         default_factory=list,
         description="Task IDs evaluated during this review."
     )
-
     problems: list[str] = Field(
         default_factory=list,
         description="Concrete implementation problems identified."
     )
-
     repair_instructions: list[str] = Field(
         default_factory=list,
         description="Precise instructions for repairing or rebuilding the implementation."
     )
-
     direct_repairs: list[DirectRepairPatch] = Field(
         default_factory=list,
         description="Concrete patches if Foreman decides to repair directly."
     )
-
     rebuild_task_ids: list[str] = Field(
         default_factory=list,
         description="Task IDs that must be rebuilt."
     )
-
     rollback_files: list[str] = Field(
         default_factory=list,
         description="Files to revert to pre-batch snapshot before rebuilding."
     )
-
     summary: str = Field(
         description="Brief explanation of the review decision."
     )
@@ -314,74 +285,45 @@ class ForemanReview(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Cycle memory
+# Cycle memory & Validator
 # ---------------------------------------------------------------------------
 
 class CycleResult(BaseModel):
-    """
-    Compact orchestration record persisted into the next cycle.
+    """Compact orchestration record persisted into the next cycle."""
 
-    The repository remains the source of truth for code.
-    This object preserves execution decisions and outcomes.
-    """
-
-    cycle_id: int = Field(
-        description="Sequential orchestration cycle number."
+    cycle_id: int = Field(description="Sequential orchestration cycle number.")
+    plan: Plan = Field(description="Planner output for this cycle.")
+    task_batches: list[TaskBatch] = Field(description="Batches produced for Worker execution.")
+    task_results: list[TaskResult] = Field(description="Coding harness execution results.")
+    ledger: list[LedgerEntry] = Field(
+        default_factory=list,
+        description="Concise chronological ledger of steps taken during this cycle."
     )
-
-    plan: Plan = Field(
-        description="Planner output for this cycle."
-    )
-
-    task_batches: list[TaskBatch] = Field(
-        description="Batches produced for Worker execution."
-    )
-
-    task_results: list[TaskResult] = Field(
-        description="Coding harness execution results."
-    )
-
     planner_review: PlannerReview | None = Field(
         default=None,
         description="Planner final review result."
     )
+    outcome: str = Field(description="overall_success | partial | failure")
 
-    outcome: str = Field(
-        description="overall_success | partial | failure"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Validator
-# ---------------------------------------------------------------------------
 
 class ValidationResult(BaseModel):
-    """
-    Deterministic validation produced by the Validator.
-
-    This model contains only objective facts gathered from repository
-    inspection. No LLM reasoning or subjective review belongs here.
-    """
+    """Deterministic validation produced by the Validator."""
 
     passed: bool = Field(
         description="True only if every deterministic validation check passed."
     )
-
     checks: list[str] = Field(
         default_factory=list,
         description="Successful validation checks."
     )
-
     errors: list[str] = Field(
         default_factory=list,
         description="Deterministic validation failures."
     )
-
     files_checked: list[str] = Field(
         default_factory=list,
         description="Repository files inspected by the validator."
     )
-
     changed_files: list[str] = Field(
         default_factory=list,
         description="Files modified during the batch."

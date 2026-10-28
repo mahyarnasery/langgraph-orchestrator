@@ -18,6 +18,7 @@ class PlannerAgent:
         architecture_context: str,
         worker_profile: WorkerProfile,
         previous_cycle: CycleResult | None,
+        ledger_context: str = "",
     ) -> Plan:
         previous_cycle_text = (
             previous_cycle.model_dump_json(indent=2)
@@ -34,9 +35,8 @@ Responsibilities:
 - Analyze the project goal.
 - Define the high-level implementation approach.
 - Identify affected repository areas.
-- Define acceptance criteria.
+- Define clear acceptance criteria.
 - Do not implement code.
-- Do not modify the repository.
 
 Project goal:
 {project_goal}
@@ -44,11 +44,15 @@ Project goal:
 Architecture context:
 {architecture_context}
 
+Execution Ledger:
+{ledger_context}
+
 Worker profile:
 {worker_profile_text}
 
 Previous cycle:
 {previous_cycle_text}
+
 
 Return only the structured Plan.
 """
@@ -64,6 +68,7 @@ Return only the structured Plan.
         plan: Plan,
         repository_context: str,
         validation_result: ValidationResult | None = None,
+        ledger_context: str = "",
     ) -> PlannerReview:
         """Evaluate whether the integrated repository code satisfies the blueprint."""
 
@@ -74,13 +79,16 @@ Return only the structured Plan.
         )
 
         prompt = f"""
-You are the Planner / Architect conducting the final acceptance review AFTER the Worker and Foreman have finished modifying the repository.
+You are the Planner / Architect conducting the final acceptance review AFTER the Worker and Foreman have finished implementing and assembling the repository.
 
 Project goal:
 {project_goal}
 
 Initial architectural blueprint & acceptance criteria:
 {plan.model_dump_json(indent=2)}
+
+Execution Ledger (steps taken & verified in this cycle):
+{ledger_context}
 
 Deterministic Validator results (post-implementation):
 {validation_text}
@@ -90,9 +98,10 @@ Final integrated repository content (post-implementation state on disk):
 
 Instructions:
 1. Evaluate each acceptance criterion against the final repository content and Validator results.
-2. Note that the Worker has ALREADY applied the fixes/changes to produce the repository content shown above.
+2. Note that the Worker and Foreman have ALREADY applied and assembled the changes shown above.
 3. If every acceptance criterion is satisfied by the current repository content and deterministic validation passed, you MUST set `accepted` to `true`.
 4. Only set `accepted` to `false` if a required file, function, or behavior is still missing or broken in the final repository content.
+
 
 Return only the structured PlannerReview.
 """

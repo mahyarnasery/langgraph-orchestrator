@@ -1,5 +1,6 @@
 from src.orchestration.models import FOREMAN_MODEL, model_session
 from src.orchestration.schemas import (
+    AssembledModule,
     CycleResult,
     ForemanReview,
     Plan,
@@ -11,7 +12,7 @@ from src.orchestration.schemas import (
 
 
 class ForemanAgent:
-    """Implementation coordination, review, and integration agent."""
+    """Implementation coordination, assembly, review, and integration agent."""
 
     def create_batch(
         self,
@@ -21,24 +22,9 @@ class ForemanAgent:
         worker_profile: WorkerProfile,
         previous_cycle: CycleResult | None,
         plan: Plan,
+        ledger_context: str = "",
     ) -> TaskBatch:
         worker_profile_text = worker_profile.model_dump_json(indent=2)
-
-        previous_cycle_text = (
-            previous_cycle.model_dump_json(indent=2)
-            if previous_cycle is not None
-            else "None (Cycle 1)"
-        )
-
-        previous_evidence = ""
-        if previous_cycle is not None:
-            previous_evidence = f"""
-Previous Cycle Execution Evidence:
-- Plan: {previous_cycle.plan.objective}
-- Outcome: {previous_cycle.outcome}
-- Task Results: {len(previous_cycle.task_results)} tasks executed
-- Planner Review: {'Accepted' if previous_cycle.planner_review and previous_cycle.planner_review.accepted else 'Rejected/Revision Needed'}
-"""
 
         prompt = f"""
 You are the Foreman / Integrator.
@@ -51,28 +37,31 @@ Project goal:
 Architecture context:
 {architecture_context}
 
+Execution Ledger:
+{ledger_context}
+
 Worker profile:
 {worker_profile_text}
-
-Previous cycle:
-{previous_cycle_text}
-{previous_evidence}
 
 Planner plan:
 {plan.model_dump_json(indent=2)}
 
-Responsibilities:
-- Decompose the plan into concrete implementation tasks.
-- CRITICAL: The orchestration layer automatically pre-creates all empty files before the Worker runs. NEVER create a separate task just to create an empty file. Every task must write or modify actual code.
-- If a single file only needs one small implementation, use a SINGLE task for that file.
-- For multi-file plans, create ONE task per file in dependency order (e.g., Task 1 creates the helper/library module, Task 2 creates the entry-point script with `dependencies: ["t1"]`).
-- CRITICAL: Each task's `relevant_files` must list ONLY the file(s) that specific task writes or modifies. Do NOT list imported dependency files in `task.relevant_files` (the harness automatically passes dependency files as read-only context).
-- Define task dependencies and populate execution_order with all task_ids.
-- Define task scope, relevant_files, and concrete acceptance_criteria.
-- Leave verification_command as null unless a specific pytest/unittest suite must be executed (NEVER use shell pipes like `|` or `grep` in verification_command; the Validator already checks syntax, file contents, and executes Python scripts automatically).
-- Do not redesign the Planner's architecture.
+Task Atomization Rules (CRITICAL):
+1. Pre-Creation: The orchestration layer automatically pre-creates empty files. NEVER create a task just to create an empty file.
+2. Function-Level Atomization for Multi-Function Files:
+   - If a Python file requires 2 or more standalone functions (for example, a module with 3 or 4 helper/processing functions), SPLIT that file into separate atomic tasks — ONE task per function!
+   - For each function task on that file, set `relevant_files` to that file (e.g. `["analytics.py"]`) and set `target_symbol` to the exact function name (e.g. `"parse_scores"`).
+   - If function B calls function A in the same file, list function A's task_id in function B's `dependencies`.
+   - The Worker will write each function in an isolated staging file, and you (Foreman) will assemble them into the target module automatically.
+3. Single-Task Files & Classes:
+   - If a file only has 1 function, or is a simple entry-point script (`main.py` / `app.py`), or defines a single `class` with its methods, keep that file or class as a SINGLE task.
+4. Strict File Scope:
+   - Each task's `relevant_files` must list ONLY the file that specific task contributes to. Do NOT list imported dependency files in `task.relevant_files`.
+5. Preserve exact formulas, f-strings, and return expressions from the Project goal in each task's `acceptance_criteria` (do not paraphrase `len(passing)` or `sum(passing)`).
+6. Populate `execution_order` with all `task_id`s in dependency order, and leave `verification_command` as null unless running a dedicated pytest suite without shell pipes.
 
-Every file mentioned by a task must appear in both task.relevant_files and TaskBatch.relevant_files.
+Every file mentioned by a task must appear in both `task.relevant_files` and `TaskBatch.relevant_files`.
+
 
 Return only the structured TaskBatch.
 """
@@ -81,12 +70,66 @@ Return only the structured TaskBatch.
             structured = llm.with_structured_output(TaskBatch)
             return structured.invoke(prompt)
 
+    def assemble_module(
+        self,
+        *,
+        target_file: str,
+        project_goal: str,
+        plan: Plan,
+        staged_snippets: dict[str, str],
+        ast_merged_draft: str,
+        ledger_context: str = "",
+    ) -> AssembledModule:
+        """
+        Assemble multiple atomic Worker function snippets into a coherent Python module.
+        """
+        snippets_text = "\n\n".join(
+            f"--- SNIPPET FROM TASK {task_id} ---\n~~~python\n{code}\n~~~"
+            for task_id, code in staged_snippets.items()
+        )
+
+        prompt = f"""
+You are the Foreman / Integrator assembling atomic Worker code snippets into `{target_file}`.
+
+Project goal:
+{project_goal}
+
+Planner blueprint:
+{plan.model_dump_json(indent=2)}
+
+Execution Ledger:
+{ledger_context}
+
+Worker staged snippets for `{target_file}`:
+{snippets_text}
+
+Deterministic AST-merged draft of `{target_file}`:
+~~~python
+{ast_merged_draft}
+~~~
+
+Responsibilities:
+- Combine all Worker snippets for `{target_file}` into a single, clean, coherent Python file.
+- Deduplicate imports at the top of the file.
+- Ensure there are NO self-imports (never import `{target_file}` inside `{target_file}`).
+- Ensure function calls between snippets in `{target_file}` use matching function names and arguments.
+- Preserve every required function and class without adding unrelated test code or extra prints.
+
+
+Return only the structured AssembledModule.
+"""
+
+        with model_session(FOREMAN_MODEL) as llm:
+            structured = llm.with_structured_output(AssembledModule)
+            return structured.invoke(prompt)
+
     def create_corrective_batch(
         self,
         *,
         batch: TaskBatch,
         review: ForemanReview,
         task_results: list[TaskResult],
+        ledger_context: str = "",
     ) -> TaskBatch:
         """Create a targeted corrective TaskBatch to rebuild/fix failed tasks."""
 
@@ -99,14 +142,18 @@ Original batch:
 Foreman review and rebuild instructions:
 {review.model_dump_json(indent=2)}
 
+Execution Ledger:
+{ledger_context}
+
 Previous task execution outcomes:
 {', '.join(f'{r.task_id}: {r.status}' for r in task_results)}
 
-Generate a new, focused TaskBatch addressing only the tasks needing rebuild/correction.
-- Populate execution_order with the exact task_ids in this corrective batch.
-- Specify unambiguous scope, constraints, and acceptance criteria.
-- Leave verification_command as null unless running a dedicated test runner without shell pipes.
-- Ensure every referenced file is listed in both task.relevant_files and TaskBatch.relevant_files.
+Generate a new, focused TaskBatch addressing ONLY the specific tasks needing rebuild/correction.
+- Preserve `target_symbol` on function-level tasks so only the broken function is rewritten and re-assembled.
+- Populate `execution_order` with the exact `task_id`s in this corrective batch.
+- Leave `verification_command` as null.
+- Ensure every referenced file is listed in both `task.relevant_files` and `TaskBatch.relevant_files`.
+
 
 Return only the structured TaskBatch.
 """
@@ -128,8 +175,9 @@ Return only the structured TaskBatch.
         worker_attempts: dict[str, int],
         foreman_repair_attempts: int = 0,
         max_foreman_repairs: int = 2,
+        ledger_context: str = "",
     ) -> ForemanReview:
-        """Review the Worker implementation and choose the next action."""
+        """Review the assembled implementation and choose the next action."""
 
         task_results_context = "\n\n".join(
             result.model_dump_json(indent=2) for result in task_results
@@ -145,14 +193,14 @@ Return only the structured TaskBatch.
         prompt = f"""
 You are the Foreman / Integrator performing an implementation review.
 
-The Planner owns architecture.
-You own implementation-level integration.
-
 Project goal:
 {project_goal}
 
 Architecture context:
 {architecture_context}
+
+Execution Ledger:
+{ledger_context}
 
 Planner plan:
 {plan.model_dump_json(indent=2)}
@@ -166,7 +214,7 @@ Worker results:
 Deterministic validation:
 {validation_context}
 
-Actual repository contents:
+Actual assembled repository contents:
 {repository_context}
 
 Worker attempt counts:
@@ -175,35 +223,11 @@ Worker attempt counts:
 Foreman direct self-repair attempts used: {foreman_repair_attempts} / {max_foreman_repairs}
 {"CRITICAL: You have exhausted all direct self-repair attempts. Do NOT choose 'repair'. Choose 'accept' (if the code works) or 'rebuild'." if foreman_repair_attempts >= max_foreman_repairs else ""}
 
-Determine the smallest appropriate next action.
+Determine the smallest appropriate next action:
+- "accept": Implementation satisfies the Planner's acceptance criteria and passes deterministic validation.
+- "repair": Implementation is close and has a localized issue you (Foreman) can fix directly via `direct_repairs` (prefer `action="overwrite"` with full file content).
+- "rebuild": One or more specific Worker tasks need to be sent back to the Worker.
 
-Choose exactly ONE decision:
-
-"accept"
-    The implementation satisfies the Planner's acceptance criteria
-    and passes deterministic validation with no meaningful problem.
-
-"repair"
-    The implementation is fundamentally close or small enough that you
-    (Foreman) can repair it directly yourself.
-    When choosing "repair", you MUST provide direct_repairs with the exact
-    file path and changes (prefer action="overwrite" with full file content
-    for small files, or action="edit" with exact target_text/replacement_text).
-
-"rebuild"
-    One or more Worker tasks should be sent back to Worker because the
-    implementation needs substantial changes, logic rewrite, or additions.
-    If the Worker corrupted a file and it should be reset before rebuilding,
-    list those paths in rollback_files.
-
-Rules:
-1. Do not redesign the architecture.
-2. The deterministic Validator is authoritative for syntax, file existence, and scope checks.
-3. Actual repository contents are the source of truth.
-4. Prefer "repair" when the fix is small/minor (e.g. typos, single missing print/return, small syntax tweak, or empty file needing a 1-5 line implementation).
-5. For "repair", populate direct_repairs with precise actions.
-6. For "rebuild", populate rebuild_task_ids and repair_instructions (and rollback_files if corrupted).
-7. For "accept", accepted must be true, and problems, repair_instructions, direct_repairs, and rebuild_task_ids must be empty.
 
 Return only the structured ForemanReview.
 """

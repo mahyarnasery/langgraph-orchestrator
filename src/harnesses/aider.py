@@ -6,31 +6,54 @@ from pathlib import Path
 
 from .base import CodingHarness
 from .config import AiderConfig
+from src.orchestration.ledger import (
+    extract_python_signatures,
+    merge_staged_snippets_ast,
+)
 from src.orchestration.schemas import Task, TaskBatch, TaskResult
 
 
 REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
 WORKSPACE_ROOT = (REPO_ROOT / "sandbox").resolve()
+STAGING_DIR = (WORKSPACE_ROOT / ".staging").resolve()
+
+
+def list_workspace_py_files() -> list[Path]:
+    """Return all user Python files in WORKSPACE_ROOT, excluding .staging and .git."""
+    if not WORKSPACE_ROOT.exists():
+        return []
+    return sorted(
+        p
+        for p in WORKSPACE_ROOT.rglob("*.py")
+        if ".staging" not in p.parts and ".git" not in p.parts
+    )
 
 
 class AiderHarness(CodingHarness):
     """
     Execute a TaskBatch through isolated per-task Aider Worker sessions.
 
-    The Worker is strictly confined to WORKSPACE_ROOT.
-    Upstream dependency files are passed via `--read` so the Worker has
-    exact signature awareness without risking accidental edits to completed files.
+    - If multiple tasks in a batch target the same file (function-level atomization),
+      each task is executed in an isolated staging file (`sandbox/.staging/<task_id>__<file>`)
+      and live-merged into `sandbox/<file>` so the 3B Worker only writes one function at a time.
+    - If only a single task targets a file, Aider edits `sandbox/<file>` directly.
     """
 
     def __init__(self, config: AiderConfig | None = None):
         self.config = config or AiderConfig()
 
-    def execute(self, batch: TaskBatch) -> list[TaskResult]:
+    def execute(
+        self,
+        batch: TaskBatch,
+        existing_staged: dict[str, dict[str, str]] | None = None,
+        file_snapshots: dict[str, str] | None = None,
+        project_goal: str = "",
+    ) -> list[TaskResult]:
         if not batch.tasks:
             raise ValueError("TaskBatch must contain at least one task.")
 
-        if not WORKSPACE_ROOT.is_dir():
-            WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+        WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
         sandbox_git = WORKSPACE_ROOT / ".git"
         if not sandbox_git.exists():
@@ -54,20 +77,16 @@ class AiderHarness(CodingHarness):
             if task.task_id not in seen_ids:
                 ordered_tasks.append(task)
 
-        all_files = sorted(
-            {
-                path.removeprefix("sandbox/")
-                for task in ordered_tasks
-                for path in (task.relevant_files or batch.relevant_files)
-            }
-            | {path.removeprefix("sandbox/") for path in batch.relevant_files}
-        )
+        file_task_counts: dict[str, int] = {}
+        for task in ordered_tasks:
+            for raw_path in (task.relevant_files or batch.relevant_files):
+                norm = raw_path.removeprefix("sandbox/")
+                file_task_counts[norm] = file_task_counts.get(norm, 0) + 1
 
-        if not all_files:
-            raise ValueError("TaskBatch must identify at least one relevant file.")
-
-        for path in all_files:
-            self._safe_workspace_path(path)
+        staged_snippets: dict[str, dict[str, str]] = {
+            k: dict(v) for k, v in (existing_staged or {}).items()
+        }
+        snapshots = dict(file_snapshots or {})
 
         env = os.environ.copy()
         env.pop("GIT_DIR", None)
@@ -75,6 +94,7 @@ class AiderHarness(CodingHarness):
 
         task_results: list[TaskResult] = []
         completed_files: set[str] = set()
+        completed_sibling_sigs: dict[str, list[str]] = {}
 
         try:
             for task in ordered_tasks:
@@ -84,17 +104,32 @@ class AiderHarness(CodingHarness):
                         for p in (task.relevant_files or batch.relevant_files)
                     }
                 )
+                for path in declared_files:
+                    self._safe_workspace_path(path)
 
-                # Separate editable target files from already-completed dependency files
-                editable_files = list(declared_files)
-                if len(editable_files) > 1:
-                    uncompleted = [
-                        f for f in editable_files if f not in completed_files
-                    ]
-                    if uncompleted:
-                        editable_files = uncompleted
+                primary_target = declared_files[0]
+                use_staging = (
+                    file_task_counts.get(primary_target, 0) > 1
+                    or primary_target in staged_snippets
+                )
 
-                # Gather read-only context files from dependencies & previously completed tasks
+                if use_staging:
+                    safe_name = primary_target.replace("/", "__")
+                    staged_rel_path = f".staging/{task.task_id}__{safe_name}"
+                    staged_abs_path = self._safe_workspace_path(staged_rel_path)
+                    staged_abs_path.parent.mkdir(parents=True, exist_ok=True)
+                    staged_abs_path.write_text("", encoding="utf-8")
+                    editable_files = [staged_rel_path]
+                else:
+                    staged_rel_path = None
+                    editable_files = list(declared_files)
+                    if len(editable_files) > 1:
+                        uncompleted = [
+                            f for f in editable_files if f not in completed_files
+                        ]
+                        if uncompleted:
+                            editable_files = uncompleted
+
                 dep_files: set[str] = set()
                 for dep_id in task.dependencies:
                     dep_task = tasks_by_id.get(dep_id)
@@ -104,7 +139,7 @@ class AiderHarness(CodingHarness):
 
                 existing_workspace_py = {
                     str(p.relative_to(WORKSPACE_ROOT))
-                    for p in WORKSPACE_ROOT.rglob("*.py")
+                    for p in list_workspace_py_files()
                 }
                 read_only_files = sorted(
                     f
@@ -114,7 +149,9 @@ class AiderHarness(CodingHarness):
                         | set(declared_files)
                         | existing_workspace_py
                     )
-                    if f not in editable_files and self._is_non_empty_file(f)
+                    if f not in editable_files
+                    and (not use_staging or f != primary_target)
+                    and self._is_non_empty_file(f)
                 )
 
                 before = self._snapshot_files(editable_files)
@@ -122,8 +159,12 @@ class AiderHarness(CodingHarness):
                 prompt = self._build_task_prompt(
                     batch=batch,
                     task=task,
+                    logical_target=primary_target,
                     editable_files=editable_files,
                     read_only_files=read_only_files,
+                    use_staging=use_staging,
+                    sibling_signatures=completed_sibling_sigs.get(primary_target, []),
+                    project_goal=project_goal,
                 )
 
                 read_args: list[str] = []
@@ -138,6 +179,7 @@ class AiderHarness(CodingHarness):
                     self.config.edit_format,
                     "--yes",
                     "--no-auto-commits",
+                    "--no-auto-lint",
                     "--no-git",
                     "--subtree-only",
                     *read_args,
@@ -149,7 +191,10 @@ class AiderHarness(CodingHarness):
                 print(f"\n=== AIDER WORKER (Task: {task.task_id}) ===")
                 print(f"Model: {self.config.model}")
                 print(f"Batch: {batch.batch_id}")
-                print(f"Editable Files: {', '.join(editable_files)}")
+                print(f"Target Module: {primary_target}")
+                if task.target_symbol:
+                    print(f"Target Symbol: {task.target_symbol}")
+                print(f"Editable File: {', '.join(editable_files)}")
                 if read_only_files:
                     print(f"Read-Only Context: {', '.join(read_only_files)}")
 
@@ -161,12 +206,35 @@ class AiderHarness(CodingHarness):
                 )
 
                 after = self._snapshot_files(editable_files)
-                changed = [
+                changed_physical = [
                     f for f in editable_files if before.get(f) != after.get(f)
                 ]
 
-                for f in changed:
-                    completed_files.add(f)
+                if use_staging and staged_rel_path:
+                    snippet_code = after.get(staged_rel_path, "").strip()
+                    changed = [primary_target] if snippet_code else []
+                    if snippet_code:
+                        staged_snippets.setdefault(primary_target, {})[
+                            task.task_id
+                        ] = snippet_code
+                        sigs = extract_python_signatures(snippet_code)
+                        if sigs:
+                            completed_sibling_sigs.setdefault(primary_target, []).extend(
+                                f"{s} (from task {task.task_id})" for s in sigs
+                            )
+                        ordered_pairs = list(staged_snippets[primary_target].items())
+                        merged_live = merge_staged_snippets_ast(
+                            target_filename=primary_target,
+                            base_source=snapshots.get(primary_target, ""),
+                            ordered_snippets=ordered_pairs,
+                        )
+                        target_abs = self._safe_workspace_path(primary_target)
+                        target_abs.write_text(merged_live, encoding="utf-8")
+                        completed_files.add(primary_target)
+                else:
+                    changed = changed_physical
+                    for f in changed:
+                        completed_files.add(f)
 
                 errors: list[str] = []
                 if completed.returncode != 0:
@@ -184,10 +252,11 @@ class AiderHarness(CodingHarness):
                         task_id=task.task_id,
                         status=status,
                         summary=(
-                            f"Executed task {task.task_id} via Aider "
-                            f"({len(changed)} file(s) modified)."
+                            f"Executed task {task.task_id} "
+                            f"({'staged for ' + primary_target if use_staging else primary_target})."
                         ),
                         files_changed=changed,
+                        staged_file=staged_rel_path if use_staging else None,
                         errors=errors,
                     )
                 )
@@ -201,7 +270,6 @@ class AiderHarness(CodingHarness):
         return p.is_file() and bool(p.read_text(encoding="utf-8").strip())
 
     def _unload_worker_model(self) -> None:
-        """Stop the Ollama worker model after execution to free VRAM for Foreman/Planner."""
         raw_model = self.config.model
         for prefix in ("ollama_chat/", "ollama/"):
             if raw_model.startswith(prefix):
@@ -215,7 +283,6 @@ class AiderHarness(CodingHarness):
         )
 
     def _safe_workspace_path(self, path: str) -> Path:
-        """Resolve a path relative to the workspace root, preventing directory traversal."""
         normalized = path.removeprefix("sandbox/")
         requested = (WORKSPACE_ROOT / normalized).resolve()
         if not requested.is_relative_to(WORKSPACE_ROOT):
@@ -227,17 +294,59 @@ class AiderHarness(CodingHarness):
         *,
         batch: TaskBatch,
         task: Task,
+        logical_target: str,
         editable_files: list[str],
         read_only_files: list[str],
+        use_staging: bool,
+        sibling_signatures: list[str],
+        project_goal: str = "",
     ) -> str:
-        """Build a focused single-task prompt for Aider."""
         lines = [
             f"# Batch Objective: {batch.objective}",
-            f"## Task {task.task_id}: {task.objective}",
-            f"Target File(s) to Edit: {', '.join(editable_files)}",
-            f"Scope: {task.scope}",
-            "",
         ]
+        if project_goal.strip():
+            lines.extend(
+                [
+                    "## Full Project Specification (for exact formula & signature reference):",
+                    project_goal.strip(),
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                f"## Current Atomic Task {task.task_id}: {task.objective}",
+                f"Logical Module: {logical_target}",
+            ]
+        )
+        if task.target_symbol:
+            lines.append(f"Target Function/Symbol to Implement: {task.target_symbol}")
+        lines.extend(
+            [
+                f"File to Edit Now: {', '.join(editable_files)}",
+                f"Scope: {task.scope}",
+                "",
+            ]
+        )
+
+        if use_staging:
+            lines.extend(
+                [
+                    "## Staging & Assembly Mode:",
+                    f"  - Write ONLY the code required for Task {task.task_id} "
+                    f"({task.target_symbol or task.objective}) into {', '.join(editable_files)}.",
+                    f"  - The Foreman will assemble {', '.join(editable_files)} into `{logical_target}`.",
+                    f"  - Do NOT write `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
+                    "",
+                ]
+            )
+
+        if sibling_signatures:
+            lines.append(
+                f"## Sibling Functions Already Implemented in `{logical_target}` (you may call these directly):"
+            )
+            for sig in sibling_signatures:
+                lines.append(f"  - {sig}")
+            lines.append("")
 
         if read_only_files:
             lines.append(
@@ -257,21 +366,14 @@ class AiderHarness(CodingHarness):
                 lines.append(f"  - {ac}")
             lines.append("")
 
-        if batch.shared_context:
-            lines.append("## Shared Context:")
-            for ctx in batch.shared_context:
-                lines.append(f"  - {ctx}")
-            lines.append("")
-
         lines.append(
             f"Modify ONLY {', '.join(editable_files)}. "
             "Make minimal, focused changes that satisfy the acceptance criteria."
         )
-        lines.append("Do not add extra code, comments, or wrappers beyond what is specified.")
+        lines.append("Do not add extra code, test blocks, or wrappers beyond what is specified.")
         return "\n".join(lines)
 
     def _snapshot_files(self, files: list[str]) -> dict[str, str]:
-        """Capture current content of each file (empty string if not exists)."""
         snapshot = {}
         for f in files:
             path = self._safe_workspace_path(f)
