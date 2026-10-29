@@ -243,8 +243,10 @@ def _extract_quoted_literals(
         ignored.add(Path(clean).stem)
 
     backticked = re.findall(r"`([^`]+)`", text)
-    double_quoted = re.findall(r'"([^"]+)"', text)
-    single_quoted = re.findall(r"(?<![a-zA-Z0-9])'([^']+)'(?![a-zA-Z0-9])", text)
+    # Strip backticked segments before searching for quotes so `f"..."` is not extracted twice
+    text_without_backticks = re.sub(r"`[^`]+`", " ", text)
+    double_quoted = re.findall(r'"([^"]+)"', text_without_backticks)
+    single_quoted = re.findall(r"(?<![a-zA-Z0-9])'([^']+)'(?![a-zA-Z0-9])", text_without_backticks)
 
     combined: list[str] = []
     for item in backticked + double_quoted + single_quoted:
@@ -278,6 +280,26 @@ def _pattern_matches(pattern: str, content: str, stdout: str) -> bool:
     if cls_match:
         cls_name = cls_match.group(1)
         if f"class {cls_name}" in content or f"{cls_name}(" in content or cls_name in content:
+            return True
+
+    # Tuple return without outer parens (e.g. `(normalize_name(left), parse_amount(right))`)
+    if compact_pattern.startswith("(") and compact_pattern.endswith(")"):
+        inner_tuple = compact_pattern[1:-1]
+        if inner_tuple and inner_tuple in compact_content:
+            return True
+
+    # f-string or interpolated template with extracted local variables
+    if "{" in compact_pattern and "}" in compact_pattern:
+        cleaned_pat = compact_pattern
+        if cleaned_pat.startswith(('f"', "f'")):
+            cleaned_pat = cleaned_pat[2:-1]
+        exprs = re.findall(r"\{([^}]+)\}", cleaned_pat)
+        static_parts = [
+            p for p in re.split(r"\{[^}]+\}", cleaned_pat) if p
+        ]
+        if exprs and all(e in compact_content for e in exprs) and all(
+            sp in compact_content for sp in static_parts
+        ):
             return True
 
     # Function or method signature match (e.g. `add_item(self, item)` or `inv.total_value()`)

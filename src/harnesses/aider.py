@@ -9,6 +9,7 @@ from .config import AiderConfig
 from src.orchestration.ledger import (
     extract_python_signatures,
     merge_staged_snippets_ast,
+    upsert_staged_snippet,
 )
 from src.orchestration.schemas import Task, TaskBatch, TaskResult
 
@@ -95,6 +96,14 @@ class AiderHarness(CodingHarness):
         task_results: list[TaskResult] = []
         completed_files: set[str] = set()
         completed_sibling_sigs: dict[str, list[str]] = {}
+
+        # Pre-populate sibling signatures from already-staged snippets (for rebuild batches)
+        for mod_file, snippets_map in staged_snippets.items():
+            for prev_tid, prev_code in snippets_map.items():
+                for sig in extract_python_signatures(prev_code):
+                    completed_sibling_sigs.setdefault(mod_file, []).append(
+                        f"{sig} (from task {prev_tid})"
+                    )
 
         try:
             for task in ordered_tasks:
@@ -214,9 +223,11 @@ class AiderHarness(CodingHarness):
                     snippet_code = after.get(staged_rel_path, "").strip()
                     changed = [primary_target] if snippet_code else []
                     if snippet_code:
-                        staged_snippets.setdefault(primary_target, {})[
-                            task.task_id
-                        ] = snippet_code
+                        staged_snippets[primary_target] = upsert_staged_snippet(
+                            staged_snippets.get(primary_target, {}),
+                            task.task_id,
+                            snippet_code,
+                        )
                         sigs = extract_python_signatures(snippet_code)
                         if sigs:
                             completed_sibling_sigs.setdefault(primary_target, []).extend(
@@ -336,6 +347,7 @@ class AiderHarness(CodingHarness):
                     f"({task.target_symbol or task.objective}) into {', '.join(editable_files)}.",
                     f"  - The Foreman will assemble {', '.join(editable_files)} into `{logical_target}`.",
                     f"  - Do NOT write `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
+                    "  - If your function calls functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <module> import ...` at the top of your snippet.",
                     "",
                 ]
             )

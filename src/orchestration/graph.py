@@ -14,6 +14,7 @@ from .ledger import (
     format_ledger_for_prompt,
     merge_staged_snippets_ast,
     record_ledger_entry,
+    upsert_staged_snippet,
 )
 from .schemas import (
     CycleResult,
@@ -367,7 +368,11 @@ def worker_node(state: WorkflowState) -> dict:
             if staged_path.is_file():
                 snippet = staged_path.read_text(encoding="utf-8").strip()
                 if snippet:
-                    staged_files.setdefault(target_file, {})[result.task_id] = snippet
+                    staged_files[target_file] = upsert_staged_snippet(
+                        staged_files.get(target_file, {}),
+                        result.task_id,
+                        snippet,
+                    )
 
         symbol_label = (
             f"{target_file}::{task_obj.target_symbol}"
@@ -788,9 +793,13 @@ def route_after_foreman_review(state: WorkflowState) -> str:
         return "accepted"
 
     if review.decision == "repair":
-        if state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS:
+        if review.direct_repairs and state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS:
             return "self_repair"
-        print("Foreman self-repair attempts exceeded limit. Escalating to rebuild.")
+        if not review.direct_repairs and not has_hard_errors:
+            print("Foreman requested repair with empty direct_repairs and no hard errors; accepting.")
+            review.accepted = True
+            return "accepted"
+        print("Foreman self-repair unavailable or exceeded limit. Escalating to rebuild.")
 
     if state["rebuild_attempts"] >= MAX_WORKER_REBUILDS:
         print(

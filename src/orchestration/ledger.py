@@ -174,3 +174,38 @@ def merge_staged_snippets_ast(
 
     assembled = "\n\n".join(sections).strip()
     return (assembled + "\n") if assembled else ""
+
+
+def upsert_staged_snippet(
+    module_snippets: dict[str, str],
+    task_id: str,
+    new_snippet: str,
+) -> dict[str, str]:
+    """
+    Insert or update a staged snippet in `module_snippets`.
+    If `new_snippet` defines the same function/class name as an earlier task_id
+    (e.g. `t2_repaired` replacing `t2`), remove the obsolete task_id entry so
+    Foreman never receives duplicate conflicting definitions of the same function.
+    """
+    updated = dict(module_snippets)
+    new_sigs = {
+        s.split("(")[0].split("[")[0].strip()
+        for s in extract_python_signatures(new_snippet)
+    }
+
+    if new_sigs:
+        obsolete_keys = []
+        for existing_id, existing_code in updated.items():
+            if existing_id == task_id:
+                continue
+            existing_sigs = {
+                s.split("(")[0].split("[")[0].strip()
+                for s in extract_python_signatures(existing_code)
+            }
+            if existing_sigs and existing_sigs.issubset(new_sigs):
+                obsolete_keys.append(existing_id)
+        for k in obsolete_keys:
+            updated.pop(k, None)
+
+    updated[task_id] = new_snippet
+    return updated
