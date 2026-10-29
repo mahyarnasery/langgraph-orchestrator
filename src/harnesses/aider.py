@@ -19,14 +19,32 @@ WORKSPACE_ROOT = (REPO_ROOT / "sandbox").resolve()
 STAGING_DIR = (WORKSPACE_ROOT / ".staging").resolve()
 
 
+def _normalize_rel_path(path: str) -> str:
+    cleaned = path.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.removeprefix("sandbox/").strip("/")
+    return cleaned
+
+
+def _module_import_name(rel_path: str) -> str:
+    norm = _normalize_rel_path(rel_path)
+    p = Path(norm)
+    parts = list(p.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts) if parts else p.stem
+
+
 def list_workspace_py_files() -> list[Path]:
-    """Return all user Python files in WORKSPACE_ROOT, excluding .staging and .git."""
+    """Return all user Python files in WORKSPACE_ROOT, excluding .staging, .git, and .pytest_cache."""
     if not WORKSPACE_ROOT.exists():
         return []
+    excluded = {".staging", ".git", ".pytest_cache", "__pycache__"}
     return sorted(
         p
         for p in WORKSPACE_ROOT.rglob("*.py")
-        if ".staging" not in p.parts and ".git" not in p.parts
+        if not ( set(p.parts) & excluded )
     )
 
 
@@ -81,13 +99,13 @@ class AiderHarness(CodingHarness):
         file_task_counts: dict[str, int] = {}
         for task in ordered_tasks:
             for raw_path in (task.relevant_files or batch.relevant_files):
-                norm = raw_path.removeprefix("sandbox/")
+                norm = _normalize_rel_path(raw_path)
                 file_task_counts[norm] = file_task_counts.get(norm, 0) + 1
 
         staged_snippets: dict[str, dict[str, str]] = {
-            k: dict(v) for k, v in (existing_staged or {}).items()
+            _normalize_rel_path(k): dict(v) for k, v in (existing_staged or {}).items()
         }
-        snapshots = dict(file_snapshots or {})
+        snapshots = {_normalize_rel_path(k): v for k, v in (file_snapshots or {}).items()}
 
         env = os.environ.copy()
         env.pop("GIT_DIR", None)
@@ -109,12 +127,15 @@ class AiderHarness(CodingHarness):
             for task in ordered_tasks:
                 declared_files = sorted(
                     {
-                        p.removeprefix("sandbox/")
+                        _normalize_rel_path(p)
                         for p in (task.relevant_files or batch.relevant_files)
+                        if _normalize_rel_path(p)
                     }
                 )
                 for path in declared_files:
-                    self._safe_workspace_path(path)
+                    abs_target = self._safe_workspace_path(path)
+                    abs_target.parent.mkdir(parents=True, exist_ok=True)
+                    self._ensure_package_inits(abs_target.parent)
 
                 primary_target = declared_files[0]
                 use_staging = (
@@ -144,7 +165,7 @@ class AiderHarness(CodingHarness):
                     dep_task = tasks_by_id.get(dep_id)
                     if dep_task:
                         for f in dep_task.relevant_files:
-                            dep_files.add(f.removeprefix("sandbox/"))
+                            dep_files.add(_normalize_rel_path(f))
 
                 existing_workspace_py = {
                     str(p.relative_to(WORKSPACE_ROOT))
@@ -240,6 +261,8 @@ class AiderHarness(CodingHarness):
                             ordered_snippets=ordered_pairs,
                         )
                         target_abs = self._safe_workspace_path(primary_target)
+                        target_abs.parent.mkdir(parents=True, exist_ok=True)
+                        self._ensure_package_inits(target_abs.parent)
                         target_abs.write_text(merged_live, encoding="utf-8")
                         completed_files.add(primary_target)
                 else:
@@ -276,6 +299,16 @@ class AiderHarness(CodingHarness):
 
         return task_results
 
+    def _ensure_package_inits(self, directory: Path) -> None:
+        """Ensure every intermediate package directory inside WORKSPACE_ROOT has an __init__.py."""
+        curr = directory.resolve()
+        while curr != WORKSPACE_ROOT and curr.is_relative_to(WORKSPACE_ROOT):
+            if curr.name not in (".staging", ".git", "__pycache__", ".pytest_cache"):
+                init_file = curr / "__init__.py"
+                if not init_file.exists():
+                    init_file.write_text("", encoding="utf-8")
+            curr = curr.parent
+
     def _is_non_empty_file(self, path: str) -> bool:
         p = self._safe_workspace_path(path)
         return p.is_file() and bool(p.read_text(encoding="utf-8").strip())
@@ -294,7 +327,7 @@ class AiderHarness(CodingHarness):
         )
 
     def _safe_workspace_path(self, path: str) -> Path:
-        normalized = path.removeprefix("sandbox/")
+        normalized = _normalize_rel_path(path)
         requested = (WORKSPACE_ROOT / normalized).resolve()
         if not requested.is_relative_to(WORKSPACE_ROOT):
             raise ValueError(f"Path {path} escapes workspace root")
@@ -312,6 +345,7 @@ class AiderHarness(CodingHarness):
         sibling_signatures: list[str],
         project_goal: str = "",
     ) -> str:
+        target_import_name = _module_import_name(logical_target)
         lines = [
             f"# Batch Objective: {batch.objective}",
         ]
@@ -326,7 +360,7 @@ class AiderHarness(CodingHarness):
         lines.extend(
             [
                 f"## Current Atomic Task {task.task_id}: {task.objective}",
-                f"Logical Module: {logical_target}",
+                f"Logical Module: {logical_target} (import path: `{target_import_name}`)",
             ]
         )
         if task.target_symbol:
@@ -346,8 +380,8 @@ class AiderHarness(CodingHarness):
                     f"  - Write ONLY the code required for Task {task.task_id} "
                     f"({task.target_symbol or task.objective}) into {', '.join(editable_files)}.",
                     f"  - The Foreman will assemble {', '.join(editable_files)} into `{logical_target}`.",
-                    f"  - Do NOT write `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
-                    "  - If your function calls functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <module> import ...` at the top of your snippet.",
+                    f"  - Do NOT write `from {target_import_name} import ...` or `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
+                    "  - If your function calls functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <package.module> import ...` at the top of your snippet.",
                     "",
                 ]
             )
@@ -361,8 +395,11 @@ class AiderHarness(CodingHarness):
             lines.append("")
 
         if read_only_files:
+            ro_descriptions = [
+                f"{rf} (import as `{_module_import_name(rf)}`)" for rf in read_only_files
+            ]
             lines.append(
-                f"Read-Only Reference Files (do NOT edit): {', '.join(read_only_files)}"
+                f"Read-Only Reference Files (do NOT edit): {', '.join(ro_descriptions)}"
             )
             lines.append("")
 
@@ -376,6 +413,14 @@ class AiderHarness(CodingHarness):
             lines.append("## Acceptance Criteria:")
             for ac in task.acceptance_criteria:
                 lines.append(f"  - {ac}")
+            lines.append("")
+
+        if task.test_assertions:
+            lines.append(
+                "## Verification Assertions (run automatically by Validator — do NOT paste these into the module unless requested):"
+            )
+            for assertion in task.test_assertions:
+                lines.append(f"  - {assertion}")
             lines.append("")
 
         lines.append(

@@ -46,19 +46,29 @@ Worker profile:
 Planner plan:
 {plan.model_dump_json(indent=2)}
 
-Task Atomization Rules (CRITICAL):
-1. Pre-Creation: The orchestration layer automatically pre-creates empty files. NEVER create a task just to create an empty file.
-2. Function-Level Atomization for Multi-Function Files:
-   - If a Python file requires 2 or more standalone functions (for example, a module with 3 or 4 helper/processing functions), SPLIT that file into separate atomic tasks — ONE task per function!
-   - For each function task on that file, set `relevant_files` to that file (e.g. `["analytics.py"]`) and set `target_symbol` to the exact function name (e.g. `"parse_scores"`).
-   - If function B calls function A in the same file, list function A's task_id in function B's `dependencies`.
+Task Atomization, Package Structure & Verification Rules (CRITICAL):
+1. Pre-Creation & Package `__init__.py` Files:
+   - The orchestration layer automatically pre-creates empty files AND automatically creates `__init__.py` in every package subdirectory (e.g. `core/__init__.py`, `services/__init__.py`).
+   - NEVER create a task just to create an empty file or an empty `__init__.py`. Only create a task for `__init__.py` if the project goal explicitly requires code/re-exports inside `__init__.py`.
+2. Multi-Directory Package Paths:
+   - Preserve exact relative directory paths from the Project goal (e.g. `"core/text_utils.py"`, `"services/report.py"`, `"main.py"`). NEVER flatten subdirectory paths into the root directory.
+   - When importing from a package module, use its full dotted package path (e.g. `from core.text_utils import ...`).
+3. Function-Level Atomization for Multi-Function Files:
+   - If any Python file (at root or in a package directory) requires 2 or more standalone functions, SPLIT that file into separate atomic tasks — ONE task per function!
+   - For each function task on that file, set `relevant_files` to that exact file path (e.g. `["core/text_utils.py"]`) and set `target_symbol` to the exact function name (e.g. `"clean_label"`).
+   - If function B calls function A, list function A's task_id in function B's `dependencies`.
    - The Worker will write each function in an isolated staging file, and you (Foreman) will assemble them into the target module automatically.
-3. Single-Task Files & Classes:
+4. Single-Task Files & Classes:
    - If a file only has 1 function, or is a simple entry-point script (`main.py` / `app.py`), or defines a single `class` with its methods, keep that file or class as a SINGLE task.
-4. Strict File Scope:
+5. Strict File Scope:
    - Each task's `relevant_files` must list ONLY the file that specific task contributes to. Do NOT list imported dependency files in `task.relevant_files`.
-5. Preserve exact formulas, f-strings, and return expressions from the Project goal in each task's `acceptance_criteria` (do not paraphrase `len(passing)` or `sum(passing)`).
-6. Populate `execution_order` with all `task_id`s in dependency order, and leave `verification_command` as null unless running a dedicated pytest suite without shell pipes.
+6. Preserve exact formulas, f-strings, and return expressions from the Project goal in each task's `acceptance_criteria` (do not paraphrase `len(passing)` or `sum(passing)`).
+7. Deterministic Unit Assertions (`test_assertions`):
+   - For every task that implements a function or class, populate `task.test_assertions` with 1 to 2 executable Python `assert` statements using CONCRETE literal inputs and expected outputs (e.g. `["assert parse_scores('45, 70') == [45, 70]"]`).
+   - Prefer exact input/output values given in the Project goal so expected values are 100% accurate.
+   - NEVER use undefined symbolic variables (like `assert f(x) == x * 2`) in `test_assertions` — always pass concrete literal numbers/strings/lists.
+   - For pure entry-point scripts (`main.py`, `app.py`, `hello.py`) that only print output to stdout and define no functions/classes, leave `task.test_assertions` empty (`[]`).
+8. Populate `execution_order` with all `task_id`s in dependency order, and leave `verification_command` as null unless running a dedicated pytest suite without shell pipes.
 
 Every file mentioned by a task must appear in both `task.relevant_files` and `TaskBatch.relevant_files`.
 
@@ -111,7 +121,8 @@ Deterministic AST-merged draft of `{target_file}`:
 Responsibilities:
 - Combine all Worker snippets for `{target_file}` into a single, clean, coherent Python file.
 - Deduplicate imports at the top of the file.
-- Ensure there are NO self-imports (never import `{target_file}` inside `{target_file}`).
+- Ensure there are NO self-imports (never import `{target_file}` or its module name inside `{target_file}`).
+- Preserve cross-package imports (such as `from core.xyz import ...`) needed by the functions.
 - Ensure function calls between snippets in `{target_file}` use matching function names and arguments.
 - Preserve every required function and class without adding unrelated test code or extra prints.
 
@@ -129,15 +140,24 @@ Return only the structured AssembledModule.
         batch: TaskBatch,
         review: ForemanReview,
         task_results: list[TaskResult],
+        validation_result: ValidationResult | None = None,
         ledger_context: str = "",
     ) -> TaskBatch:
         """Create a targeted corrective TaskBatch to rebuild/fix failed tasks."""
+        validation_summary = (
+            validation_result.model_dump_json(indent=2)
+            if validation_result is not None
+            else "Not provided"
+        )
 
         prompt = f"""
 You are the Foreman creating a corrective TaskBatch for the Worker.
 
 Original batch:
 {batch.model_dump_json(indent=2)}
+
+Deterministic Validator results (note `errors` and `failed_task_ids`):
+{validation_summary}
 
 Foreman review and rebuild instructions:
 {review.model_dump_json(indent=2)}
@@ -148,8 +168,8 @@ Execution Ledger:
 Previous task execution outcomes:
 {', '.join(f'{r.task_id}: {r.status}' for r in task_results)}
 
-Generate a new, focused TaskBatch addressing ONLY the specific tasks needing rebuild/correction.
-- Preserve `target_symbol` on function-level tasks so only the broken function is rewritten and re-assembled.
+Generate a new, focused TaskBatch addressing ONLY the specific tasks needing rebuild/correction:
+- Preserve exact package paths in `relevant_files`, `target_symbol`, and concrete `test_assertions` on function-level tasks so only the broken function is rewritten, re-assembled, and re-verified.
 - Populate `execution_order` with the exact `task_id`s in this corrective batch.
 - Leave `verification_command` as null.
 - Ensure every referenced file is listed in both `task.relevant_files` and `TaskBatch.relevant_files`.
@@ -211,7 +231,7 @@ Current TaskBatch:
 Worker results:
 {task_results_context}
 
-Deterministic validation:
+Deterministic validation (inspect `passed`, `errors`, and `failed_task_ids`):
 {validation_context}
 
 Actual assembled repository contents:
@@ -221,12 +241,12 @@ Worker attempt counts:
 {worker_attempts_context}
 
 Foreman direct self-repair attempts used: {foreman_repair_attempts} / {max_foreman_repairs}
-{"CRITICAL: You have exhausted all direct self-repair attempts. Do NOT choose 'repair'. Choose 'accept' (if the code works) or 'rebuild'." if foreman_repair_attempts >= max_foreman_repairs else ""}
+{"CRITICAL: You have exhausted all direct self-repair attempts. Do NOT choose 'repair'. Choose 'accept' (if all checks pass) or 'rebuild' (targeting `failed_task_ids`)." if foreman_repair_attempts >= max_foreman_repairs else ""}
 
 Determine the smallest appropriate next action:
-- "accept": Implementation satisfies the Planner's acceptance criteria and passes deterministic validation.
+- "accept": Implementation satisfies the Planner's acceptance criteria and passes all deterministic validation checks and unit assertions.
 - "repair": Implementation is close and has a localized issue you (Foreman) can fix directly via `direct_repairs` (prefer `action="overwrite"` with full file content).
-- "rebuild": One or more specific Worker tasks need to be sent back to the Worker.
+- "rebuild": One or more specific Worker tasks (such as those in `validation_result.failed_task_ids`) need to be sent back to the Worker.
 
 
 Return only the structured ForemanReview.

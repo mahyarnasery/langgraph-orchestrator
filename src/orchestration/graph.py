@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 from langgraph.graph import END, StateGraph
@@ -21,6 +22,7 @@ from .schemas import (
     ForemanReview,
     Plan,
     PlannerReview,
+    Task,
     TaskBatch,
     TaskResult,
     ValidationResult,
@@ -35,16 +37,25 @@ MAX_FOREMAN_REPAIRS = 2
 MAX_WORKER_REBUILDS = 3
 
 
+def _normalize_workspace_path(path: str) -> str:
+    """Normalize a logical workspace path into a clean relative POSIX path."""
+    cleaned = path.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.removeprefix("sandbox/").strip("/")
+    return cleaned
+
+
 def _sandbox_repo_path(path: str) -> str:
     """Convert a logical TaskBatch path into its physical repository path inside sandbox."""
-    normalized = path.removeprefix("sandbox/")
+    normalized = _normalize_workspace_path(path)
     if normalized in ("", ".", ".."):
         raise ValueError(f"Invalid Worker path: {path}")
     return f"sandbox/{normalized}"
 
 
 def _build_repository_map() -> str:
-    """Build a compact AST-based map of existing files, classes, and functions in sandbox."""
+    """Build a compact AST-based map of existing files, packages, classes, and functions in sandbox."""
     py_files = list_workspace_py_files()
     if not py_files:
         return "[No Python files currently in sandbox workspace]"
@@ -55,7 +66,10 @@ def _build_repository_map() -> str:
         try:
             source = py_file.read_text(encoding="utf-8")
             if not source.strip():
-                entries.append(f"- {rel_path} (empty file)")
+                if py_file.name == "__init__.py":
+                    entries.append(f"- {rel_path} (package marker)")
+                else:
+                    entries.append(f"- {rel_path} (empty file)")
                 continue
 
             sigs = extract_python_signatures(source)
@@ -72,51 +86,133 @@ def _enrich_architecture_context(architecture_context: str) -> str:
     return f"{architecture_context}\n\n{repo_map}"
 
 
+def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
+    """
+    If Foreman omitted `target_symbol` on a function/class task, infer it
+    deterministically from `acceptance_criteria`, `test_assertions`, or `objective`.
+    """
+    if task.target_symbol and task.target_symbol.strip():
+        return task.target_symbol.split("(")[0].strip()
+
+    if not multi_task_file and "function" not in task.scope.lower():
+        return None
+
+    # 1. Look for `def <name>(` or `class <Name>` in acceptance_criteria
+    for crit in task.acceptance_criteria:
+        m = re.search(r"\b(?:def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", crit)
+        if m:
+            return m.group(1)
+
+    # 2. Look for `assert <name>(` in test_assertions
+    for assertion in task.test_assertions:
+        m = re.search(r"\bassert\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", assertion)
+        if m:
+            return m.group(1)
+
+    # 3. Look for backticked identifier in objective (excluding `.py` filenames)
+    for token in re.findall(r"`([a-zA-Z_][a-zA-Z0-9_]*)(?:\([^`]*\))?`", task.objective):
+        if not token.endswith(".py"):
+            return token
+
+    # 4. Look for `Implement <name>(` in objective
+    m_obj = re.search(
+        r"\b(?:implement|define|create)\s+(?:the\s+)?(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
+        task.objective,
+        re.IGNORECASE,
+    )
+    if m_obj:
+        return m_obj.group(1)
+
+    return None
+
+
+def _is_redundant_empty_file_task(task: Task) -> bool:
+    """Return True if a task only exists to create an empty file or empty __init__.py."""
+    scope_lower = task.scope.strip().lower()
+    obj_lower = task.objective.strip().lower()
+
+    if (
+        scope_lower in ("file creation", "create file", "empty file creation")
+        and len(task.acceptance_criteria) == 1
+        and "exists" in task.acceptance_criteria[0].lower()
+    ):
+        return True
+
+    if len(task.relevant_files) == 1 and Path(task.relevant_files[0]).name == "__init__.py":
+        joined_criteria = " ".join(task.acceptance_criteria).lower()
+        has_code_req = any(
+            kw in joined_criteria
+            for kw in ("def ", "class ", "import ", "__all__", "export")
+        )
+        if not has_code_req and not task.test_assertions and (
+            "empty" in obj_lower
+            or "empty" in joined_criteria
+            or "exists" in joined_criteria
+            or "initialize" in obj_lower
+            or "package" in obj_lower
+        ):
+            return True
+
+    return False
+
+
 def _prepare_batch_and_workspace(
     batch: TaskBatch,
     existing_snapshots: dict[str, str],
 ) -> tuple[TaskBatch, dict[str, str]]:
     """
     Normalize batch relevant_files and execution_order, pre-create missing
-    files in sandbox, and snapshot pre-batch file contents for rollback support.
+    files and package `__init__.py` markers in sandbox, infer missing
+    `target_symbol`s, and snapshot pre-batch file contents for rollback support.
     """
     from .tools import create_file, read_file
 
     union_files = sorted(
         {
-            path.removeprefix("sandbox/")
+            _normalize_workspace_path(path)
             for task in batch.tasks
             for path in task.relevant_files
-            if path not in ("", ".", "..")
+            if _normalize_workspace_path(path) not in ("", ".", "..")
         }
         | {
-            path.removeprefix("sandbox/")
+            _normalize_workspace_path(path)
             for path in batch.relevant_files
-            if path not in ("", ".", "..")
+            if _normalize_workspace_path(path) not in ("", ".", "..")
         }
     )
     batch.relevant_files = union_files
+    batch.test_assertions = [
+        a.strip() for a in batch.test_assertions if a and a.strip()
+    ]
 
     for task in batch.tasks:
         task.relevant_files = [
-            p.removeprefix("sandbox/")
+            _normalize_workspace_path(p)
             for p in (task.relevant_files or union_files)
-            if p not in ("", ".", "..")
+            if _normalize_workspace_path(p) not in ("", ".", "..")
+        ]
+        task.test_assertions = [
+            a.strip() for a in task.test_assertions if a and a.strip()
         ]
 
     if len(batch.tasks) > 1:
         filtered_tasks = [
-            t
-            for t in batch.tasks
-            if not (
-                t.scope.strip().lower()
-                in ("file creation", "create file", "empty file creation")
-                and len(t.acceptance_criteria) == 1
-                and "exists" in t.acceptance_criteria[0].lower()
-            )
+            t for t in batch.tasks if not _is_redundant_empty_file_task(t)
         ]
         if filtered_tasks:
             batch.tasks = filtered_tasks
+
+    # Count tasks per file to infer missing target_symbols on multi-task modules
+    file_counts: dict[str, int] = {}
+    for task in batch.tasks:
+        for f in task.relevant_files:
+            file_counts[f] = file_counts.get(f, 0) + 1
+
+    for task in batch.tasks:
+        primary = task.relevant_files[0] if task.relevant_files else ""
+        inferred = _infer_task_symbol(task, file_counts.get(primary, 0) > 1)
+        if inferred:
+            task.target_symbol = inferred
 
     valid_ids = {t.task_id for t in batch.tasks}
     for task in batch.tasks:
@@ -129,9 +225,31 @@ def _prepare_batch_and_workspace(
             ordered_ids.append(task.task_id)
     batch.execution_order = ordered_ids
 
+    # Automatically discover and include parent package `__init__.py` files
+    package_init_files: set[str] = set()
+    for rel_path in list(batch.relevant_files):
+        parts = Path(rel_path).parts
+        if len(parts) > 1:
+            for depth in range(1, len(parts)):
+                pkg_dir = Path(*parts[:depth])
+                if pkg_dir.parts[0] not in (".staging", ".git", "__pycache__"):
+                    package_init_files.add(str(pkg_dir / "__init__.py"))
+
     snapshots = dict(existing_snapshots)
 
     print("\n=== FOREMAN REPOSITORY PREPARATION ===")
+    for init_rel in sorted(package_init_files):
+        physical_init = _sandbox_repo_path(init_rel)
+        try:
+            res = read_file.func(path=physical_init)
+            snapshots.setdefault(init_rel, res.get("content", ""))
+        except FileNotFoundError:
+            create_file.func(path=physical_init, content="")
+            snapshots.setdefault(init_rel, "")
+            print(f"Created package marker {physical_init}")
+        except Exception:
+            pass
+
     for path in batch.relevant_files:
         physical_path = _sandbox_repo_path(path)
         try:
@@ -154,14 +272,49 @@ def _prepare_batch_and_workspace(
     return batch, snapshots
 
 
+def _build_effective_validation_batch(task_batches: list[TaskBatch]) -> TaskBatch:
+    """
+    Combine the initial TaskBatch with any updates from subsequent corrective
+    TaskBatches so original `test_assertions` are preserved when corrective
+    tasks omit them, or updated when corrective tasks refine them.
+    """
+    primary = task_batches[0].model_copy(deep=True)
+    if len(task_batches) == 1:
+        return primary
+
+    tasks_by_id: dict[str, Task] = {t.task_id: t for t in primary.tasks}
+    tasks_by_sym: dict[tuple[str, str], Task] = {}
+    for t in primary.tasks:
+        if t.target_symbol and t.relevant_files:
+            tasks_by_sym[(t.relevant_files[0], t.target_symbol)] = t
+
+    union_files = set(primary.relevant_files)
+    for corr_batch in task_batches[1:]:
+        union_files.update(corr_batch.relevant_files)
+        if corr_batch.test_assertions:
+            primary.test_assertions = list(corr_batch.test_assertions)
+        for ct in corr_batch.tasks:
+            matched: Task | None = tasks_by_id.get(ct.task_id)
+            if matched is None and ct.target_symbol and ct.relevant_files:
+                matched = tasks_by_sym.get((ct.relevant_files[0], ct.target_symbol))
+            if matched is not None:
+                if ct.test_assertions:
+                    matched.test_assertions = list(ct.test_assertions)
+                if ct.acceptance_criteria:
+                    matched.acceptance_criteria = list(ct.acceptance_criteria)
+
+    primary.relevant_files = sorted(union_files)
+    return primary
+
+
 def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult]) -> str:
     """Inspect the sandbox repository files and construct textual evidence."""
     from .tools import read_file
 
     relevant_files = sorted(
-        set(batch.relevant_files)
+        {_normalize_workspace_path(p) for p in batch.relevant_files}
         | {
-            file_path.removeprefix("sandbox/")
+            _normalize_workspace_path(file_path)
             for result in task_results
             for file_path in result.files_changed
         }
@@ -194,7 +347,10 @@ def _gather_full_repository_context() -> str:
             logical_path = str(relative_path)
             result = read_file.func(path=f"sandbox/{logical_path}")
             content = result.get("content", "")
-            content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
+            if not content.strip() and py_file.name == "__init__.py":
+                content_display = "[PACKAGE __init__.py - 0 bytes]"
+            else:
+                content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
             repository_evidence.append(
                 f"FILE: {logical_path}\n~~~python\n{content_display}\n~~~"
             )
@@ -351,7 +507,8 @@ def worker_node(state: WorkflowState) -> dict:
         merged_by_id[result.task_id] = result
 
     staged_files: dict[str, dict[str, str]] = {
-        k: dict(v) for k, v in state.get("staged_files", {}).items()
+        _normalize_workspace_path(k): dict(v)
+        for k, v in state.get("staged_files", {}).items()
     }
     tasks_by_id = {t.task_id: t for t in batch.tasks}
 
@@ -359,7 +516,7 @@ def worker_node(state: WorkflowState) -> dict:
     for result in results:
         task_obj = tasks_by_id.get(result.task_id)
         target_file = (
-            task_obj.relevant_files[0].removeprefix("sandbox/")
+            _normalize_workspace_path(task_obj.relevant_files[0])
             if task_obj and task_obj.relevant_files
             else "unknown"
         )
@@ -426,9 +583,10 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
         if not task_snippets:
             continue
 
+        norm_target = _normalize_workspace_path(target_file)
         ast_merged = merge_staged_snippets_ast(
-            target_filename=target_file,
-            base_source=snapshots.get(target_file, ""),
+            target_filename=norm_target,
+            base_source=snapshots.get(norm_target, ""),
             ordered_snippets=list(task_snippets.items()),
         )
         expected_sigs = extract_python_signatures(ast_merged)
@@ -443,7 +601,7 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
         if len(task_snippets) > 1 and plan is not None:
             try:
                 assembled = foreman.assemble_module(
-                    target_file=target_file,
+                    target_file=norm_target,
                     project_goal=state["project_goal"],
                     plan=plan,
                     staged_snippets=task_snippets,
@@ -462,14 +620,14 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
                     else:
                         print(
                             f"Foreman assembly omitted {missing_symbols}; "
-                            f"retaining complete AST merge for {target_file}."
+                            f"retaining complete AST merge for {norm_target}."
                         )
             except Exception as exc:
                 print(
-                    f"Foreman LLM assembly fallback to AST merge for {target_file}: {exc}"
+                    f"Foreman LLM assembly fallback to AST merge for {norm_target}: {exc}"
                 )
 
-        physical_path = _sandbox_repo_path(target_file)
+        physical_path = _sandbox_repo_path(norm_target)
         write_file.func(path=physical_path, content=final_code)
         print(
             f"Assembled {physical_path} from {len(task_snippets)} staged snippet(s) "
@@ -481,7 +639,7 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
             cycle_id=state["cycle_id"],
             layer="assembler",
             action="assemble_module",
-            target=target_file,
+            target=norm_target,
             status="success",
             detail=(
                 f"Assembled {len(task_snippets)} snippet(s) "
@@ -504,9 +662,9 @@ def validator_node(state: WorkflowState) -> dict:
     if not state["task_batches"]:
         raise RuntimeError("No TaskBatch available for validation.")
 
-    primary_batch = state["task_batches"][0]
+    effective_batch = _build_effective_validation_batch(state["task_batches"])
     validation = validate_batch(
-        batch=primary_batch,
+        batch=effective_batch,
         task_results=state["task_results"],
     )
 
@@ -519,7 +677,7 @@ def validator_node(state: WorkflowState) -> dict:
     detail = (
         f"All {len(validation.checks)} checks passed."
         if validation.passed
-        else f"Failed with {len(validation.errors)} error(s): {'; '.join(validation.errors[:2])}"
+        else f"Failed ({', '.join(validation.failed_task_ids) or 'batch'}): {'; '.join(validation.errors[:2])}"
     )
     updated_ledger = record_ledger_entry(
         state["ledger"],
@@ -557,9 +715,9 @@ def foreman_review_node(state: WorkflowState) -> dict:
     if plan is None:
         raise RuntimeError("Planner output missing before Foreman review.")
 
-    batch = state["task_batches"][-1]
+    batch = _build_effective_validation_batch(state["task_batches"])
     repository_context = _gather_repository_context(
-        state["task_batches"][0], state["task_results"]
+        batch, state["task_results"]
     )
     enriched_arch = _enrich_architecture_context(state["architecture_context"])
     ledger_ctx = format_ledger_for_prompt(state["ledger"], state["previous_cycle"])
@@ -635,7 +793,7 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
                     path=physical_path,
                     content=repair.content,
                 )
-            repaired_files.append(repair.path.removeprefix("sandbox/"))
+            repaired_files.append(_normalize_workspace_path(repair.path))
         except Exception as exc:
             err_msg = f"Foreman self-repair failed on {repair.path}: {type(exc).__name__}: {exc}"
             print(f"WARNING: {err_msg}")
@@ -674,15 +832,16 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
     from .tools import write_file
 
     foreman = build_foreman()
-    batch = state["task_batches"][-1]
+    batch = _build_effective_validation_batch(state["task_batches"])
     review = state["foreman_review"]
+    validation = state.get("validation_result")
     snapshots = state.get("file_snapshots", {})
     ledger_ctx = format_ledger_for_prompt(state["ledger"], state["previous_cycle"])
 
     if review and review.rollback_files:
         print("\n=== FOREMAN ROLLING BACK CORRUPTED FILES ===")
         for path in review.rollback_files:
-            logical = path.removeprefix("sandbox/")
+            logical = _normalize_workspace_path(path)
             if logical in snapshots:
                 physical_path = _sandbox_repo_path(logical)
                 write_file.func(path=physical_path, content=snapshots[logical])
@@ -693,6 +852,7 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         batch=batch,
         review=review,
         task_results=state["task_results"],
+        validation_result=validation,
         ledger_context=ledger_ctx,
     )
 
@@ -773,7 +933,18 @@ def route_after_foreman_review(state: WorkflowState) -> str:
     has_hard_errors = bool(
         validation
         and any(
-            err.startswith(("syntax error", "empty file", "missing file", "execution failed"))
+            err.startswith(
+                (
+                    "syntax error",
+                    "empty file",
+                    "missing file",
+                    "missing symbol",
+                    "execution failed",
+                    "assertion failed",
+                    "pytest failed",
+                    "verification command failed",
+                )
+            )
             for err in validation.errors
         )
     )
@@ -782,10 +953,15 @@ def route_after_foreman_review(state: WorkflowState) -> str:
         if not has_hard_errors:
             return "accepted"
         print(
-            "WARNING: Foreman chose 'accept' while deterministic execution/syntax errors remain. "
+            "WARNING: Foreman chose 'accept' while deterministic validation/assertion errors remain. "
             "Overriding to rework."
         )
         review.accepted = False
+        if validation:
+            if not review.problems:
+                review.problems = list(validation.errors)
+            if not review.rebuild_task_ids and validation.failed_task_ids:
+                review.rebuild_task_ids = list(validation.failed_task_ids)
         if review.direct_repairs and state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS:
             return "self_repair"
         if state["rebuild_attempts"] < MAX_WORKER_REBUILDS:
@@ -800,6 +976,8 @@ def route_after_foreman_review(state: WorkflowState) -> str:
             review.accepted = True
             return "accepted"
         print("Foreman self-repair unavailable or exceeded limit. Escalating to rebuild.")
+        if validation and not review.rebuild_task_ids and validation.failed_task_ids:
+            review.rebuild_task_ids = list(validation.failed_task_ids)
 
     if state["rebuild_attempts"] >= MAX_WORKER_REBUILDS:
         print(

@@ -1,9 +1,18 @@
 import argparse
-from pathlib import Path
+import shutil
 import sys
 
 from src.orchestration.graph import WORKER_WORKSPACE, run_project
 from src.orchestration.schemas import WorkerProfile
+
+
+def clean_sandbox_workspace() -> None:
+    WORKER_WORKSPACE.mkdir(parents=True, exist_ok=True)
+    for py_file in WORKER_WORKSPACE.rglob("*.py"):
+        py_file.unlink(missing_ok=True)
+    for child in sorted(WORKER_WORKSPACE.iterdir()):
+        if child.is_dir() and child.name not in (".git", ".staging"):
+            shutil.rmtree(child, ignore_errors=True)
 
 
 def main() -> None:
@@ -28,15 +37,14 @@ def main() -> None:
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="Clean existing .py files in sandbox/ before starting.",
+        help="Clean existing .py files and subdirectories in sandbox/ before starting.",
     )
 
     args = parser.parse_args()
 
     WORKER_WORKSPACE.mkdir(parents=True, exist_ok=True)
     if args.clean:
-        for py_file in WORKER_WORKSPACE.rglob("*.py"):
-            py_file.unlink(missing_ok=True)
+        clean_sandbox_workspace()
         print("Cleaned sandbox/ workspace.")
 
     profile = WorkerProfile(

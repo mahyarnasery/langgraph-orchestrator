@@ -19,7 +19,6 @@ def record_ledger_entry(
     detail: str,
 ) -> list[LedgerEntry]:
     """Append a new concise step entry to the cycle ledger."""
-    # Collapse multi-line tracebacks into a single concise line to prevent prompt bloat
     compact_detail = " | ".join(line.strip() for line in detail.splitlines() if line.strip())
     if len(compact_detail) > 220:
         compact_detail = compact_detail[:217] + "..."
@@ -95,17 +94,30 @@ def extract_python_signatures(source: str) -> list[str]:
 
 def _strip_self_imports(source: str, target_filename: str) -> str:
     """
-    Remove accidental self-imports (e.g. `from analytics import parse_scores`
-    inside `analytics.py`) that a Worker may write when seeing sibling functions.
+    Remove accidental self-imports (e.g. `from analytics import parse_scores`,
+    `from core.cleaner import normalize_name`, or `from .cleaner import ...`
+    inside `core/cleaner.py`) that a Worker may write when seeing sibling functions.
     """
-    module_stem = Path(target_filename.removeprefix("sandbox/")).stem
+    norm = target_filename.removeprefix("sandbox/").strip("/")
+    path_obj = Path(norm)
+    module_stem = path_obj.stem
+    dotted_path = ".".join(path_obj.with_suffix("").parts)
+
+    candidates = {
+        re.escape(module_stem),
+        re.escape(dotted_path),
+        r"\." + re.escape(module_stem),
+    }
+    mod_pattern = "|".join(sorted(candidates, key=len, reverse=True))
+
     cleaned_lines: list[str] = []
     for line in source.splitlines():
         stripped = line.strip()
-        if re.match(rf"^from\s+{re.escape(module_stem)}\s+import\b", stripped):
+        if re.match(rf"^from\s+(?:{mod_pattern})\s+import\b", stripped):
             continue
-        if re.match(rf"^import\s+{re.escape(module_stem)}\b", stripped):
+        if re.match(rf"^import\s+(?:{ re.escape(dotted_path) }|{ re.escape(module_stem) })\b", stripped):
             continue
+        line = re.sub(rf"\b{re.escape(dotted_path)}\.", "", line)
         line = re.sub(rf"\b{re.escape(module_stem)}\.", "", line)
         cleaned_lines.append(line)
     return "\n".join(cleaned_lines)

@@ -147,6 +147,15 @@ class Task(BaseModel):
         description="Concrete completion conditions."
     )
 
+    test_assertions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Executable Python assert statements using concrete literal inputs to verify "
+            "this task's function or class (e.g. [\"assert parse_scores('10, 20') == [10, 20]\"]). "
+            "Leave empty for pure entry-point scripts that only print output."
+        ),
+    )
+
 
 class TaskBatch(BaseModel):
     """Group of related tasks executed during a Worker harness phase."""
@@ -172,6 +181,13 @@ class TaskBatch(BaseModel):
     verification_command: str | None = Field(
         default=None,
         description="Optional command to verify batch behavior."
+    )
+    test_assertions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional module/batch-level Python assert statements verifying integrated "
+            "cross-function or cross-module behavior."
+        ),
     )
 
 
@@ -327,4 +343,8 @@ class ValidationResult(BaseModel):
     changed_files: list[str] = Field(
         default_factory=list,
         description="Files modified during the batch."
+    )
+    failed_task_ids: list[str] = Field(
+        default_factory=list,
+        description="Task IDs that failed deterministic symbol, assertion, or acceptance checks."
     )
