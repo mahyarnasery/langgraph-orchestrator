@@ -14,7 +14,7 @@ class LedgerEntry(BaseModel):
     cycle_id: int = Field(description="Cycle number.")
     step: int = Field(description="Sequential step number within the cycle.")
     layer: Literal[
-        "planner", "foreman", "worker", "assembler", "validator"
+        "planner", "foreman", "worker", "assembler", "validator", "checkpoint"
     ] = Field(description="Which orchestration layer executed this step.")
     action: str = Field(description="Short action identifier.")
     target: str = Field(description="Target file, task_id, or symbol.")
@@ -301,7 +301,7 @@ class ForemanReview(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Cycle memory & Validator
+# Cycle memory, Checkpoint & Validator
 # ---------------------------------------------------------------------------
 
 class CycleResult(BaseModel):
@@ -348,3 +348,28 @@ class ValidationResult(BaseModel):
         default_factory=list,
         description="Task IDs that failed deterministic symbol, assertion, or acceptance checks."
     )
+
+
+class CheckpointData(BaseModel):
+    """Persistent orchestration state saved to sandbox/.checkpoint/state.json."""
+
+    cycle_id: int = Field(default=1)
+    project_goal: str = Field(default="")
+    architecture_context: str = Field(default="")
+    worker_profile: WorkerProfile
+    previous_cycle: CycleResult | None = Field(default=None)
+    plan: Plan | None = Field(default=None)
+    task_batches: list[TaskBatch] = Field(default_factory=list)
+    task_results: list[TaskResult] = Field(default_factory=list)
+    ledger: list[LedgerEntry] = Field(default_factory=list)
+    staged_files: dict[str, dict[str, str]] = Field(default_factory=dict)
+    file_snapshots: dict[str, str] = Field(default_factory=dict)
+    worker_attempts: dict[str, int] = Field(default_factory=dict)
+    foreman_repair_attempts: int = Field(default=0)
+    rebuild_attempts: int = Field(default=0)
+    validation_result: ValidationResult | None = Field(default=None)
+    foreman_review: ForemanReview | None = Field(default=None)
+    planner_review: PlannerReview | None = Field(default=None)
+    rework_mode: str = Field(default="none")
+    phase: str = Field(default="initial")
+    completed_cycles: list[CycleResult] = Field(default_factory=list)

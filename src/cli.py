@@ -2,6 +2,7 @@ import argparse
 import shutil
 import sys
 
+from src.orchestration.checkpoint import clear_checkpoint, load_checkpoint
 from src.orchestration.graph import WORKER_WORKSPACE, run_project
 from src.orchestration.schemas import WorkerProfile
 
@@ -11,8 +12,9 @@ def clean_sandbox_workspace() -> None:
     for py_file in WORKER_WORKSPACE.rglob("*.py"):
         py_file.unlink(missing_ok=True)
     for child in sorted(WORKER_WORKSPACE.iterdir()):
-        if child.is_dir() and child.name not in (".git", ".staging"):
+        if child.is_dir() and child.name != ".git":
             shutil.rmtree(child, ignore_errors=True)
+    clear_checkpoint()
 
 
 def main() -> None:
@@ -21,7 +23,9 @@ def main() -> None:
     )
     parser.add_argument(
         "goal",
-        help="High-level project goal or coding instruction.",
+        nargs="?",
+        default="",
+        help="High-level project goal or coding instruction (optional when using --resume).",
     )
     parser.add_argument(
         "--arch",
@@ -37,7 +41,12 @@ def main() -> None:
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="Clean existing .py files and subdirectories in sandbox/ before starting.",
+        help="Clean existing .py files, subdirectories, and checkpoints in sandbox/ before starting.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the last saved checkpoint in sandbox/.checkpoint/state.json.",
     )
 
     args = parser.parse_args()
@@ -45,7 +54,18 @@ def main() -> None:
     WORKER_WORKSPACE.mkdir(parents=True, exist_ok=True)
     if args.clean:
         clean_sandbox_workspace()
-        print("Cleaned sandbox/ workspace.")
+        print("Cleaned sandbox/ workspace and checkpoints.")
+
+    goal = args.goal.strip()
+    arch = args.arch
+    if args.resume and not goal:
+        ckpt = load_checkpoint()
+        if ckpt is None or not ckpt.project_goal.strip():
+            parser.error("--resume was specified without a goal, and no saved checkpoint was found.")
+        goal = ckpt.project_goal
+        arch = ckpt.architecture_context or arch
+    elif not goal:
+        parser.error("A project goal is required unless resuming from an existing checkpoint (--resume).")
 
     profile = WorkerProfile(
         model="ibm/granite4.1:3b",
@@ -56,10 +76,11 @@ def main() -> None:
     )
 
     history = run_project(
-        goal=args.goal,
-        architecture=args.arch,
+        goal=goal,
+        architecture=arch,
         worker_profile=profile,
         max_cycles=args.cycles,
+        resume=args.resume,
     )
 
     final = history[-1]

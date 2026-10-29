@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 import subprocess
 from pathlib import Path
@@ -37,14 +38,14 @@ def _module_import_name(rel_path: str) -> str:
 
 
 def list_workspace_py_files() -> list[Path]:
-    """Return all user Python files in WORKSPACE_ROOT, excluding .staging, .git, and .pytest_cache."""
+    """Return all user Python files in WORKSPACE_ROOT, excluding .staging, .checkpoint, .git, and .pytest_cache."""
     if not WORKSPACE_ROOT.exists():
         return []
-    excluded = {".staging", ".git", ".pytest_cache", "__pycache__"}
+    excluded = {".staging", ".checkpoint", ".git", ".pytest_cache", "__pycache__"}
     return sorted(
         p
         for p in WORKSPACE_ROOT.rglob("*.py")
-        if not ( set(p.parts) & excluded )
+        if not (set(p.parts) & excluded)
     )
 
 
@@ -52,10 +53,11 @@ class AiderHarness(CodingHarness):
     """
     Execute a TaskBatch through isolated per-task Aider Worker sessions.
 
+    - Supports intra-batch checkpointing (`on_task_complete`) and skipping tasks
+      already verified on disk during a resumed session (`verified_task_results`).
     - If multiple tasks in a batch target the same file (function-level atomization),
       each task is executed in an isolated staging file (`sandbox/.staging/<task_id>__<file>`)
       and live-merged into `sandbox/<file>` so the 3B Worker only writes one function at a time.
-    - If only a single task targets a file, Aider edits `sandbox/<file>` directly.
     """
 
     def __init__(self, config: AiderConfig | None = None):
@@ -67,6 +69,9 @@ class AiderHarness(CodingHarness):
         existing_staged: dict[str, dict[str, str]] | None = None,
         file_snapshots: dict[str, str] | None = None,
         project_goal: str = "",
+        verified_task_results: dict[str, TaskResult] | None = None,
+        on_task_complete: Callable[[Task, TaskResult, dict[str, dict[str, str]]], None] | None = None,
+        stop_after_tasks: int | None = None,
     ) -> list[TaskResult]:
         if not batch.tasks:
             raise ValueError("TaskBatch must contain at least one task.")
@@ -106,22 +111,28 @@ class AiderHarness(CodingHarness):
             _normalize_rel_path(k): dict(v) for k, v in (existing_staged or {}).items()
         }
         snapshots = {_normalize_rel_path(k): v for k, v in (file_snapshots or {}).items()}
+        verified_map = dict(verified_task_results or {})
 
         env = os.environ.copy()
         env.pop("GIT_DIR", None)
         env.pop("GIT_WORK_TREE", None)
 
+        env_stop = os.environ.get("ORCHESTRATOR_STOP_AFTER_TASKS")
+        if stop_after_tasks is None and env_stop and env_stop.isdigit():
+            stop_after_tasks = int(env_stop)
+
         task_results: list[TaskResult] = []
         completed_files: set[str] = set()
         completed_sibling_sigs: dict[str, list[str]] = {}
+        newly_executed_count = 0
 
-        # Pre-populate sibling signatures from already-staged snippets (for rebuild batches)
+        # Pre-populate sibling signatures from already-staged snippets (for rebuild/resumed batches)
         for mod_file, snippets_map in staged_snippets.items():
             for prev_tid, prev_code in snippets_map.items():
                 for sig in extract_python_signatures(prev_code):
-                    completed_sibling_sigs.setdefault(mod_file, []).append(
-                        f"{sig} (from task {prev_tid})"
-                    )
+                    entry_str = f"{sig} (from task {prev_tid})"
+                    if entry_str not in completed_sibling_sigs.setdefault(mod_file, []):
+                        completed_sibling_sigs[mod_file].append(entry_str)
 
         try:
             for task in ordered_tasks:
@@ -142,6 +153,18 @@ class AiderHarness(CodingHarness):
                     file_task_counts.get(primary_target, 0) > 1
                     or primary_target in staged_snippets
                 )
+
+                # Check if this task was already completed and verified on disk (Resume Fast-Forward)
+                prev_res = verified_map.get(task.task_id)
+                if prev_res is not None and prev_res.status == "completed":
+                    print(
+                        f"\n=== AIDER WORKER (Task: {task.task_id}) — SKIPPING (Verified on disk from checkpoint) ==="
+                    )
+                    for f in prev_res.files_changed:
+                        completed_files.add(_normalize_rel_path(f))
+                    completed_files.add(primary_target)
+                    task_results.append(prev_res)
+                    continue
 
                 if use_staging:
                     safe_name = primary_target.replace("/", "__")
@@ -251,9 +274,10 @@ class AiderHarness(CodingHarness):
                         )
                         sigs = extract_python_signatures(snippet_code)
                         if sigs:
-                            completed_sibling_sigs.setdefault(primary_target, []).extend(
-                                f"{s} (from task {task.task_id})" for s in sigs
-                            )
+                            for s in sigs:
+                                entry_str = f"{s} (from task {task.task_id})"
+                                if entry_str not in completed_sibling_sigs.setdefault(primary_target, []):
+                                    completed_sibling_sigs[primary_target].append(entry_str)
                         ordered_pairs = list(staged_snippets[primary_target].items())
                         merged_live = merge_staged_snippets_ast(
                             target_filename=primary_target,
@@ -281,19 +305,27 @@ class AiderHarness(CodingHarness):
                 else:
                     status = "no_change"
 
-                task_results.append(
-                    TaskResult(
-                        task_id=task.task_id,
-                        status=status,
-                        summary=(
-                            f"Executed task {task.task_id} "
-                            f"({'staged for ' + primary_target if use_staging else primary_target})."
-                        ),
-                        files_changed=changed,
-                        staged_file=staged_rel_path if use_staging else None,
-                        errors=errors,
-                    )
+                result_obj = TaskResult(
+                    task_id=task.task_id,
+                    status=status,
+                    summary=(
+                        f"Executed task {task.task_id} "
+                        f"({'staged for ' + primary_target if use_staging else primary_target})."
+                    ),
+                    files_changed=changed,
+                    staged_file=staged_rel_path if use_staging else None,
+                    errors=errors,
                 )
+                task_results.append(result_obj)
+                newly_executed_count += 1
+
+                if on_task_complete is not None:
+                    on_task_complete(task, result_obj, staged_snippets)
+
+                if stop_after_tasks is not None and newly_executed_count >= stop_after_tasks:
+                    raise KeyboardInterrupt(
+                        f"Simulated interrupt after {newly_executed_count} task(s) completed (last={task.task_id})."
+                    )
         finally:
             self._unload_worker_model()
 
@@ -303,7 +335,7 @@ class AiderHarness(CodingHarness):
         """Ensure every intermediate package directory inside WORKSPACE_ROOT has an __init__.py."""
         curr = directory.resolve()
         while curr != WORKSPACE_ROOT and curr.is_relative_to(WORKSPACE_ROOT):
-            if curr.name not in (".staging", ".git", "__pycache__", ".pytest_cache"):
+            if curr.name not in (".staging", ".checkpoint", ".git", "__pycache__", ".pytest_cache"):
                 init_file = curr / "__init__.py"
                 if not init_file.exists():
                     init_file.write_text("", encoding="utf-8")

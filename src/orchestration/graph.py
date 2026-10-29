@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from graphlib import CycleError, TopologicalSorter
 import re
 from pathlib import Path
 
@@ -10,6 +11,12 @@ from src.agents.foreman import ForemanAgent
 from src.agents.planner import PlannerAgent
 from src.harnesses.aider import AiderHarness, STAGING_DIR, list_workspace_py_files
 
+from .checkpoint import (
+    clear_checkpoint,
+    load_checkpoint,
+    reconcile_checkpoint_with_disk,
+    save_checkpoint,
+)
 from .ledger import (
     extract_python_signatures,
     format_ledger_for_prompt,
@@ -97,24 +104,20 @@ def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
     if not multi_task_file and "function" not in task.scope.lower():
         return None
 
-    # 1. Look for `def <name>(` or `class <Name>` in acceptance_criteria
     for crit in task.acceptance_criteria:
         m = re.search(r"\b(?:def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", crit)
         if m:
             return m.group(1)
 
-    # 2. Look for `assert <name>(` in test_assertions
     for assertion in task.test_assertions:
         m = re.search(r"\bassert\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", assertion)
         if m:
             return m.group(1)
 
-    # 3. Look for backticked identifier in objective (excluding `.py` filenames)
     for token in re.findall(r"`([a-zA-Z_][a-zA-Z0-9_]*)(?:\([^`]*\))?`", task.objective):
         if not token.endswith(".py"):
             return token
 
-    # 4. Look for `Implement <name>(` in objective
     m_obj = re.search(
         r"\b(?:implement|define|create)\s+(?:the\s+)?(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
         task.objective,
@@ -156,14 +159,71 @@ def _is_redundant_empty_file_task(task: Task) -> bool:
     return False
 
 
+def _sort_execution_order_topologically(
+    tasks: list[Task],
+    initial_order: list[str],
+) -> list[str]:
+    """
+    Deterministically sort task IDs in dependency order using TopologicalSorter,
+    preserving Foreman's relative ordering when tasks are at the same depth,
+    and ensuring entry-point scripts (`main.py`, `app.py`) run after library modules.
+    """
+    valid_ids = {t.task_id for t in tasks}
+    rank = {tid: idx for idx, tid in enumerate(initial_order) if tid in valid_ids}
+    for t in tasks:
+        rank.setdefault(t.task_id, len(rank))
+
+    non_entry_ids = {
+        t.task_id
+        for t in tasks
+        if not (
+            t.target_symbol is None
+            and len(t.relevant_files) == 1
+            and Path(t.relevant_files[0]).name in ("main.py", "app.py")
+        )
+    }
+    referenced_as_dep = {
+        dep for t in tasks for dep in t.dependencies if dep in valid_ids
+    }
+
+    graph_deps: dict[str, list[str]] = {}
+    for t in sorted(tasks, key=lambda x: rank[x.task_id]):
+        deps = [d for d in t.dependencies if d in valid_ids and d != t.task_id]
+        # If an entry-point script (`main.py` / `app.py`) omitted explicit dependencies
+        # and nothing depends on it, ensure library tasks run before it.
+        if (
+            not deps
+            and t.task_id not in non_entry_ids
+            and t.task_id not in referenced_as_dep
+            and non_entry_ids
+        ):
+            deps = sorted(non_entry_ids, key=lambda tid: rank[tid])
+        graph_deps[t.task_id] = deps
+
+    try:
+        sorter = TopologicalSorter()
+        for tid in sorted(valid_ids, key=lambda x: rank[x]):
+            sorter.add(tid, *graph_deps.get(tid, []))
+        sorter.prepare()
+        ordered: list[str] = []
+        while sorter.is_active():
+            ready = sorted(sorter.get_ready(), key=lambda x: rank[x])
+            ordered.extend(ready)
+            sorter.done(*ready)
+        return ordered
+    except CycleError as exc:
+        print(f"[WARN] Circular task dependency detected ({exc}); retaining initial order.")
+        return sorted(valid_ids, key=lambda x: rank[x])
+
+
 def _prepare_batch_and_workspace(
     batch: TaskBatch,
     existing_snapshots: dict[str, str],
 ) -> tuple[TaskBatch, dict[str, str]]:
     """
-    Normalize batch relevant_files and execution_order, pre-create missing
-    files and package `__init__.py` markers in sandbox, infer missing
-    `target_symbol`s, and snapshot pre-batch file contents for rollback support.
+    Normalize batch relevant_files and execution_order, topologically sort tasks,
+    pre-create missing files and package `__init__.py` markers in sandbox, infer
+    missing `target_symbol`s, and snapshot pre-batch file contents for rollback.
     """
     from .tools import create_file, read_file
 
@@ -202,7 +262,6 @@ def _prepare_batch_and_workspace(
         if filtered_tasks:
             batch.tasks = filtered_tasks
 
-    # Count tasks per file to infer missing target_symbols on multi-task modules
     file_counts: dict[str, int] = {}
     for task in batch.tasks:
         for f in task.relevant_files:
@@ -223,16 +282,18 @@ def _prepare_batch_and_workspace(
     for task in batch.tasks:
         if task.task_id not in ordered_ids:
             ordered_ids.append(task.task_id)
-    batch.execution_order = ordered_ids
 
-    # Automatically discover and include parent package `__init__.py` files
+    batch.execution_order = _sort_execution_order_topologically(
+        batch.tasks, ordered_ids
+    )
+
     package_init_files: set[str] = set()
     for rel_path in list(batch.relevant_files):
         parts = Path(rel_path).parts
         if len(parts) > 1:
             for depth in range(1, len(parts)):
                 pkg_dir = Path(*parts[:depth])
-                if pkg_dir.parts[0] not in (".staging", ".git", "__pycache__"):
+                if pkg_dir.parts[0] not in (".staging", ".checkpoint", ".git", "__pycache__"):
                     package_init_files.add(str(pkg_dir / "__init__.py"))
 
     snapshots = dict(existing_snapshots)
@@ -366,6 +427,13 @@ def _gather_full_repository_context() -> str:
     )
 
 
+def _persist_node_state(state: WorkflowState, updates: dict) -> dict:
+    """Merge node state updates and save checkpoint to sandbox/.checkpoint/state.json."""
+    merged: WorkflowState = {**state, **updates}  # type: ignore[assignment]
+    save_checkpoint(merged)
+    return updates
+
+
 def build_planner() -> PlannerAgent:
     return PlannerAgent()
 
@@ -412,11 +480,14 @@ def planner_node(state: WorkflowState) -> dict:
         detail=f"Planned {len(plan.acceptance_criteria)} acceptance criteria: {plan.objective}",
     )
 
-    return {
-        "plan": plan,
-        "ledger": updated_ledger,
-        "phase": "planned",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "plan": plan,
+            "ledger": updated_ledger,
+            "phase": "planned",
+        },
+    )
 
 
 # ============================================================================
@@ -466,16 +537,19 @@ def foreman_node(state: WorkflowState) -> dict:
         detail=f"Atomized plan into {len(batch.tasks)} task(s): {task_desc}",
     )
 
-    return {
-        "task_batches": [batch],
-        "file_snapshots": snapshots,
-        "ledger": updated_ledger,
-        "phase": "task_ready",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "task_batches": [batch],
+            "file_snapshots": snapshots,
+            "ledger": updated_ledger,
+            "phase": "task_ready",
+        },
+    )
 
 
 # ============================================================================
-# 3. Worker — Atomic Execution (Direct or Staged)
+# 3. Worker — Atomic Execution (Direct or Staged, with Intra-Batch Checkpointing)
 # ============================================================================
 
 
@@ -489,51 +563,39 @@ def worker_node(state: WorkflowState) -> dict:
     print("\n=== WORKER SESSION START ===")
     print(f"Batch: {batch.batch_id}")
 
-    results = worker.execute(
-        batch,
-        existing_staged=state.get("staged_files", {}),
-        file_snapshots=state.get("file_snapshots", {}),
-        project_goal=state["project_goal"],
-    )
-
-    print("\n=== WORKER SESSION COMPLETE ===")
-
-    attempts = dict(state["worker_attempts"])
-    for result in results:
-        attempts[result.task_id] = attempts.get(result.task_id, 0) + 1
-
-    merged_by_id = {r.task_id: r for r in state["task_results"]}
-    for result in results:
-        merged_by_id[result.task_id] = result
-
+    verified_by_id = {
+        r.task_id: r
+        for r in state.get("task_results", [])
+        if r.status == "completed"
+    }
+    merged_by_id = {r.task_id: r for r in state.get("task_results", [])}
+    attempts = dict(state.get("worker_attempts", {}))
     staged_files: dict[str, dict[str, str]] = {
         _normalize_workspace_path(k): dict(v)
         for k, v in state.get("staged_files", {}).items()
     }
-    tasks_by_id = {t.task_id: t for t in batch.tasks}
+    updated_ledger = list(state.get("ledger", []))
 
-    updated_ledger = list(state["ledger"])
-    for result in results:
-        task_obj = tasks_by_id.get(result.task_id)
+    def _on_single_task_complete(
+        task_obj: Task,
+        result: TaskResult,
+        live_staged: dict[str, dict[str, str]],
+    ) -> None:
+        nonlocal updated_ledger, staged_files
+        attempts[result.task_id] = attempts.get(result.task_id, 0) + 1
+        merged_by_id[result.task_id] = result
+        staged_files = {
+            _normalize_workspace_path(k): dict(v) for k, v in live_staged.items()
+        }
+
         target_file = (
             _normalize_workspace_path(task_obj.relevant_files[0])
-            if task_obj and task_obj.relevant_files
+            if task_obj.relevant_files
             else "unknown"
         )
-        if result.staged_file:
-            staged_path = WORKER_WORKSPACE / result.staged_file
-            if staged_path.is_file():
-                snippet = staged_path.read_text(encoding="utf-8").strip()
-                if snippet:
-                    staged_files[target_file] = upsert_staged_snippet(
-                        staged_files.get(target_file, {}),
-                        result.task_id,
-                        snippet,
-                    )
-
         symbol_label = (
             f"{target_file}::{task_obj.target_symbol}"
-            if task_obj and task_obj.target_symbol
+            if task_obj.target_symbol
             else target_file
         )
         updated_ledger = record_ledger_entry(
@@ -546,13 +608,61 @@ def worker_node(state: WorkflowState) -> dict:
             detail=result.summary,
         )
 
-    return {
-        "task_results": list(merged_by_id.values()),
-        "worker_attempts": attempts,
-        "staged_files": staged_files,
-        "ledger": updated_ledger,
-        "phase": "worker_complete",
-    }
+        # Save intra-node checkpoint immediately after this task finishes
+        partial_state: WorkflowState = {
+            **state,
+            "task_results": list(merged_by_id.values()),
+            "worker_attempts": dict(attempts),
+            "staged_files": dict(staged_files),
+            "ledger": list(updated_ledger),
+        }
+        save_checkpoint(partial_state)
+
+    results = worker.execute(
+        batch,
+        existing_staged=staged_files,
+        file_snapshots=state.get("file_snapshots", {}),
+        project_goal=state["project_goal"],
+        verified_task_results=verified_by_id,
+        on_task_complete=_on_single_task_complete,
+    )
+
+    print("\n=== WORKER SESSION COMPLETE ===")
+
+    # Ensure any task results returned without triggering the callback (e.g., unit-mocked harnesses)
+    # are also merged into state.
+    tasks_by_id = {t.task_id: t for t in batch.tasks}
+    for result in results:
+        if result.task_id not in merged_by_id:
+            merged_by_id[result.task_id] = result
+            attempts[result.task_id] = attempts.get(result.task_id, 0) + 1
+            task_obj = tasks_by_id.get(result.task_id)
+            target_file = (
+                _normalize_workspace_path(task_obj.relevant_files[0])
+                if task_obj and task_obj.relevant_files
+                else "unknown"
+            )
+            if result.staged_file:
+                staged_path = WORKER_WORKSPACE / result.staged_file
+                if staged_path.is_file():
+                    snippet = staged_path.read_text(encoding="utf-8").strip()
+                    if snippet:
+                        staged_files[target_file] = upsert_staged_snippet(
+                            staged_files.get(target_file, {}),
+                            result.task_id,
+                            snippet,
+                        )
+
+    return _persist_node_state(
+        state,
+        {
+            "task_results": list(merged_by_id.values()),
+            "worker_attempts": attempts,
+            "staged_files": staged_files,
+            "ledger": updated_ledger,
+            "phase": "worker_complete",
+        },
+    )
 
 
 # ============================================================================
@@ -569,7 +679,7 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
 
     staged_files = state.get("staged_files", {})
     if not staged_files:
-        return {"phase": "assembled"}
+        return _persist_node_state(state, {"phase": "assembled"})
 
     foreman = build_foreman()
     plan = state["plan"]
@@ -647,10 +757,13 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
             ),
         )
 
-    return {
-        "ledger": updated_ledger,
-        "phase": "assembled",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "ledger": updated_ledger,
+            "phase": "assembled",
+        },
+    )
 
 
 # ============================================================================
@@ -689,11 +802,14 @@ def validator_node(state: WorkflowState) -> dict:
         detail=detail,
     )
 
-    return {
-        "validation_result": validation,
-        "ledger": updated_ledger,
-        "phase": "validated",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "validation_result": validation,
+            "ledger": updated_ledger,
+            "phase": "validated",
+        },
+    )
 
 
 # ============================================================================
@@ -753,11 +869,14 @@ def foreman_review_node(state: WorkflowState) -> dict:
         detail=review.summary,
     )
 
-    return {
-        "foreman_review": review,
-        "ledger": updated_ledger,
-        "phase": f"foreman_review_{review.decision}",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "foreman_review": review,
+            "ledger": updated_ledger,
+            "phase": f"foreman_review_{review.decision}",
+        },
+    )
 
 
 def foreman_self_repair_node(state: WorkflowState) -> dict:
@@ -819,12 +938,15 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
         detail=repair_task_result.summary,
     )
 
-    return {
-        "task_results": state["task_results"] + [repair_task_result],
-        "foreman_repair_attempts": state["foreman_repair_attempts"] + 1,
-        "ledger": updated_ledger,
-        "phase": "foreman_repaired",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "task_results": state["task_results"] + [repair_task_result],
+            "foreman_repair_attempts": state["foreman_repair_attempts"] + 1,
+            "ledger": updated_ledger,
+            "phase": "foreman_repaired",
+        },
+    )
 
 
 def foreman_corrective_node(state: WorkflowState) -> dict:
@@ -860,6 +982,13 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         corrective_batch, snapshots
     )
 
+    # Clear previous TaskResults for any task_id being rebuilt so `worker_node`
+    # executes the corrective tasks instead of skipping them as already completed.
+    rebuild_ids = {t.task_id for t in corrective_batch.tasks}
+    retained_results = [
+        r for r in state["task_results"] if r.task_id not in rebuild_ids
+    ]
+
     updated_ledger = record_ledger_entry(
         state["ledger"],
         cycle_id=state["cycle_id"],
@@ -870,13 +999,17 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         detail=f"Created corrective batch with tasks: {', '.join(t.task_id for t in corrective_batch.tasks)}",
     )
 
-    return {
-        "task_batches": state["task_batches"] + [corrective_batch],
-        "file_snapshots": updated_snapshots,
-        "rebuild_attempts": state["rebuild_attempts"] + 1,
-        "ledger": updated_ledger,
-        "phase": "corrective_task_ready",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "task_batches": state["task_batches"] + [corrective_batch],
+            "task_results": retained_results,
+            "file_snapshots": updated_snapshots,
+            "rebuild_attempts": state["rebuild_attempts"] + 1,
+            "ledger": updated_ledger,
+            "phase": "corrective_task_ready",
+        },
+    )
 
 
 # ============================================================================
@@ -912,16 +1045,45 @@ def planner_review_node(state: WorkflowState) -> dict:
         detail=review.summary,
     )
 
-    return {
-        "planner_review": review,
-        "ledger": updated_ledger,
-        "phase": "planner_accepted" if review.accepted else "planner_revision_needed",
-    }
+    return _persist_node_state(
+        state,
+        {
+            "planner_review": review,
+            "ledger": updated_ledger,
+            "phase": "planner_accepted" if review.accepted else "planner_revision_needed",
+        },
+    )
 
 
 # ============================================================================
 # Routing & Graph Construction
 # ============================================================================
+
+
+def route_from_entry(state: WorkflowState) -> str:
+    """Route from START to the appropriate node based on the reconciled checkpoint phase."""
+    phase = state.get("phase", "initial")
+
+    if phase == "initial" or state.get("plan") is None:
+        return "planner"
+    if phase == "planned" or not state.get("task_batches"):
+        return "foreman"
+    if phase in ("task_ready", "corrective_task_ready"):
+        return "worker"
+    if phase == "worker_complete":
+        return "foreman_assemble"
+    if phase in ("assembled", "foreman_repaired"):
+        return "validator"
+    if phase == "validated":
+        return "foreman_review"
+    if phase == "foreman_review_accept":
+        return "planner_review"
+    if phase == "foreman_review_repair":
+        return "foreman_self_repair"
+    if phase == "foreman_review_rebuild":
+        return "foreman_corrective"
+
+    return "planner"
 
 
 def route_after_foreman_review(state: WorkflowState) -> str:
@@ -1002,7 +1164,20 @@ def build_graph():
     graph.add_node("foreman_corrective", foreman_corrective_node)
     graph.add_node("planner_review", planner_review_node)
 
-    graph.set_entry_point("planner")
+    graph.set_conditional_entry_point(
+        route_from_entry,
+        {
+            "planner": "planner",
+            "foreman": "foreman",
+            "worker": "worker",
+            "foreman_assemble": "foreman_assemble",
+            "validator": "validator",
+            "foreman_review": "foreman_review",
+            "foreman_self_repair": "foreman_self_repair",
+            "foreman_corrective": "foreman_corrective",
+            "planner_review": "planner_review",
+        },
+    )
 
     graph.add_edge("planner", "foreman")
     graph.add_edge("foreman", "worker")
@@ -1037,14 +1212,28 @@ def run_cycle(
     architecture: str,
     worker_profile: WorkerProfile,
     previous_cycle: CycleResult | None,
+    resume: bool = False,
 ) -> CycleResult:
-    """Execute a single orchestration cycle."""
-    if STAGING_DIR.exists():
-        for f in STAGING_DIR.rglob("*.py"):
-            f.unlink(missing_ok=True)
+    """Execute a single orchestration cycle, optionally resuming from sandbox/.checkpoint/state.json."""
+    initial_state: WorkflowState | None = None
 
-    final_state = app.invoke(
-        {
+    if resume:
+        ckpt = load_checkpoint()
+        if ckpt is not None and ckpt.cycle_id == cycle_id:
+            initial_state = reconcile_checkpoint_with_disk(ckpt)
+            if goal.strip():
+                initial_state["project_goal"] = goal
+            if architecture.strip():
+                initial_state["architecture_context"] = architecture
+            initial_state["worker_profile"] = worker_profile
+
+    if initial_state is None:
+        if STAGING_DIR.exists():
+            for f in STAGING_DIR.rglob("*.py"):
+                f.unlink(missing_ok=True)
+        clear_checkpoint()
+
+        initial_state = {
             "cycle_id": cycle_id,
             "project_goal": goal,
             "architecture_context": architecture,
@@ -1065,7 +1254,9 @@ def run_cycle(
             "rework_mode": "none",
             "phase": "initial",
         }
-    )
+        save_checkpoint(initial_state)
+
+    final_state = app.invoke(initial_state)
 
     foreman_review = final_state.get("foreman_review")
     planner_review = final_state.get("planner_review")
@@ -1095,22 +1286,36 @@ def run_project(
     architecture: str,
     worker_profile: WorkerProfile,
     max_cycles: int = 3,
+    resume: bool = False,
 ) -> list[CycleResult]:
-    """Execute the outer Planner loop across multiple cycles."""
+    """Execute the outer Planner loop across multiple cycles, with optional checkpoint resume."""
     history: list[CycleResult] = []
     previous_cycle: CycleResult | None = None
+    start_cycle = 1
 
-    for cycle_id in range(1, max_cycles + 1):
+    if resume:
+        ckpt = load_checkpoint()
+        if ckpt is not None:
+            history = list(ckpt.completed_cycles)
+            start_cycle = ckpt.cycle_id
+            previous_cycle = ckpt.previous_cycle
+            print(
+                f"\n=== RESUMING PROJECT FROM CHECKPOINT (Cycle {start_cycle}, Phase: {ckpt.phase}) ==="
+            )
+
+    for cycle_id in range(start_cycle, max_cycles + 1):
         print(f"\n==========================================")
         print(f"=== STARTING ORCHESTRATION CYCLE {cycle_id}/{max_cycles} ===")
         print(f"==========================================")
 
+        use_resume_this_cycle = resume and (cycle_id == start_cycle)
         result = run_cycle(
             cycle_id=cycle_id,
             goal=goal,
             architecture=architecture,
             worker_profile=worker_profile,
             previous_cycle=previous_cycle,
+            resume=use_resume_this_cycle,
         )
         history.append(result)
 
