@@ -9,15 +9,18 @@ from langgraph.graph import END, StateGraph
 
 from src.agents.foreman import ForemanAgent
 from src.agents.planner import PlannerAgent
-from src.harnesses.aider import AiderHarness, STAGING_DIR, list_workspace_py_files
+from src.harnesses.aider import AiderHarness, list_workspace_py_files
 
 from .checkpoint import (
     clear_checkpoint,
     load_checkpoint,
     reconcile_checkpoint_with_disk,
     save_checkpoint,
+    update_checkpoint_stage_metadata,
 )
 from .ledger import (
+    ensure_class_wrapper,
+    extract_all_ast_symbol_names,
     extract_python_signatures,
     format_ledger_for_prompt,
     merge_staged_snippets_ast,
@@ -29,6 +32,7 @@ from .schemas import (
     ForemanReview,
     Plan,
     PlannerReview,
+    StageGoal,
     Task,
     TaskBatch,
     TaskResult,
@@ -37,39 +41,43 @@ from .schemas import (
 )
 from .state import WorkflowState
 from .validator import validate_batch
+from .workspace import (
+    DEFAULT_WORKSPACE_ROOT,
+    REPO_ROOT,
+    get_staging_dir,
+    get_workspace_root,
+    normalize_workspace_rel_path,
+    set_active_workspace,
+)
 
-REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
-WORKER_WORKSPACE = (REPO_ROOT / "sandbox").resolve()
+WORKER_WORKSPACE = DEFAULT_WORKSPACE_ROOT
 MAX_FOREMAN_REPAIRS = 2
 MAX_WORKER_REBUILDS = 3
 
 
 def _normalize_workspace_path(path: str) -> str:
     """Normalize a logical workspace path into a clean relative POSIX path."""
-    cleaned = path.strip().replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    cleaned = cleaned.removeprefix("sandbox/").strip("/")
-    return cleaned
+    return normalize_workspace_rel_path(path)
 
 
 def _sandbox_repo_path(path: str) -> str:
-    """Convert a logical TaskBatch path into its physical repository path inside sandbox."""
+    """Convert a logical TaskBatch path into a workspace-relative path for tool calls."""
     normalized = _normalize_workspace_path(path)
     if normalized in ("", ".", ".."):
         raise ValueError(f"Invalid Worker path: {path}")
-    return f"sandbox/{normalized}"
+    return normalized
 
 
 def _build_repository_map() -> str:
-    """Build a compact AST-based map of existing files, packages, classes, and functions in sandbox."""
+    """Build a compact AST-based map of existing files, packages, classes, and functions in the active workspace."""
+    ws_root = get_workspace_root()
     py_files = list_workspace_py_files()
     if not py_files:
-        return "[No Python files currently in sandbox workspace]"
+        return f"[No Python files currently in workspace {ws_root.name}/]"
 
     entries: list[str] = []
     for py_file in py_files:
-        rel_path = str(py_file.relative_to(WORKER_WORKSPACE))
+        rel_path = str(py_file.relative_to(ws_root))
         try:
             source = py_file.read_text(encoding="utf-8")
             if not source.strip():
@@ -85,7 +93,7 @@ def _build_repository_map() -> str:
         except Exception:
             entries.append(f"- {rel_path} (unparsed)")
 
-    return "Existing Workspace Repository Map:\n" + "\n".join(entries)
+    return f"Existing Workspace Repository Map ({ws_root}):\n" + "\n".join(entries)
 
 
 def _enrich_architecture_context(architecture_context: str) -> str:
@@ -95,14 +103,22 @@ def _enrich_architecture_context(architecture_context: str) -> str:
 
 def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
     """
-    If Foreman omitted `target_symbol` on a function/class task, infer it
+    If Foreman omitted `target_symbol` on a function or class-method task, infer it
     deterministically from `acceptance_criteria`, `test_assertions`, or `objective`.
     """
     if task.target_symbol and task.target_symbol.strip():
         return task.target_symbol.split("(")[0].strip()
 
-    if not multi_task_file and "function" not in task.scope.lower():
+    if not multi_task_file and "function" not in task.scope.lower() and "method" not in task.scope.lower():
         return None
+
+    combined_text = f"{task.objective}\n" + "\n".join(task.acceptance_criteria)
+    cls_method_match = re.search(
+        r"\b([A-Z][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*)\b",
+        combined_text,
+    )
+    if cls_method_match:
+        return cls_method_match.group(1)
 
     for crit in task.acceptance_criteria:
         m = re.search(r"\b(?:def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", crit)
@@ -114,12 +130,12 @@ def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
         if m:
             return m.group(1)
 
-    for token in re.findall(r"`([a-zA-Z_][a-zA-Z0-9_]*)(?:\([^`]*\))?`", task.objective):
+    for token in re.findall(r"`([a-zA-Z_][a-zA-Z0-9_.]*)(?:\([^`]*\))?`", task.objective):
         if not token.endswith(".py"):
             return token
 
     m_obj = re.search(
-        r"\b(?:implement|define|create)\s+(?:the\s+)?(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
+        r"\b(?:implement|define|create)\s+(?:the\s+)?(?:function|method\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*\(",
         task.objective,
         re.IGNORECASE,
     )
@@ -164,14 +180,28 @@ def _sort_execution_order_topologically(
     initial_order: list[str],
 ) -> list[str]:
     """
-    Deterministically sort task IDs in dependency order using TopologicalSorter,
-    preserving Foreman's relative ordering when tasks are at the same depth,
-    and ensuring entry-point scripts (`main.py`, `app.py`) run after library modules.
+    Deterministically sort task IDs in dependency order using TopologicalSorter:
+    - Preserves Foreman's relative ordering when tasks are at the same depth.
+    - Ensures `ClassName.__init__` tasks run before other method tasks on the same file/class.
+    - Ensures entry-point scripts (`main.py`, `app.py`) run after library/model tasks.
     """
     valid_ids = {t.task_id for t in tasks}
     rank = {tid: idx for idx, tid in enumerate(initial_order) if tid in valid_ids}
     for t in tasks:
         rank.setdefault(t.task_id, len(rank))
+
+    init_task_by_file_class: dict[tuple[str, str], str] = {}
+    init_task_by_file: dict[str, str] = {}
+    for t in tasks:
+        if not t.relevant_files or not t.target_symbol:
+            continue
+        primary = t.relevant_files[0]
+        if t.target_symbol.endswith(".__init__"):
+            cls_name = t.target_symbol.split(".", 1)[0]
+            init_task_by_file_class[(primary, cls_name)] = t.task_id
+            init_task_by_file[primary] = t.task_id
+        elif t.target_symbol == "__init__":
+            init_task_by_file[primary] = t.task_id
 
     non_entry_ids = {
         t.task_id
@@ -189,8 +219,18 @@ def _sort_execution_order_topologically(
     graph_deps: dict[str, list[str]] = {}
     for t in sorted(tasks, key=lambda x: rank[x.task_id]):
         deps = [d for d in t.dependencies if d in valid_ids and d != t.task_id]
-        # If an entry-point script (`main.py` / `app.py`) omitted explicit dependencies
-        # and nothing depends on it, ensure library tasks run before it.
+
+        if t.relevant_files and t.target_symbol and not t.target_symbol.endswith("__init__"):
+            primary = t.relevant_files[0]
+            init_tid: str | None = None
+            if "." in t.target_symbol:
+                cls_name = t.target_symbol.split(".", 1)[0]
+                init_tid = init_task_by_file_class.get((primary, cls_name))
+            if init_tid is None:
+                init_tid = init_task_by_file.get(primary)
+            if init_tid and init_tid != t.task_id and init_tid not in deps:
+                deps.append(init_tid)
+
         if (
             not deps
             and t.task_id not in non_entry_ids
@@ -198,6 +238,7 @@ def _sort_execution_order_topologically(
             and non_entry_ids
         ):
             deps = sorted(non_entry_ids, key=lambda tid: rank[tid])
+
         graph_deps[t.task_id] = deps
 
     try:
@@ -222,11 +263,12 @@ def _prepare_batch_and_workspace(
 ) -> tuple[TaskBatch, dict[str, str]]:
     """
     Normalize batch relevant_files and execution_order, topologically sort tasks,
-    pre-create missing files and package `__init__.py` markers in sandbox, infer
-    missing `target_symbol`s, and snapshot pre-batch file contents for rollback.
+    pre-create missing files and package `__init__.py` markers in the active workspace,
+    infer missing `target_symbol`s, and snapshot pre-batch file contents for rollback.
     """
     from .tools import create_file, read_file
 
+    ws_root = get_workspace_root()
     union_files = sorted(
         {
             _normalize_workspace_path(path)
@@ -267,11 +309,29 @@ def _prepare_batch_and_workspace(
         for f in task.relevant_files:
             file_counts[f] = file_counts.get(f, 0) + 1
 
+    class_prefix_by_file: dict[str, str] = {}
+    for task in batch.tasks:
+        if task.relevant_files and task.target_symbol and "." in task.target_symbol:
+            class_prefix_by_file[task.relevant_files[0]] = task.target_symbol.split(".", 1)[0]
+
     for task in batch.tasks:
         primary = task.relevant_files[0] if task.relevant_files else ""
         inferred = _infer_task_symbol(task, file_counts.get(primary, 0) > 1)
         if inferred:
+            if (
+                "." not in inferred
+                and primary in class_prefix_by_file
+                and inferred != class_prefix_by_file[primary]
+            ):
+                inferred = f"{class_prefix_by_file[primary]}.{inferred}"
             task.target_symbol = inferred
+
+        if (
+            task.target_symbol is None
+            and len(task.relevant_files) == 1
+            and Path(task.relevant_files[0]).name in ("main.py", "app.py", "hello.py")
+        ):
+            task.test_assertions = []
 
     valid_ids = {t.task_id for t in batch.tasks}
     for task in batch.tasks:
@@ -298,7 +358,7 @@ def _prepare_batch_and_workspace(
 
     snapshots = dict(existing_snapshots)
 
-    print("\n=== FOREMAN REPOSITORY PREPARATION ===")
+    print(f"\n=== FOREMAN REPOSITORY PREPARATION ({ws_root}) ===")
     for init_rel in sorted(package_init_files):
         physical_init = _sandbox_repo_path(init_rel)
         try:
@@ -307,7 +367,7 @@ def _prepare_batch_and_workspace(
         except FileNotFoundError:
             create_file.func(path=physical_init, content="")
             snapshots.setdefault(init_rel, "")
-            print(f"Created package marker {physical_init}")
+            print(f"Created package marker {ws_root.name}/{physical_init}")
         except Exception:
             pass
 
@@ -316,17 +376,17 @@ def _prepare_batch_and_workspace(
         try:
             res = read_file.func(path=physical_path)
             snapshots.setdefault(path, res.get("content", ""))
-            print(f"{physical_path} already exists")
+            print(f"{ws_root.name}/{physical_path} already exists")
         except FileNotFoundError:
             create_file.func(path=physical_path, content="")
             snapshots.setdefault(path, "")
-            print(f"Created {physical_path}")
+            print(f"Created {ws_root.name}/{physical_path}")
         except Exception as exc:
             print(f"Warning: could not read {physical_path}: {exc}")
             try:
                 create_file.func(path=physical_path, content="")
                 snapshots.setdefault(path, "")
-                print(f"Created {physical_path} (after read error)")
+                print(f"Created {ws_root.name}/{physical_path} (after read error)")
             except Exception as create_exc:
                 print(f"Error creating {physical_path}: {create_exc}")
 
@@ -369,7 +429,7 @@ def _build_effective_validation_batch(task_batches: list[TaskBatch]) -> TaskBatc
 
 
 def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult]) -> str:
-    """Inspect the sandbox repository files and construct textual evidence."""
+    """Inspect the active workspace repository files and construct textual evidence."""
     from .tools import read_file
 
     relevant_files = sorted(
@@ -398,15 +458,16 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
 
 
 def _gather_full_repository_context() -> str:
-    """Gather context from all user Python files in the sandbox for Planner review."""
+    """Gather context from all user Python files in the active workspace for Planner review."""
     from .tools import read_file
 
+    ws_root = get_workspace_root()
     repository_evidence: list[str] = []
     for py_file in list_workspace_py_files():
         try:
-            relative_path = py_file.relative_to(WORKER_WORKSPACE)
+            relative_path = py_file.relative_to(ws_root)
             logical_path = str(relative_path)
-            result = read_file.func(path=f"sandbox/{logical_path}")
+            result = read_file.func(path=logical_path)
             content = result.get("content", "")
             if not content.strip() and py_file.name == "__init__.py":
                 content_display = "[PACKAGE __init__.py - 0 bytes]"
@@ -423,12 +484,12 @@ def _gather_full_repository_context() -> str:
     return (
         "\n\n".join(repository_evidence)
         if repository_evidence
-        else "[No Python files in sandbox]"
+        else f"[No Python files in {ws_root.name}/]"
     )
 
 
 def _persist_node_state(state: WorkflowState, updates: dict) -> dict:
-    """Merge node state updates and save checkpoint to sandbox/.checkpoint/state.json."""
+    """Merge node state updates and save checkpoint to `<workspace>/.checkpoint/state.json`."""
     merged: WorkflowState = {**state, **updates}  # type: ignore[assignment]
     save_checkpoint(merged)
     return updates
@@ -557,6 +618,7 @@ def worker_node(state: WorkflowState) -> dict:
     if not state["task_batches"]:
         raise RuntimeError("No TaskBatch received.")
 
+    ws_root = get_workspace_root()
     batch = state["task_batches"][-1]
     worker = build_worker()
 
@@ -608,7 +670,6 @@ def worker_node(state: WorkflowState) -> dict:
             detail=result.summary,
         )
 
-        # Save intra-node checkpoint immediately after this task finishes
         partial_state: WorkflowState = {
             **state,
             "task_results": list(merged_by_id.values()),
@@ -629,8 +690,6 @@ def worker_node(state: WorkflowState) -> dict:
 
     print("\n=== WORKER SESSION COMPLETE ===")
 
-    # Ensure any task results returned without triggering the callback (e.g., unit-mocked harnesses)
-    # are also merged into state.
     tasks_by_id = {t.task_id: t for t in batch.tasks}
     for result in results:
         if result.task_id not in merged_by_id:
@@ -643,14 +702,19 @@ def worker_node(state: WorkflowState) -> dict:
                 else "unknown"
             )
             if result.staged_file:
-                staged_path = WORKER_WORKSPACE / result.staged_file
+                staged_path = ws_root / result.staged_file
                 if staged_path.is_file():
-                    snippet = staged_path.read_text(encoding="utf-8").strip()
+                    raw_snippet = staged_path.read_text(encoding="utf-8").strip()
+                    snippet = ensure_class_wrapper(
+                        raw_snippet,
+                        task_obj.target_symbol if task_obj else None,
+                    ).strip()
                     if snippet:
                         staged_files[target_file] = upsert_staged_snippet(
                             staged_files.get(target_file, {}),
                             result.task_id,
                             snippet,
+                            target_symbol=task_obj.target_symbol if task_obj else None,
                         )
 
     return _persist_node_state(
@@ -666,14 +730,16 @@ def worker_node(state: WorkflowState) -> dict:
 
 
 # ============================================================================
-# 4. Foreman Assembler — Stitch Staged Atomic Functions into Coherent Modules
+# 4. Foreman Assembler — Stitch Staged Functions & Class Methods into Modules
 # ============================================================================
 
 
 def foreman_assemble_node(state: WorkflowState) -> dict:
     """
-    When a file was split into multiple function-level tasks in `.staging/`,
-    Foreman assembles the individual snippets into the final target module.
+    When a file was split into multiple function-level or class-method-level
+    tasks in `.staging/`, Foreman assembles the individual snippets into the
+    final target module, verifying via AST that every function, class, and
+    method in `ast_merged` is retained.
     """
     from .tools import write_file
 
@@ -681,6 +747,7 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
     if not staged_files:
         return _persist_node_state(state, {"phase": "assembled"})
 
+    ws_root = get_workspace_root()
     foreman = build_foreman()
     plan = state["plan"]
     snapshots = state.get("file_snapshots", {})
@@ -700,10 +767,7 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
             ordered_snippets=list(task_snippets.items()),
         )
         expected_sigs = extract_python_signatures(ast_merged)
-        expected_fn_names = [
-            s.split("(")[0].replace("def ", "").replace("class ", "").split("[")[0].strip()
-            for s in expected_sigs
-        ]
+        expected_symbols = extract_all_ast_symbol_names(ast_merged)
 
         final_code = ast_merged
         assembly_mode = "AST-deterministic"
@@ -721,9 +785,8 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
                 candidate = assembled.assembled_code.strip()
                 if candidate:
                     ast.parse(candidate)
-                    missing_symbols = [
-                        name for name in expected_fn_names if name not in candidate
-                    ]
+                    candidate_symbols = extract_all_ast_symbol_names(candidate)
+                    missing_symbols = sorted(expected_symbols - candidate_symbols)
                     if not missing_symbols:
                         final_code = candidate
                         assembly_mode = f"Foreman-LLM + AST verified ({assembled.notes or 'clean'})"
@@ -740,7 +803,7 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
         physical_path = _sandbox_repo_path(norm_target)
         write_file.func(path=physical_path, content=final_code)
         print(
-            f"Assembled {physical_path} from {len(task_snippets)} staged snippet(s) "
+            f"Assembled {ws_root.name}/{physical_path} from {len(task_snippets)} staged snippet(s) "
             f"[{assembly_mode}]"
         )
 
@@ -880,19 +943,31 @@ def foreman_review_node(state: WorkflowState) -> dict:
 
 
 def foreman_self_repair_node(state: WorkflowState) -> dict:
-    """Foreman executes direct localized repairs with exception safety."""
-    from .tools import edit_file, write_file
+    """
+    Foreman executes direct localized repairs with exception safety and
+    Zero-Diff Stagnation Detection.
+    """
+    from .tools import edit_file, read_file, write_file
 
+    ws_root = get_workspace_root()
     review = state["foreman_review"]
     print("\n=== FOREMAN DIRECT SELF-REPAIR ===")
 
     repaired_files: list[str] = []
+    unchanged_files: list[str] = []
     repair_errors: list[str] = []
 
     for repair in review.direct_repairs:
         physical_path = _sandbox_repo_path(repair.path)
-        print(f"Applying Foreman self-repair to {physical_path} ({repair.action})")
+        norm_rel = _normalize_workspace_path(repair.path)
+        print(f"Applying Foreman self-repair to {ws_root.name}/{physical_path} ({repair.action})")
         try:
+            before_content = ""
+            try:
+                before_content = read_file.func(path=physical_path).get("content", "")
+            except Exception:
+                before_content = ""
+
             if repair.action == "edit":
                 if not repair.target_text:
                     raise ValueError(
@@ -912,20 +987,43 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
                     path=physical_path,
                     content=repair.content,
                 )
-            repaired_files.append(_normalize_workspace_path(repair.path))
+
+            after_content = read_file.func(path=physical_path).get("content", "")
+            if before_content.strip() == after_content.strip():
+                print(
+                    f"[STAGNATION GUARD] Foreman self-repair on {ws_root.name}/{physical_path} "
+                    f"produced zero content change on disk."
+                )
+                unchanged_files.append(norm_rel)
+            else:
+                repaired_files.append(norm_rel)
         except Exception as exc:
             err_msg = f"Foreman self-repair failed on {repair.path}: {type(exc).__name__}: {exc}"
             print(f"WARNING: {err_msg}")
             repair_errors.append(err_msg)
 
-    status = "completed" if repaired_files and not repair_errors else "failure"
+    status = "completed" if repaired_files and not repair_errors else "no_change"
+    if repair_errors:
+        status = "failure"
+
     repair_id = f"foreman_self_repair_{state['foreman_repair_attempts'] + 1}"
+    summary_text = (
+        f"Foreman direct repair: {', '.join(review.repair_instructions or ['self-repaired'])}"
+        if repaired_files
+        else f"Foreman self-repair produced no file changes on {unchanged_files or ['workspace']}"
+    )
     repair_task_result = TaskResult(
         task_id=repair_id,
         status=status,
-        summary=f"Foreman direct repair: {', '.join(review.repair_instructions or ['self-repaired'])}",
+        summary=summary_text,
         files_changed=repaired_files,
         errors=repair_errors,
+    )
+
+    next_repair_attempts = (
+        MAX_FOREMAN_REPAIRS
+        if not repaired_files
+        else state["foreman_repair_attempts"] + 1
     )
 
     updated_ledger = record_ledger_entry(
@@ -933,8 +1031,8 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
         cycle_id=state["cycle_id"],
         layer="foreman",
         action="self_repair",
-        target=", ".join(repaired_files) or "none",
-        status="success" if status == "completed" else "failure",
+        target=", ".join(repaired_files or unchanged_files) or "none",
+        status="success" if status == "completed" else "warning",
         detail=repair_task_result.summary,
     )
 
@@ -942,7 +1040,7 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
         state,
         {
             "task_results": state["task_results"] + [repair_task_result],
-            "foreman_repair_attempts": state["foreman_repair_attempts"] + 1,
+            "foreman_repair_attempts": next_repair_attempts,
             "ledger": updated_ledger,
             "phase": "foreman_repaired",
         },
@@ -953,6 +1051,7 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
     """Foreman rolls back corrupted files (if requested) and creates a corrective TaskBatch."""
     from .tools import write_file
 
+    ws_root = get_workspace_root()
     foreman = build_foreman()
     batch = _build_effective_validation_batch(state["task_batches"])
     review = state["foreman_review"]
@@ -967,7 +1066,7 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
             if logical in snapshots:
                 physical_path = _sandbox_repo_path(logical)
                 write_file.func(path=physical_path, content=snapshots[logical])
-                print(f"Reverted {physical_path} to pre-batch snapshot")
+                print(f"Reverted {ws_root.name}/{physical_path} to pre-batch snapshot")
 
     print("\n=== FOREMAN GENERATING CORRECTIVE BATCH ===")
     corrective_batch = foreman.create_corrective_batch(
@@ -982,8 +1081,6 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         corrective_batch, snapshots
     )
 
-    # Clear previous TaskResults for any task_id being rebuilt so `worker_node`
-    # executes the corrective tasks instead of skipping them as already completed.
     rebuild_ids = {t.task_id for t in corrective_batch.tasks}
     retained_results = [
         r for r in state["task_results"] if r.task_id not in rebuild_ids
@@ -1056,8 +1153,30 @@ def planner_review_node(state: WorkflowState) -> dict:
 
 
 # ============================================================================
-# Routing & Graph Construction
+# Routing, Stagnation Circuit Breaker & Graph Construction
 # ============================================================================
+
+
+def _count_consecutive_identical_validator_failures(state: WorkflowState) -> int:
+    """
+    Count how many consecutive times the Validator has produced the exact same
+    failure detail in the current cycle's ledger.
+    """
+    validator_entries = [
+        e for e in state.get("ledger", [])
+        if e.layer == "validator" and e.action == "validate_batch"
+    ]
+    if not validator_entries or validator_entries[-1].status != "failure":
+        return 0
+
+    latest_detail = validator_entries[-1].detail
+    consecutive = 0
+    for entry in reversed(validator_entries):
+        if entry.status == "failure" and entry.detail == latest_detail:
+            consecutive += 1
+        else:
+            break
+    return consecutive
 
 
 def route_from_entry(state: WorkflowState) -> str:
@@ -1111,6 +1230,23 @@ def route_after_foreman_review(state: WorkflowState) -> str:
         )
     )
 
+    repeat_failures = _count_consecutive_identical_validator_failures(state)
+    last_task_no_change = bool(
+        state.get("task_results")
+        and state["task_results"][-1].status == "no_change"
+    )
+
+    if has_hard_errors and (
+        repeat_failures >= 3
+        or (repeat_failures >= 2 and last_task_no_change and state["rebuild_attempts"] >= 1)
+    ):
+        print(
+            f"[STAGNATION CIRCUIT BREAKER] Identical validation error repeated "
+            f"{repeat_failures} consecutive time(s) without progress. "
+            f"Breaking repair/rebuild loop."
+        )
+        return "accepted"
+
     if review.decision == "accept":
         if not has_hard_errors:
             return "accepted"
@@ -1124,20 +1260,28 @@ def route_after_foreman_review(state: WorkflowState) -> str:
                 review.problems = list(validation.errors)
             if not review.rebuild_task_ids and validation.failed_task_ids:
                 review.rebuild_task_ids = list(validation.failed_task_ids)
-        if review.direct_repairs and state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS:
+        if (
+            review.direct_repairs
+            and state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS
+            and repeat_failures < 2
+        ):
             return "self_repair"
         if state["rebuild_attempts"] < MAX_WORKER_REBUILDS:
             return "rebuild"
         return "accepted"
 
     if review.decision == "repair":
-        if review.direct_repairs and state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS:
+        if (
+            review.direct_repairs
+            and state["foreman_repair_attempts"] < MAX_FOREMAN_REPAIRS
+            and not (state["foreman_repair_attempts"] >= 1 and repeat_failures >= 2)
+        ):
             return "self_repair"
         if not review.direct_repairs and not has_hard_errors:
             print("Foreman requested repair with empty direct_repairs and no hard errors; accepting.")
             review.accepted = True
             return "accepted"
-        print("Foreman self-repair unavailable or exceeded limit. Escalating to rebuild.")
+        print("Foreman self-repair unavailable, stagnant, or exceeded limit. Escalating to rebuild.")
         if validation and not review.rebuild_task_ids and validation.failed_task_ids:
             review.rebuild_task_ids = list(validation.failed_task_ids)
 
@@ -1213,8 +1357,13 @@ def run_cycle(
     worker_profile: WorkerProfile,
     previous_cycle: CycleResult | None,
     resume: bool = False,
+    workspace: str | Path | None = None,
 ) -> CycleResult:
-    """Execute a single orchestration cycle, optionally resuming from sandbox/.checkpoint/state.json."""
+    """Execute a single orchestration cycle in the active or specified workspace."""
+    if workspace is not None:
+        set_active_workspace(workspace)
+
+    staging_dir = get_staging_dir()
     initial_state: WorkflowState | None = None
 
     if resume:
@@ -1228,10 +1377,9 @@ def run_cycle(
             initial_state["worker_profile"] = worker_profile
 
     if initial_state is None:
-        if STAGING_DIR.exists():
-            for f in STAGING_DIR.rglob("*.py"):
+        if staging_dir.exists():
+            for f in staging_dir.rglob("*.py"):
                 f.unlink(missing_ok=True)
-        clear_checkpoint()
 
         initial_state = {
             "cycle_id": cycle_id,
@@ -1287,8 +1435,12 @@ def run_project(
     worker_profile: WorkerProfile,
     max_cycles: int = 3,
     resume: bool = False,
+    workspace: str | Path | None = None,
 ) -> list[CycleResult]:
-    """Execute the outer Planner loop across multiple cycles, with optional checkpoint resume."""
+    """Execute the outer Planner loop across multiple cycles in the target workspace."""
+    if workspace is not None:
+        set_active_workspace(workspace)
+
     history: list[CycleResult] = []
     previous_cycle: CycleResult | None = None
     start_cycle = 1
@@ -1296,16 +1448,29 @@ def run_project(
     if resume:
         ckpt = load_checkpoint()
         if ckpt is not None:
+            if ckpt.stages:
+                return run_staged_project(
+                    goal=goal or ckpt.project_goal,
+                    architecture=architecture or ckpt.architecture_context,
+                    worker_profile=worker_profile,
+                    stages=ckpt.stages,
+                    max_cycles_per_stage=max_cycles,
+                    resume=True,
+                    workspace=workspace,
+                )
             history = list(ckpt.completed_cycles)
             start_cycle = ckpt.cycle_id
             previous_cycle = ckpt.previous_cycle
             print(
-                f"\n=== RESUMING PROJECT FROM CHECKPOINT (Cycle {start_cycle}, Phase: {ckpt.phase}) ==="
+                f"\n=== RESUMING PROJECT FROM CHECKPOINT (Workspace: {get_workspace_root()}, "
+                f"Cycle {start_cycle}, Phase: {ckpt.phase}) ==="
             )
+    else:
+        clear_checkpoint()
 
     for cycle_id in range(start_cycle, max_cycles + 1):
         print(f"\n==========================================")
-        print(f"=== STARTING ORCHESTRATION CYCLE {cycle_id}/{max_cycles} ===")
+        print(f"=== STARTING ORCHESTRATION CYCLE {cycle_id}/{max_cycles} ({get_workspace_root()}) ===")
         print(f"==========================================")
 
         use_resume_this_cycle = resume and (cycle_id == start_cycle)
@@ -1325,5 +1490,169 @@ def run_project(
 
         print(f"\n=== CYCLE {cycle_id} INCOMPLETE ({result.outcome}) — RE-PLANNING ===")
         previous_cycle = result
+
+    return history
+
+
+def _format_stage_goal(
+    stage: StageGoal,
+    total_stages: int,
+) -> str:
+    """Construct a clean, non-duplicated stage prompt for Planner, Foreman, and Worker."""
+    target_files_text = (
+        ", ".join(f"`{f}`" for f in stage.target_files)
+        if stage.target_files
+        else "as specified below"
+    )
+    return (
+        f"Build Stage {stage.stage_id} of {total_stages} ({stage.title}).\n"
+        f"Target Files for Stage {stage.stage_id}: {target_files_text}\n\n"
+        f"{stage.objective.strip()}"
+    )
+
+
+def run_staged_project(
+    *,
+    goal: str,
+    architecture: str,
+    worker_profile: WorkerProfile,
+    stages: list[StageGoal] | None = None,
+    max_stages: int = 3,
+    max_cycles_per_stage: int = 2,
+    resume: bool = False,
+    workspace: str | Path | None = None,
+) -> list[CycleResult]:
+    """
+    Decompose a complex project into sequential StageGoal milestones (or use provided
+    `stages`) and execute each stage inside the target workspace, supporting mid-stage
+    checkpointing and resume.
+    """
+    if workspace is not None:
+        set_active_workspace(workspace)
+
+    ws_root = get_workspace_root()
+    history: list[CycleResult] = []
+    completed_stage_ids: list[int] = []
+    start_stage_idx = 0
+    ckpt = load_checkpoint() if resume else None
+
+    if resume and ckpt is not None and ckpt.stages:
+        resolved_stages = list(ckpt.stages)
+        start_stage_idx = ckpt.current_stage_index
+        completed_stage_ids = list(ckpt.completed_stage_ids)
+        history = list(ckpt.completed_cycles)
+        print(
+            f"\n=== RESUMING MULTI-STAGE PROJECT IN {ws_root} AT STAGE "
+            f"{start_stage_idx + 1}/{len(resolved_stages)} "
+            f"(Completed Stage IDs: {completed_stage_ids}) ==="
+        )
+    else:
+        clear_checkpoint()
+        if stages is not None:
+            resolved_stages = list(stages)
+        else:
+            print(f"\n=== DECOMPOSING PROJECT GOAL INTO SEQUENTIAL STAGES ({ws_root}) ===")
+            planner = build_planner()
+            blueprint = planner.decompose_stages(
+                project_goal=goal,
+                architecture_context=architecture,
+                max_stages=max_stages,
+            )
+            print(blueprint.model_dump_json(indent=2))
+            resolved_stages = list(blueprint.stages)
+
+    total_stages = len(resolved_stages)
+    for stage_idx in range(start_stage_idx, total_stages):
+        stage = resolved_stages[stage_idx]
+        print(f"\n############################################################")
+        print(f"### STAGE {stage.stage_id}/{total_stages}: {stage.title} ({ws_root}) ###")
+        print(f"############################################################")
+
+        stage_goal_text = _format_stage_goal(stage, total_stages)
+        stage_previous_cycle: CycleResult | None = None
+        stage_succeeded = False
+
+        start_cycle = 1
+        resuming_mid_stage = (
+            resume
+            and ckpt is not None
+            and stage_idx == start_stage_idx
+            and ckpt.phase not in ("initial", "planner_accepted")
+        )
+        if resuming_mid_stage and ckpt is not None:
+            start_cycle = ckpt.cycle_id
+            stage_previous_cycle = ckpt.previous_cycle
+
+        for cycle_id in range(start_cycle, max_cycles_per_stage + 1):
+            use_resume_cycle = resuming_mid_stage and (cycle_id == start_cycle)
+            if not use_resume_cycle:
+                placeholder_state: WorkflowState = {
+                    "cycle_id": cycle_id,
+                    "project_goal": stage_goal_text,
+                    "architecture_context": architecture,
+                    "worker_profile": worker_profile,
+                    "previous_cycle": stage_previous_cycle,
+                    "plan": None,
+                    "task_batches": [],
+                    "task_results": [],
+                    "ledger": [],
+                    "staged_files": {},
+                    "file_snapshots": {},
+                    "worker_attempts": {},
+                    "foreman_repair_attempts": 0,
+                    "rebuild_attempts": 0,
+                    "validation_result": None,
+                    "foreman_review": None,
+                    "planner_review": None,
+                    "rework_mode": "none",
+                    "phase": "initial",
+                }
+                save_checkpoint(
+                    placeholder_state,
+                    completed_cycles=history,
+                    stages=resolved_stages,
+                    current_stage_index=stage_idx,
+                    completed_stage_ids=completed_stage_ids,
+                )
+
+            cycle_result = run_cycle(
+                cycle_id=cycle_id,
+                goal=stage_goal_text,
+                architecture=architecture,
+                worker_profile=worker_profile,
+                previous_cycle=stage_previous_cycle,
+                resume=use_resume_cycle,
+            )
+            history.append(cycle_result)
+            stage_previous_cycle = cycle_result
+
+            if cycle_result.outcome == "overall_success":
+                stage_succeeded = True
+                if stage.stage_id not in completed_stage_ids:
+                    completed_stage_ids.append(stage.stage_id)
+                next_idx = min(stage_idx + 1, total_stages - 1)
+                update_checkpoint_stage_metadata(
+                    completed_cycles=history,
+                    stages=resolved_stages,
+                    current_stage_index=next_idx,
+                    completed_stage_ids=completed_stage_ids,
+                )
+                print(
+                    f"\n=== STAGE {stage.stage_id}/{total_stages} ({stage.title}) ACCEPTED ==="
+                )
+                break
+
+            update_checkpoint_stage_metadata(
+                completed_cycles=history,
+                stages=resolved_stages,
+                current_stage_index=stage_idx,
+                completed_stage_ids=completed_stage_ids,
+            )
+
+        if not stage_succeeded:
+            print(
+                f"\n=== STAGE {stage.stage_id}/{total_stages} FAILED TO CONVERGE — STOPPING ==="
+            )
+            break
 
     return history

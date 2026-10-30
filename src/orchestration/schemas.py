@@ -27,8 +27,36 @@ class LedgerEntry(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Planner
+# Planner & Multi-Stage Blueprint Decomposition
 # ---------------------------------------------------------------------------
+
+class StageGoal(BaseModel):
+    """Single sequential architectural milestone in a multi-stage project."""
+
+    stage_id: int = Field(description="Sequential 1-based stage number (1, 2, ...).")
+    title: str = Field(description="Concise title for this architectural stage.")
+    objective: str = Field(
+        description=(
+            "Complete implementation specification for this stage, preserving exact "
+            "file paths, class/function/method signatures, formulas, and expected outputs."
+        )
+    )
+    target_files: list[str] = Field(
+        default_factory=list,
+        description="Relative workspace file paths created or updated in this stage.",
+    )
+
+
+class MultiStageBlueprint(BaseModel):
+    """Ordered sequence of architectural stages produced by the Planner."""
+
+    project_summary: str = Field(
+        description="High-level summary of the overall multi-stage application."
+    )
+    stages: list[StageGoal] = Field(
+        description="Sequential stages ordered from foundational models/utilities to services and entry points."
+    )
+
 
 class Plan(BaseModel):
     """High-level architectural plan produced by the Planner."""
@@ -124,7 +152,10 @@ class Task(BaseModel):
 
     target_symbol: str | None = Field(
         default=None,
-        description="Optional single function or class name this task implements (e.g. 'parse_scores')."
+        description=(
+            "Single function name (e.g. 'parse_scores') or Class.method name "
+            "(e.g. 'Account.__init__', 'Account.deposit') this task implements."
+        ),
     )
 
     scope: str = Field(description="Explicit boundaries of what may be modified.")
@@ -151,7 +182,7 @@ class Task(BaseModel):
         default_factory=list,
         description=(
             "Executable Python assert statements using concrete literal inputs to verify "
-            "this task's function or class (e.g. [\"assert parse_scores('10, 20') == [10, 20]\"]). "
+            "this task's function or class method (e.g. [\"acc = Account('Alice', 100); assert acc.deposit(50) == 150\"]). "
             "Leave empty for pure entry-point scripts that only print output."
         ),
     )
@@ -373,3 +404,6 @@ class CheckpointData(BaseModel):
     rework_mode: str = Field(default="none")
     phase: str = Field(default="initial")
     completed_cycles: list[CycleResult] = Field(default_factory=list)
+    stages: list[StageGoal] = Field(default_factory=list)
+    current_stage_index: int = Field(default=0)
+    completed_stage_ids: list[int] = Field(default_factory=list)

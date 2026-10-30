@@ -2,29 +2,25 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-
-REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
-WORKSPACE_ROOT = (REPO_ROOT / "sandbox").resolve()
+from .workspace import get_workspace_root, normalize_workspace_rel_path
 
 
 def _safe_path(path: str) -> Path:
     """
-    Resolve a relative path and ensure it remains inside the
+    Resolve a relative path and ensure it remains inside the active
     orchestration workspace.
     """
+    workspace_root = get_workspace_root()
     candidate = Path(path)
 
     if candidate.is_absolute():
         raise ValueError(f"Absolute paths are not allowed: {path}")
 
-    normalized = candidate
-    if str(candidate).startswith("sandbox/"):
-        normalized = Path(str(candidate).removeprefix("sandbox/"))
-
-    resolved = (WORKSPACE_ROOT / normalized).resolve()
+    normalized = Path(normalize_workspace_rel_path(path))
+    resolved = (workspace_root / normalized).resolve()
 
     try:
-        resolved.relative_to(WORKSPACE_ROOT)
+        resolved.relative_to(workspace_root)
     except ValueError as exc:
         raise ValueError(f"Path escapes orchestration workspace: {path}") from exc
 

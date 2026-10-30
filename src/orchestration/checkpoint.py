@@ -4,28 +4,24 @@ import ast
 from pathlib import Path
 
 from .ledger import (
-    extract_python_signatures,
+    ensure_class_wrapper,
+    extract_all_ast_symbol_names,
     merge_staged_snippets_ast,
     record_ledger_entry,
     upsert_staged_snippet,
 )
-from .schemas import CheckpointData, CycleResult, Task, TaskResult
+from .schemas import CheckpointData, CycleResult, StageGoal, Task, TaskResult
 from .state import WorkflowState
-
-
-REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
-WORKSPACE_ROOT = (REPO_ROOT / "sandbox").resolve()
-STAGING_DIR = (WORKSPACE_ROOT / ".staging").resolve()
-CHECKPOINT_DIR = (WORKSPACE_ROOT / ".checkpoint").resolve()
-CHECKPOINT_FILE = (CHECKPOINT_DIR / "state.json").resolve()
+from .workspace import (
+    get_checkpoint_dir,
+    get_checkpoint_file,
+    get_workspace_root,
+    normalize_workspace_rel_path,
+)
 
 
 def _normalize_rel_path(path: str) -> str:
-    cleaned = path.strip().replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    cleaned = cleaned.removeprefix("sandbox/").strip("/")
-    return cleaned
+    return normalize_workspace_rel_path(path)
 
 
 def _is_valid_python_source(source: str, allow_empty_init: bool = False) -> bool:
@@ -40,22 +36,49 @@ def _is_valid_python_source(source: str, allow_empty_init: bool = False) -> bool
 
 def save_checkpoint(
     state: WorkflowState,
+    *,
     completed_cycles: list[CycleResult] | None = None,
+    stages: list[StageGoal] | None = None,
+    current_stage_index: int | None = None,
+    completed_stage_ids: list[int] | None = None,
 ) -> Path:
-    """Persist the current WorkflowState atomically to sandbox/.checkpoint/state.json."""
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    """
+    Persist the current WorkflowState atomically to `<workspace>/.checkpoint/state.json`,
+    preserving multi-stage metadata (`stages`, `current_stage_index`, `completed_stage_ids`,
+    `completed_cycles`) unless explicitly updated.
+    """
+    ckpt_dir = get_checkpoint_dir()
+    ckpt_file = get_checkpoint_file()
 
-    existing_cycles: list[CycleResult] = []
-    if completed_cycles is not None:
-        existing_cycles = list(completed_cycles)
-    elif CHECKPOINT_FILE.is_file():
+    prev: CheckpointData | None = None
+    if ckpt_file.is_file():
         try:
             prev = CheckpointData.model_validate_json(
-                CHECKPOINT_FILE.read_text(encoding="utf-8")
+                ckpt_file.read_text(encoding="utf-8")
             )
-            existing_cycles = prev.completed_cycles
         except Exception:
-            existing_cycles = []
+            prev = None
+
+    resolved_cycles = (
+        list(completed_cycles)
+        if completed_cycles is not None
+        else (list(prev.completed_cycles) if prev else [])
+    )
+    resolved_stages = (
+        list(stages)
+        if stages is not None
+        else (list(prev.stages) if prev else [])
+    )
+    resolved_stage_idx = (
+        current_stage_index
+        if current_stage_index is not None
+        else (prev.current_stage_index if prev else 0)
+    )
+    resolved_completed_stage_ids = (
+        list(completed_stage_ids)
+        if completed_stage_ids is not None
+        else (list(prev.completed_stage_ids) if prev else [])
+    )
 
     data = CheckpointData(
         cycle_id=state["cycle_id"],
@@ -83,41 +106,75 @@ def save_checkpoint(
         planner_review=state.get("planner_review"),
         rework_mode=state.get("rework_mode", "none"),
         phase=state.get("phase", "initial"),
-        completed_cycles=existing_cycles,
+        completed_cycles=resolved_cycles,
+        stages=resolved_stages,
+        current_stage_index=resolved_stage_idx,
+        completed_stage_ids=resolved_completed_stage_ids,
     )
 
-    tmp_file = CHECKPOINT_DIR / "state.json.tmp"
+    tmp_file = ckpt_dir / "state.json.tmp"
     tmp_file.write_text(data.model_dump_json(indent=2), encoding="utf-8")
-    tmp_file.replace(CHECKPOINT_FILE)
-    return CHECKPOINT_FILE
+    tmp_file.replace(ckpt_file)
+    return ckpt_file
+
+
+
+
+def update_checkpoint_stage_metadata(
+    *,
+    completed_cycles: list[CycleResult],
+    stages: list[StageGoal],
+    current_stage_index: int,
+    completed_stage_ids: list[int],
+) -> None:
+    """Update multi-stage progress fields on the existing checkpoint file without re-running disk reconciliation."""
+    ckpt_dir = get_checkpoint_dir()
+    ckpt_file = get_checkpoint_file()
+    if not ckpt_file.is_file():
+        return
+    try:
+        data = CheckpointData.model_validate_json(ckpt_file.read_text(encoding="utf-8"))
+        data.completed_cycles = list(completed_cycles)
+        data.stages = list(stages)
+        data.current_stage_index = current_stage_index
+        data.completed_stage_ids = list(completed_stage_ids)
+        tmp_file = ckpt_dir / "state.json.tmp"
+        tmp_file.write_text(data.model_dump_json(indent=2), encoding="utf-8")
+        tmp_file.replace(ckpt_file)
+    except Exception as exc:
+        print(f"[WARN] Could not update stage metadata in checkpoint: {exc}")
 
 
 def load_checkpoint() -> CheckpointData | None:
-    """Load the saved checkpoint from sandbox/.checkpoint/state.json if it exists."""
-    if not CHECKPOINT_FILE.is_file():
+    """Load the saved checkpoint from `<workspace>/.checkpoint/state.json` if it exists."""
+    ckpt_file = get_checkpoint_file()
+    if not ckpt_file.is_file():
         return None
     try:
         return CheckpointData.model_validate_json(
-            CHECKPOINT_FILE.read_text(encoding="utf-8")
+            ckpt_file.read_text(encoding="utf-8")
         )
     except Exception as exc:
-        print(f"[WARN] Could not parse checkpoint file {CHECKPOINT_FILE}: {exc}")
+        print(f"[WARN] Could not parse checkpoint file {ckpt_file}: {exc}")
         return None
 
 
 def clear_checkpoint() -> None:
-    """Remove any existing checkpoint file."""
-    if CHECKPOINT_FILE.is_file():
-        CHECKPOINT_FILE.unlink(missing_ok=True)
+    """Remove any existing checkpoint file in the active workspace."""
+    ckpt_file = get_checkpoint_file()
+    if ckpt_file.is_file():
+        ckpt_file.unlink(missing_ok=True)
 
 
 def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
     """
-    Compare a loaded CheckpointData against the physical files in `sandbox/` and
-    `sandbox/.staging/`, recovering orphaned staged snippets and invalidating any
-    task whose staged or target files were deleted, emptied, or corrupted on disk.
+    Compare a loaded CheckpointData against the physical files in the active
+    workspace and its `.staging/` directory, recovering orphaned staged snippets
+    and invalidating any task whose staged or target files were deleted, emptied,
+    or corrupted on disk.
     """
-    print("\n=== CHECKPOINT & DISK RECONCILIATION ===")
+    workspace_root = get_workspace_root()
+    print(f"\n=== CHECKPOINT & DISK RECONCILIATION ({workspace_root}) ===")
     ledger = list(checkpoint.ledger)
     cycle_id = checkpoint.cycle_id
 
@@ -141,9 +198,9 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
     invalidated_tasks: list[str] = []
     recovered_tasks: list[str] = []
 
-    # 1. Verify each recorded TaskResult against physical files on disk
     for res in checkpoint.task_results:
         task_obj = all_tasks_by_id.get(res.task_id)
+        target_sym = task_obj.target_symbol if task_obj else None
         primary_file = (
             _normalize_rel_path(task_obj.relevant_files[0])
             if task_obj and task_obj.relevant_files
@@ -162,15 +219,17 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
 
         if res.staged_file:
             staged_rel = _normalize_rel_path(res.staged_file)
-            staged_abs = WORKSPACE_ROOT / staged_rel
+            staged_abs = workspace_root / staged_rel
             if staged_abs.is_file():
-                snippet = staged_abs.read_text(encoding="utf-8").strip()
+                raw_snippet = staged_abs.read_text(encoding="utf-8").strip()
+                snippet = ensure_class_wrapper(raw_snippet, target_sym).strip()
                 if _is_valid_python_source(snippet):
                     if primary_file:
                         staged_files[primary_file] = upsert_staged_snippet(
                             staged_files.get(primary_file, {}),
                             res.task_id,
                             snippet,
+                            target_symbol=target_sym,
                         )
                     verified_results[res.task_id] = res
                 else:
@@ -189,7 +248,7 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
             ]
             all_ok = bool(changed_paths)
             for rel_p in changed_paths:
-                abs_p = WORKSPACE_ROOT / rel_p
+                abs_p = workspace_root / rel_p
                 if not abs_p.is_file():
                     all_ok = False
                     break
@@ -211,7 +270,6 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
                     f"{res.task_id}(missing/corrupted target file {','.join(changed_paths)})"
                 )
 
-    # 2. Scan active batch for orphaned valid `.staging/` files written right before an interrupt
     active_batch = checkpoint.task_batches[-1] if checkpoint.task_batches else None
     if active_batch is not None:
         for task in active_batch.tasks:
@@ -227,16 +285,18 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
             if use_staging:
                 safe_name = primary_file.replace("/", "__")
                 staged_rel = f".staging/{task.task_id}__{safe_name}"
-                staged_abs = WORKSPACE_ROOT / staged_rel
+                staged_abs = workspace_root / staged_rel
                 if staged_abs.is_file():
-                    snippet = staged_abs.read_text(encoding="utf-8").strip()
+                    raw_snippet = staged_abs.read_text(encoding="utf-8").strip()
+                    snippet = ensure_class_wrapper(raw_snippet, task.target_symbol).strip()
                     if _is_valid_python_source(snippet):
-                        sigs = " ".join(extract_python_signatures(snippet))
-                        if not task.target_symbol or task.target_symbol in sigs:
+                        defined_syms = extract_all_ast_symbol_names(snippet)
+                        if not task.target_symbol or task.target_symbol in defined_syms:
                             staged_files[primary_file] = upsert_staged_snippet(
                                 staged_files.get(primary_file, {}),
                                 task.task_id,
                                 snippet,
+                                target_symbol=task.target_symbol,
                             )
                             verified_results[task.task_id] = TaskResult(
                                 task_id=task.task_id,
@@ -248,11 +308,10 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
                             )
                             recovered_tasks.append(task.task_id)
 
-    # 3. Re-synchronize live AST-merged files on disk for any staged modules
     for mod_file, snippets_map in sorted(staged_files.items()):
         if not snippets_map:
             continue
-        mod_abs = WORKSPACE_ROOT / mod_file
+        mod_abs = workspace_root / mod_file
         if not mod_abs.is_file() or not mod_abs.read_text(encoding="utf-8").strip():
             merged_live = merge_staged_snippets_ast(
                 target_filename=mod_file,
@@ -262,9 +321,8 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
             if merged_live.strip():
                 mod_abs.parent.mkdir(parents=True, exist_ok=True)
                 mod_abs.write_text(merged_live, encoding="utf-8")
-                print(f"[RECONCILE] Restored live AST merge for sandbox/{mod_file}")
+                print(f"[RECONCILE] Restored live AST merge for {mod_file}")
 
-    # 4. Determine reconciled workflow phase
     reconciled_phase = checkpoint.phase
     if checkpoint.plan is None:
         reconciled_phase = "initial"
@@ -283,12 +341,10 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
             )
             print(
                 f"[RECONCILE] Active batch '{active_batch.batch_id}' has "
-                f"{len( verified_results )}/{len(active_task_ids)} verified task(s); "
+                f"{len(verified_results)}/{len(active_task_ids)} verified task(s); "
                 f"pending tasks to run: {pending_active} -> routing to worker."
             )
         else:
-            # All tasks in active batch are verified on disk. Check if any staged module
-            # still needs final assembly or if we can keep the later checkpointed phase.
             if reconciled_phase in ("task_ready", "corrective_task_ready"):
                 reconciled_phase = "worker_complete"
             print(
@@ -298,7 +354,7 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
 
     summary_parts = [
         f"phase={checkpoint.phase}->{reconciled_phase}",
-        f"verified_tasks={ sorted(verified_results.keys()) }",
+        f"verified_tasks={sorted(verified_results.keys())}",
     ]
     if invalidated_tasks:
         summary_parts.append(f"invalidated={invalidated_tasks}")

@@ -8,24 +8,26 @@ from pathlib import Path
 from .base import CodingHarness
 from .config import AiderConfig
 from src.orchestration.ledger import (
+    ensure_class_wrapper,
     extract_python_signatures,
     merge_staged_snippets_ast,
     upsert_staged_snippet,
 )
 from src.orchestration.schemas import Task, TaskBatch, TaskResult
+from src.orchestration.workspace import (
+    DEFAULT_WORKSPACE_ROOT,
+    REPO_ROOT,
+    get_staging_dir,
+    get_workspace_root,
+    normalize_workspace_rel_path,
+)
 
-
-REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
-WORKSPACE_ROOT = (REPO_ROOT / "sandbox").resolve()
-STAGING_DIR = (WORKSPACE_ROOT / ".staging").resolve()
+WORKSPACE_ROOT = DEFAULT_WORKSPACE_ROOT
+STAGING_DIR = (DEFAULT_WORKSPACE_ROOT / ".staging").resolve()
 
 
 def _normalize_rel_path(path: str) -> str:
-    cleaned = path.strip().replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    cleaned = cleaned.removeprefix("sandbox/").strip("/")
-    return cleaned
+    return normalize_workspace_rel_path(path)
 
 
 def _module_import_name(rel_path: str) -> str:
@@ -38,26 +40,22 @@ def _module_import_name(rel_path: str) -> str:
 
 
 def list_workspace_py_files() -> list[Path]:
-    """Return all user Python files in WORKSPACE_ROOT, excluding .staging, .checkpoint, .git, and .pytest_cache."""
-    if not WORKSPACE_ROOT.exists():
+    """Return all user Python files in the active workspace, excluding .staging, .checkpoint, .git, and .pytest_cache."""
+    ws_root = get_workspace_root()
+    if not ws_root.exists():
         return []
     excluded = {".staging", ".checkpoint", ".git", ".pytest_cache", "__pycache__"}
     return sorted(
         p
-        for p in WORKSPACE_ROOT.rglob("*.py")
+        for p in ws_root.rglob("*.py")
         if not (set(p.parts) & excluded)
     )
 
 
 class AiderHarness(CodingHarness):
     """
-    Execute a TaskBatch through isolated per-task Aider Worker sessions.
-
-    - Supports intra-batch checkpointing (`on_task_complete`) and skipping tasks
-      already verified on disk during a resumed session (`verified_task_results`).
-    - If multiple tasks in a batch target the same file (function-level atomization),
-      each task is executed in an isolated staging file (`sandbox/.staging/<task_id>__<file>`)
-      and live-merged into `sandbox/<file>` so the 3B Worker only writes one function at a time.
+    Execute a TaskBatch through isolated per-task Aider Worker sessions inside
+    the currently active workspace directory.
     """
 
     def __init__(self, config: AiderConfig | None = None):
@@ -76,14 +74,16 @@ class AiderHarness(CodingHarness):
         if not batch.tasks:
             raise ValueError("TaskBatch must contain at least one task.")
 
-        WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
-        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        ws_root = get_workspace_root()
+        staging_dir = get_staging_dir()
+        ws_root.mkdir(parents=True, exist_ok=True)
+        staging_dir.mkdir(parents=True, exist_ok=True)
 
-        sandbox_git = WORKSPACE_ROOT / ".git"
+        sandbox_git = ws_root / ".git"
         if not sandbox_git.exists():
             subprocess.run(
                 ["git", "init", "-q"],
-                cwd=WORKSPACE_ROOT,
+                cwd=ws_root,
                 check=False,
             )
 
@@ -126,7 +126,6 @@ class AiderHarness(CodingHarness):
         completed_sibling_sigs: dict[str, list[str]] = {}
         newly_executed_count = 0
 
-        # Pre-populate sibling signatures from already-staged snippets (for rebuild/resumed batches)
         for mod_file, snippets_map in staged_snippets.items():
             for prev_tid, prev_code in snippets_map.items():
                 for sig in extract_python_signatures(prev_code):
@@ -154,7 +153,6 @@ class AiderHarness(CodingHarness):
                     or primary_target in staged_snippets
                 )
 
-                # Check if this task was already completed and verified on disk (Resume Fast-Forward)
                 prev_res = verified_map.get(task.task_id)
                 if prev_res is not None and prev_res.status == "completed":
                     print(
@@ -191,7 +189,7 @@ class AiderHarness(CodingHarness):
                             dep_files.add(_normalize_rel_path(f))
 
                 existing_workspace_py = {
-                    str(p.relative_to(WORKSPACE_ROOT))
+                    str(p.relative_to(ws_root))
                     for p in list_workspace_py_files()
                 }
                 read_only_files = sorted(
@@ -208,6 +206,11 @@ class AiderHarness(CodingHarness):
                 )
 
                 before = self._snapshot_files(editable_files)
+                before_primary = (
+                    self._snapshot_files([primary_target]).get(primary_target, "")
+                    if use_staging
+                    else ""
+                )
 
                 prompt = self._build_task_prompt(
                     batch=batch,
@@ -242,6 +245,7 @@ class AiderHarness(CodingHarness):
                 ]
 
                 print(f"\n=== AIDER WORKER (Task: {task.task_id}) ===")
+                print(f"Workspace: {ws_root}")
                 print(f"Model: {self.config.model}")
                 print(f"Batch: {batch.batch_id}")
                 print(f"Target Module: {primary_target}")
@@ -253,7 +257,7 @@ class AiderHarness(CodingHarness):
 
                 completed = subprocess.run(
                     command,
-                    cwd=WORKSPACE_ROOT,
+                    cwd=ws_root,
                     env=env,
                     text=True,
                 )
@@ -264,13 +268,34 @@ class AiderHarness(CodingHarness):
                 ]
 
                 if use_staging and staged_rel_path:
-                    snippet_code = after.get(staged_rel_path, "").strip()
+                    raw_snippet = after.get(staged_rel_path, "").strip()
+                    if not raw_snippet:
+                        # Fallback: if the 3B model emitted `primary_target` as the filename
+                        # header in `--edit-format whole` and Aider wrote directly to `primary_target`
+                        # instead of `staged_rel_path`, capture that edit into `staged_rel_path`!
+                        after_primary = (
+                            self._snapshot_files([primary_target])
+                            .get(primary_target, "")
+                            .strip()
+                        )
+                        if after_primary and after_primary != before_primary.strip():
+                            raw_snippet = after_primary
+                            self._safe_workspace_path(staged_rel_path).write_text(
+                                raw_snippet + "\n", encoding="utf-8"
+                            )
+
+                    snippet_code = ensure_class_wrapper(raw_snippet, task.target_symbol).strip()
+                    if snippet_code and snippet_code != raw_snippet:
+                        self._safe_workspace_path(staged_rel_path).write_text(
+                            snippet_code + "\n", encoding="utf-8"
+                        )
                     changed = [primary_target] if snippet_code else []
                     if snippet_code:
                         staged_snippets[primary_target] = upsert_staged_snippet(
                             staged_snippets.get(primary_target, {}),
                             task.task_id,
                             snippet_code,
+                            target_symbol=task.target_symbol,
                         )
                         sigs = extract_python_signatures(snippet_code)
                         if sigs:
@@ -332,9 +357,10 @@ class AiderHarness(CodingHarness):
         return task_results
 
     def _ensure_package_inits(self, directory: Path) -> None:
-        """Ensure every intermediate package directory inside WORKSPACE_ROOT has an __init__.py."""
+        """Ensure every intermediate package directory inside the active workspace has an __init__.py."""
+        ws_root = get_workspace_root()
         curr = directory.resolve()
-        while curr != WORKSPACE_ROOT and curr.is_relative_to(WORKSPACE_ROOT):
+        while curr != ws_root and curr.is_relative_to(ws_root):
             if curr.name not in (".staging", ".checkpoint", ".git", "__pycache__", ".pytest_cache"):
                 init_file = curr / "__init__.py"
                 if not init_file.exists():
@@ -359,10 +385,11 @@ class AiderHarness(CodingHarness):
         )
 
     def _safe_workspace_path(self, path: str) -> Path:
+        ws_root = get_workspace_root()
         normalized = _normalize_rel_path(path)
-        requested = (WORKSPACE_ROOT / normalized).resolve()
-        if not requested.is_relative_to(WORKSPACE_ROOT):
-            raise ValueError(f"Path {path} escapes workspace root")
+        requested = (ws_root / normalized).resolve()
+        if not requested.is_relative_to(ws_root):
+            raise ValueError(f"Path {path} escapes workspace root {ws_root}")
         return requested
 
     def _build_task_prompt(
@@ -406,21 +433,36 @@ class AiderHarness(CodingHarness):
         )
 
         if use_staging:
-            lines.extend(
-                [
-                    "## Staging & Assembly Mode:",
-                    f"  - Write ONLY the code required for Task {task.task_id} "
-                    f"({task.target_symbol or task.objective}) into {', '.join(editable_files)}.",
-                    f"  - The Foreman will assemble {', '.join(editable_files)} into `{logical_target}`.",
-                    f"  - Do NOT write `from {target_import_name} import ...` or `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
-                    "  - If your function calls functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <package.module> import ...` at the top of your snippet.",
-                    "",
-                ]
-            )
+            if task.target_symbol and "." in task.target_symbol:
+                cls_name, method_name = task.target_symbol.split(".", 1)
+                lines.extend(
+                    [
+                        f"## Class Method Staging Mode (`{cls_name}.{method_name}`):",
+                        f"  - Write `class {cls_name}:` containing ONLY the `{method_name}` method into `{editable_files[0]}`.",
+                        f"  - IMPORTANT: Use the exact filename `{editable_files[0]}` as the file header in your response (do NOT use `{logical_target}` as the filename header).",
+                        f"  - Do NOT write `pass` stubs for other methods of `{cls_name}` — the Foreman will automatically merge all staged methods into `class {cls_name}:` in `{logical_target}`.",
+                        f"  - Do NOT write `from {target_import_name} import ...` or `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
+                        "  - If your method uses classes/functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <package.module> import ...` at the top of your snippet.",
+                        "",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "## Staging & Assembly Mode:",
+                        f"  - Write ONLY the code required for Task {task.task_id} "
+                        f"({task.target_symbol or task.objective}) into `{editable_files[0]}`.",
+                        f"  - IMPORTANT: Use the exact filename `{editable_files[0]}` as the file header in your response (do NOT use `{logical_target}` as the filename header).",
+                        f"  - The Foreman will assemble `{editable_files[0]}` into `{logical_target}`.",
+                        f"  - Do NOT write `from {target_import_name} import ...` or `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
+                        "  - If your function calls functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <package.module> import ...` at the top of your snippet.",
+                        "",
+                    ]
+                )
 
         if sibling_signatures:
             lines.append(
-                f"## Sibling Functions Already Implemented in `{logical_target}` (you may call these directly):"
+                f"## Sibling Functions/Methods Already Implemented in `{logical_target}` (you may reference these attributes & methods directly):"
             )
             for sig in sibling_signatures:
                 lines.append(f"  - {sig}")
@@ -456,7 +498,7 @@ class AiderHarness(CodingHarness):
             lines.append("")
 
         lines.append(
-            f"Modify ONLY {', '.join(editable_files)}. "
+            f"Modify ONLY `{editable_files[0]}`. "
             "Make minimal, focused changes that satisfy the acceptance criteria."
         )
         lines.append("Do not add extra code, test blocks, or wrappers beyond what is specified.")

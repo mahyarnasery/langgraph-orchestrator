@@ -11,10 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .schemas import Task, TaskBatch, TaskResult, ValidationResult
-
-
-REPO_ROOT = Path("/mnt/ai/langgraph-orchestrator").resolve()
-WORKSPACE_ROOT = (REPO_ROOT / "sandbox").resolve()
+from .workspace import get_workspace_root, normalize_workspace_rel_path
 
 
 _SUBPROCESS_ASSERTION_RUNNER = r"""
@@ -110,8 +107,7 @@ def load_target_namespace(workspace_root: Path, target_files: list[str], stdout_
     return ns
 
 
-def evaluate_assertion(stmt: str, base_ns: dict, target_symbol: str | None) -> dict:
-    ns = dict(base_ns)
+def evaluate_assertion(stmt: str, shared_ns: dict, target_symbol: str | None) -> dict:
     try:
         tree = ast.parse(stmt, filename="<assertion>")
     except SyntaxError as exc:
@@ -129,7 +125,7 @@ def evaluate_assertion(stmt: str, base_ns: dict, target_symbol: str | None) -> d
             for node in tree.body:
                 if not isinstance(node, ast.Assert):
                     mod = ast.Module(body=[node], type_ignores=[])
-                    exec(compile(mod, "<assertion>", "exec"), ns)
+                    exec(compile(mod, "<assertion>", "exec"), shared_ns)
                     continue
 
                 test_node = node.test
@@ -141,7 +137,7 @@ def evaluate_assertion(stmt: str, base_ns: dict, target_symbol: str | None) -> d
                 ):
                     left_val = eval(
                         compile(ast.Expression(body=test_node.left), "<assertion>", "eval"),
-                        ns,
+                        shared_ns,
                     )
                     right_val = eval(
                         compile(
@@ -149,7 +145,7 @@ def evaluate_assertion(stmt: str, base_ns: dict, target_symbol: str | None) -> d
                             "<assertion>",
                             "eval",
                         ),
-                        ns,
+                        shared_ns,
                     )
                     op_fn = COMPARE_OPS[type(test_node.ops[0])]
                     ok = bool(op_fn(left_val, right_val))
@@ -161,7 +157,7 @@ def evaluate_assertion(stmt: str, base_ns: dict, target_symbol: str | None) -> d
                 else:
                     val = eval(
                         compile(ast.Expression(body=test_node), "<assertion>", "eval"),
-                        ns,
+                        shared_ns,
                     )
                     if not bool(val):
                         return {
@@ -207,9 +203,9 @@ def main() -> None:
     assertions = payload.get("assertions", [])
     stdout_map = payload.get("stdout_map", {})
 
-    base_ns = load_target_namespace(workspace_root, target_files, stdout_map)
+    shared_ns = load_target_namespace(workspace_root, target_files, stdout_map)
     results = [
-        evaluate_assertion(stmt, base_ns, target_symbol)
+        evaluate_assertion(stmt, shared_ns, target_symbol)
         for stmt in assertions
     ]
     sys.stdout.write(json.dumps({"results": results}))
@@ -221,28 +217,25 @@ if __name__ == "__main__":
 
 
 def _normalize_rel_path(path: str) -> str:
-    cleaned = path.strip().replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    cleaned = cleaned.removeprefix("sandbox/").strip("/")
-    return cleaned
+    return normalize_workspace_rel_path(path)
 
 
 def _absolute(path: str) -> Path:
     """
     Convert a workspace-relative path into an absolute path.
-    The resulting path must remain inside WORKSPACE_ROOT.
+    The resulting path must remain inside the active workspace root.
     """
+    workspace_root = get_workspace_root()
     candidate = Path(path)
 
     if candidate.is_absolute():
         raise ValueError(f"Absolute paths are not allowed: {path}")
 
     normalized = Path(_normalize_rel_path(path))
-    resolved = (WORKSPACE_ROOT / normalized).resolve()
+    resolved = (workspace_root / normalized).resolve()
 
     try:
-        resolved.relative_to(WORKSPACE_ROOT)
+        resolved.relative_to(workspace_root)
     except ValueError as exc:
         raise ValueError(f"Path escapes validation workspace: {path}") from exc
 
@@ -251,12 +244,13 @@ def _absolute(path: str) -> Path:
 
 def _ensure_parent_package_inits(norm_path: str) -> None:
     """Ensure parent directories of a nested Python file have `__init__.py`."""
+    workspace_root = get_workspace_root()
     parts = Path(norm_path).parts
     if len(parts) <= 1:
         return
     for depth in range(1, len(parts)):
-        pkg_dir = WORKSPACE_ROOT / Path(*parts[:depth])
-        if pkg_dir.is_dir() and pkg_dir.name not in (".staging", ".git", "__pycache__"):
+        pkg_dir = workspace_root / Path(*parts[:depth])
+        if pkg_dir.is_dir() and pkg_dir.name not in (".staging", ".checkpoint", ".git", "__pycache__"):
             init_file = pkg_dir / "__init__.py"
             if not init_file.exists():
                 init_file.write_text("", encoding="utf-8")
@@ -332,8 +326,9 @@ def _check_python_execution(
 ) -> str:
     """
     Execute a Python file or package module deterministically using the active
-    Python interpreter with PYTHONPATH set to WORKSPACE_ROOT. Returns captured stdout.
+    Python interpreter with PYTHONPATH set to the active workspace root.
     """
+    workspace_root = get_workspace_root()
     norm_path = _normalize_rel_path(path)
     absolute = _absolute(norm_path)
     _ensure_parent_package_inits(norm_path)
@@ -344,7 +339,7 @@ def _check_python_execution(
         return ""
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(WORKSPACE_ROOT)
+    env["PYTHONPATH"] = str(workspace_root)
 
     p_parts = list(Path(norm_path).with_suffix("").parts)
     if len(p_parts) > 1:
@@ -360,7 +355,7 @@ def _check_python_execution(
     try:
         completed = subprocess.run(
             cmd,
-            cwd=WORKSPACE_ROOT,
+            cwd=workspace_root,
             env=env,
             capture_output=True,
             text=True,
@@ -409,13 +404,14 @@ def _check_pytest_files(
     if not pytest_files:
         return
 
+    workspace_root = get_workspace_root()
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(WORKSPACE_ROOT)
+    env["PYTHONPATH"] = str(workspace_root)
 
     try:
         completed = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", *pytest_files],
-            cwd=WORKSPACE_ROOT,
+            cwd=workspace_root,
             env=env,
             capture_output=True,
             text=True,
@@ -441,7 +437,7 @@ def _check_verification_command(
     errors: list[str],
 ) -> None:
     """
-    Run an explicit batch verification command inside WORKSPACE_ROOT.
+    Run an explicit batch verification command inside the active workspace root.
     Ignores unsafe or redundant shell-pipe commands (e.g. cat | grep).
     """
     if any(token in command for token in ("|", "&&", ";", "`", "$(")):
@@ -450,8 +446,9 @@ def _check_verification_command(
         )
         return
 
+    workspace_root = get_workspace_root()
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(WORKSPACE_ROOT)
+    env["PYTHONPATH"] = str(workspace_root)
 
     try:
         args = shlex.split(command)
@@ -465,7 +462,7 @@ def _check_verification_command(
 
         completed = subprocess.run(
             args,
-            cwd=WORKSPACE_ROOT,
+            cwd=workspace_root,
             env=env,
             capture_output=True,
             text=True,
@@ -583,6 +580,24 @@ def _check_target_symbols(
             failed_task_ids.add(task.task_id)
 
 
+class _UnwrapPrintInAssertTransformer(ast.NodeTransformer):
+    """
+    If an LLM writes `assert print(expr) == expected`, unwrap `print(expr)` to `expr`
+    because `print(...)` returns `None` in Python while the LLM intended to compare `expr`.
+    """
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        if (
+            isinstance(node.left, ast.Call)
+            and isinstance(node.left.func, ast.Name)
+            and node.left.func.id == "print"
+            and len(node.left.args) == 1
+        ):
+            node.left = node.left.args[0]
+        return node
+
+
 def _normalize_assertion_code(raw: str) -> str | None:
     """
     Normalize a raw assertion string into valid executable Python code containing
@@ -606,27 +621,81 @@ def _normalize_assertion_code(raw: str) -> str | None:
     if not tree.body:
         return None
 
-    last_node = tree.body[-1]
-    if isinstance(last_node, ast.Expr) and isinstance(
-        last_node.value, (ast.Compare, ast.Call, ast.BoolOp, ast.UnaryOp)
-    ):
-        expr_src = ast.get_source_segment(cleaned, last_node) or ast.unparse(last_node)
-        prefix_nodes = tree.body[:-1]
-        if not prefix_nodes:
-            cleaned = f"assert {expr_src}"
-        else:
-            prefix_src = "; ".join(
-                (ast.get_source_segment(cleaned, n) or ast.unparse(n))
-                for n in prefix_nodes
-            )
-            cleaned = f"{prefix_src}; assert {expr_src}"
+    has_assert = any(isinstance(n, ast.Assert) for n in ast.walk(tree))
+    if not has_assert:
+        last_node = tree.body[-1]
+        is_print_call = (
+            isinstance(last_node, ast.Expr)
+            and isinstance(last_node.value, ast.Call)
+            and isinstance(last_node.value.func, ast.Name)
+            and last_node.value.func.id == "print"
+        )
+        if (
+            isinstance(last_node, ast.Expr)
+            and isinstance(last_node.value, (ast.Compare, ast.Call, ast.BoolOp, ast.UnaryOp))
+            and not is_print_call
+        ):
+            expr_src = ast.get_source_segment(cleaned, last_node) or ast.unparse(last_node)
+            prefix_nodes = tree.body[:-1]
+            if not prefix_nodes:
+                cleaned = f"assert {expr_src}"
+            else:
+                prefix_src = "; ".join(
+                    (ast.get_source_segment(cleaned, n) or ast.unparse(n))
+                    for n in prefix_nodes
+                )
+                cleaned = f"{prefix_src}; assert {expr_src}"
+            try:
+                tree = ast.parse(cleaned)
+            except SyntaxError:
+                return None
+
+    has_assert = any(isinstance(n, ast.Assert) for n in ast.walk(tree))
+    if not has_assert:
+        return None
+
+    # Unwrap accidental `assert print(expr) == expected` -> `assert expr == expected`
+    tree = _UnwrapPrintInAssertTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
+    return "; ".join(ast.unparse(stmt) for stmt in tree.body)
+
+
+def _prepare_assertion_list(raw_assertions: Iterable[str]) -> list[str]:
+    """
+    Normalize a list of assertion strings. If the LLM split setup assignments/imports
+    and `assert` statements into separate list items (e.g. `["items = [...]", "assert f(items) == 50"]`),
+    merge the setup lines onto the following `assert` statement so variables remain bound.
+    """
+    pending_setup: list[str] = []
+    normalized_list: list[str] = []
+
+    for raw in raw_assertions:
+        cleaned = raw.strip().strip("`").strip()
+        if not cleaned:
+            continue
         try:
             tree = ast.parse(cleaned)
         except SyntaxError:
-            return None
+            continue
+        if not tree.body:
+            continue
 
-    has_assert = any(isinstance(n, ast.Assert) for n in ast.walk(tree))
-    return cleaned if has_assert else None
+        has_assert = any(isinstance(n, ast.Assert) for n in ast.walk(tree))
+        is_pure_setup = not has_assert and all(
+            isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom))
+            for n in tree.body
+        )
+        if is_pure_setup:
+            pending_setup.append(cleaned)
+            continue
+
+        combined = "; ".join([*pending_setup, cleaned]) if pending_setup else cleaned
+        norm = _normalize_assertion_code(combined)
+        if norm and norm not in normalized_list:
+            normalized_list.append(norm)
+            pending_setup.clear()
+
+    return normalized_list
 
 
 def _extract_explicit_asserts_from_criteria(criteria: Iterable[str]) -> list[str]:
@@ -660,11 +729,12 @@ def _run_assertions_in_workspace(
     if not assertions:
         return []
 
+    workspace_root = get_workspace_root()
     for tf in target_files:
         _ensure_parent_package_inits(tf)
 
     payload = {
-        "workspace_root": str(WORKSPACE_ROOT),
+        "workspace_root": str(workspace_root),
         "target_files": target_files,
         "target_symbol": target_symbol,
         "assertions": assertions,
@@ -672,13 +742,13 @@ def _run_assertions_in_workspace(
     }
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(WORKSPACE_ROOT)
+    env["PYTHONPATH"] = str(workspace_root)
 
     try:
         completed = subprocess.run(
             [sys.executable, "-c", _SUBPROCESS_ASSERTION_RUNNER],
             input=json.dumps(payload),
-            cwd=WORKSPACE_ROOT,
+            cwd=workspace_root,
             env=env,
             capture_output=True,
             text=True,
@@ -742,12 +812,7 @@ def _check_task_and_batch_assertions(
                 task.acceptance_criteria
             )
 
-        normalized_assertions: list[str] = []
-        for raw in raw_assertions:
-            norm = _normalize_assertion_code(raw)
-            if norm and norm not in normalized_assertions:
-                normalized_assertions.append(norm)
-
+        normalized_assertions = _prepare_assertion_list(raw_assertions)
         if not normalized_assertions:
             continue
 
@@ -790,12 +855,7 @@ def _check_task_and_batch_assertions(
         and _absolute(_normalize_rel_path(f)).is_file()
     ]
     if batch.test_assertions and batch_files:
-        norm_batch_assertions: list[str] = []
-        for raw in batch.test_assertions:
-            norm = _normalize_assertion_code(raw)
-            if norm and norm not in norm_batch_assertions:
-                norm_batch_assertions.append(norm)
-
+        norm_batch_assertions = _prepare_assertion_list(batch.test_assertions)
         if norm_batch_assertions:
             batch_outcomes = _run_assertions_in_workspace(
                 target_files=batch_files,
@@ -924,14 +984,12 @@ def _criterion_satisfied_by_file(
 
     content_lower = content.lower()
 
-    # 1. File existence check
     if any(
         phrase in criterion_lower
         for phrase in ("file exists", "is created", "must exist", "exists in")
     ) and not expected_patterns:
         return True
 
-    # 2. Negative / prohibition constraints (e.g. "no print statements", "should not")
     if any(
         phrase in criterion_lower
         for phrase in (
@@ -955,7 +1013,6 @@ def _criterion_satisfied_by_file(
         non_empty_lines = [line.strip() for line in content.splitlines() if line.strip()]
         return len(non_empty_lines) > 0
 
-    # 3. Exact content, explicit "contains", or runtime output with quoted/backticked literals
     if expected_patterns and any(
         word in criterion_lower
         for word in (
@@ -985,13 +1042,11 @@ def _criterion_satisfied_by_file(
             for pattern in expected_patterns
         )
 
-    # 4. Structural Python keyword check
     code_keywords = ("print", "def ", "class ", "import ", "return")
     matched_keywords = [kw for kw in code_keywords if kw in criterion_lower]
     if matched_keywords:
         return all(kw.strip() in content_lower for kw in matched_keywords)
 
-    # 5. Default fallback for general descriptive criteria when file is non-empty
     return True
 
 

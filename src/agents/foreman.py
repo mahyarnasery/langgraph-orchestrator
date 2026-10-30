@@ -46,29 +46,33 @@ Worker profile:
 Planner plan:
 {plan.model_dump_json(indent=2)}
 
-Task Atomization, Package Structure & Verification Rules (CRITICAL):
+Task Atomization, Class Method Staging, Package Structure & Verification Rules (CRITICAL):
 1. Pre-Creation & Package `__init__.py` Files:
-   - The orchestration layer automatically pre-creates empty files AND automatically creates `__init__.py` in every package subdirectory (e.g. `core/__init__.py`, `services/__init__.py`).
-   - NEVER create a task just to create an empty file or an empty `__init__.py`. Only create a task for `__init__.py` if the project goal explicitly requires code/re-exports inside `__init__.py`.
+   - The orchestration layer automatically pre-creates empty files AND automatically creates `__init__.py` in every package subdirectory (e.g. `core/__init__.py`, `models/__init__.py`, `services/__init__.py`).
+   - NEVER create a task just to create an empty file or an empty `__init__.py`.
 2. Multi-Directory Package Paths:
-   - Preserve exact relative directory paths from the Project goal (e.g. `"core/text_utils.py"`, `"services/report.py"`, `"main.py"`). NEVER flatten subdirectory paths into the root directory.
-   - When importing from a package module, use its full dotted package path (e.g. `from core.text_utils import ...`).
+   - Preserve exact relative directory paths from the Project goal (e.g. `"models/product.py"`, `"services/invoice.py"`, `"main.py"`). NEVER flatten subdirectory paths into the root directory.
+   - When importing from a package module, use its full dotted package path (e.g. `from models.product import Product`).
 3. Function-Level Atomization for Multi-Function Files:
-   - If any Python file (at root or in a package directory) requires 2 or more standalone functions, SPLIT that file into separate atomic tasks — ONE task per function!
-   - For each function task on that file, set `relevant_files` to that exact file path (e.g. `["core/text_utils.py"]`) and set `target_symbol` to the exact function name (e.g. `"clean_label"`).
-   - If function B calls function A, list function A's task_id in function B's `dependencies`.
-   - The Worker will write each function in an isolated staging file, and you (Foreman) will assemble them into the target module automatically.
-4. Single-Task Files & Classes:
-   - If a file only has 1 function, or is a simple entry-point script (`main.py` / `app.py`), or defines a single `class` with its methods, keep that file or class as a SINGLE task.
-5. Strict File Scope:
+   - If any Python file requires 2 or more standalone functions, SPLIT that file into separate atomic tasks — ONE task per function!
+   - Set `relevant_files` to that exact file path (e.g. `["services/invoice.py"]`) and set `target_symbol` to the exact function name (e.g. `"create_products"`).
+4. Class Method-Level Atomization for Multi-Method Classes:
+   - If a Python file defines a `class` with 2 or more methods (for example, `__init__`, `deposit`, `describe`), SPLIT that class into separate atomic tasks — ONE task per method!
+   - For each method task on that class, set `relevant_files` to the class's file (e.g. `["bank.py"]`) and set `target_symbol` to `"ClassName.method_name"` (e.g. `"Account.__init__"`, `"Account.deposit"`, `"Account.describe"`).
+   - Put the `"ClassName.__init__"` task first and list its `task_id` in the `dependencies` of the other method tasks on that class.
+   - The Worker will write each method in an isolated staging file, and the orchestration layer + you (Foreman) will merge all methods into a single unified `class ClassName:` definition automatically.
+5. Single-Task Entry Scripts:
+   - If a file only has 1 standalone function or is a simple entry-point script (`main.py` / `app.py`), keep that file as a SINGLE task.
+6. Strict File Scope:
    - Each task's `relevant_files` must list ONLY the file that specific task contributes to. Do NOT list imported dependency files in `task.relevant_files`.
-6. Preserve exact formulas, f-strings, and return expressions from the Project goal in each task's `acceptance_criteria` (do not paraphrase `len(passing)` or `sum(passing)`).
-7. Deterministic Unit Assertions (`test_assertions`):
-   - For every task that implements a function or class, populate `task.test_assertions` with 1 to 2 executable Python `assert` statements using CONCRETE literal inputs and expected outputs (e.g. `["assert parse_scores('45, 70') == [45, 70]"]`).
+   - Do NOT create tasks for files that already exist and are already implemented in the Existing Workspace Repository Map unless the current goal explicitly asks to modify them.
+7. Preserve exact formulas, f-strings, and return expressions from the Project goal in each task's `acceptance_criteria`.
+8. Deterministic Unit Assertions (`test_assertions`):
+   - For every task that implements a function or class method, populate `task.test_assertions` with 1 to 2 executable Python `assert` statements using CONCRETE literal inputs and expected outputs (e.g. `["acc = Account('Alice', 100); assert acc.owner == 'Alice' and acc.balance == 100"]` or `["acc = Account('Alice', 100); assert acc.deposit(50) == 150"]`).
    - Prefer exact input/output values given in the Project goal so expected values are 100% accurate.
-   - NEVER use undefined symbolic variables (like `assert f(x) == x * 2`) in `test_assertions` — always pass concrete literal numbers/strings/lists.
-   - For pure entry-point scripts (`main.py`, `app.py`, `hello.py`) that only print output to stdout and define no functions/classes, leave `task.test_assertions` empty (`[]`).
-8. Populate `execution_order` with all `task_id`s in dependency order, and leave `verification_command` as null unless running a dedicated pytest suite without shell pipes.
+   - NEVER use undefined symbolic variables in `test_assertions` — always instantiate objects or call functions with concrete literal arguments.
+   - For pure entry-point scripts (`main.py`, `app.py`, `hello.py`) that only print output to stdout, leave `task.test_assertions` empty (`[]`).
+9. Populate `execution_order` with all `task_id`s in dependency order, and leave `verification_command` as null unless running a dedicated pytest suite without shell pipes.
 
 Every file mentioned by a task must appear in both `task.relevant_files` and `TaskBatch.relevant_files`.
 
@@ -91,7 +95,7 @@ Return only the structured TaskBatch.
         ledger_context: str = "",
     ) -> AssembledModule:
         """
-        Assemble multiple atomic Worker function snippets into a coherent Python module.
+        Assemble multiple atomic Worker function or class-method snippets into a coherent Python module.
         """
         snippets_text = "\n\n".join(
             f"--- SNIPPET FROM TASK {task_id} ---\n~~~python\n{code}\n~~~"
@@ -120,11 +124,11 @@ Deterministic AST-merged draft of `{target_file}`:
 
 Responsibilities:
 - Combine all Worker snippets for `{target_file}` into a single, clean, coherent Python file.
+- If the snippets implement methods of a class, ensure ALL methods (`__init__` and every other method in the AST-merged draft) are unified inside a single `class` definition without any `pass` stubs overwriting real methods.
 - Deduplicate imports at the top of the file.
 - Ensure there are NO self-imports (never import `{target_file}` or its module name inside `{target_file}`).
-- Preserve cross-package imports (such as `from core.xyz import ...`) needed by the functions.
-- Ensure function calls between snippets in `{target_file}` use matching function names and arguments.
-- Preserve every required function and class without adding unrelated test code or extra prints.
+- Preserve cross-package imports (such as `from models.product import Product`) needed by the module.
+- Preserve every required function, class, and method without adding unrelated test code or extra prints.
 
 
 Return only the structured AssembledModule.
@@ -169,7 +173,7 @@ Previous task execution outcomes:
 {', '.join(f'{r.task_id}: {r.status}' for r in task_results)}
 
 Generate a new, focused TaskBatch addressing ONLY the specific tasks needing rebuild/correction:
-- Preserve exact package paths in `relevant_files`, `target_symbol`, and concrete `test_assertions` on function-level tasks so only the broken function is rewritten, re-assembled, and re-verified.
+- Preserve exact package paths in `relevant_files`, `target_symbol` (including `"ClassName.method_name"` for class method tasks), and concrete `test_assertions` so only the broken function/method is rewritten, re-assembled, and re-verified.
 - Populate `execution_order` with the exact `task_id`s in this corrective batch.
 - Leave `verification_command` as null.
 - Ensure every referenced file is listed in both `task.relevant_files` and `TaskBatch.relevant_files`.
