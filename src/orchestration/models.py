@@ -14,6 +14,34 @@ WORKER_MODEL = "ibm/granite4.1:3b"
 MAX_INVOCATION_RETRIES = 3
 
 
+def configure_models(
+    *,
+    planner_model: str | None = None,
+    foreman_model: str | None = None,
+    worker_model: str | None = None,
+) -> None:
+    """Override active Ollama model identifiers at runtime."""
+    global PLANNER_MODEL, FOREMAN_MODEL, WORKER_MODEL
+    if planner_model and planner_model.strip():
+        PLANNER_MODEL = planner_model.strip()
+    if foreman_model and foreman_model.strip():
+        FOREMAN_MODEL = foreman_model.strip()
+    if worker_model and worker_model.strip():
+        WORKER_MODEL = worker_model.strip()
+
+
+def get_planner_model() -> str:
+    return PLANNER_MODEL
+
+
+def get_foreman_model() -> str:
+    return FOREMAN_MODEL
+
+
+def get_worker_model() -> str:
+    return WORKER_MODEL
+
+
 class _ResilientStructuredRunner:
     """
     Wraps a structured-output Runnable to retry transient Ollama 500 startup
@@ -37,8 +65,6 @@ class _ResilientStructuredRunner:
                 active_input = prompt_or_input
 
                 if attempt > 1:
-                    # Use a slight temperature bump so the sampler does not repeat
-                    # a deterministic empty/truncated output from attempt 1.
                     retry_llm = ChatOllama(
                         model=self._model_name,
                         base_url=OLLAMA_BASE_URL,

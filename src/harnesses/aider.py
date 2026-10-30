@@ -13,6 +13,7 @@ from src.orchestration.ledger import (
     merge_staged_snippets_ast,
     upsert_staged_snippet,
 )
+from src.orchestration.models import get_worker_model
 from src.orchestration.schemas import Task, TaskBatch, TaskResult
 from src.orchestration.workspace import (
     DEFAULT_WORKSPACE_ROOT,
@@ -24,6 +25,20 @@ from src.orchestration.workspace import (
 
 WORKSPACE_ROOT = DEFAULT_WORKSPACE_ROOT
 STAGING_DIR = (DEFAULT_WORKSPACE_ROOT / ".staging").resolve()
+
+SUPPORTED_ASSET_EXTENSIONS = {
+    ".py",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".csv",
+    ".sql",
+    ".txt",
+    ".md",
+}
 
 
 def _normalize_rel_path(path: str) -> str:
@@ -39,17 +54,31 @@ def _module_import_name(rel_path: str) -> str:
     return ".".join(parts) if parts else p.stem
 
 
-def list_workspace_py_files() -> list[Path]:
-    """Return all user Python files in the active workspace, excluding .staging, .checkpoint, .git, and .pytest_cache."""
+def list_workspace_files() -> list[Path]:
+    """
+    Return all user code, configuration, and data files in the active workspace,
+    excluding hidden dotfiles/directories (such as `.aider.chat.history.md`,
+    `.staging`, `.checkpoint`, `.git`, `.pytest_cache`) and `__pycache__`.
+    """
     ws_root = get_workspace_root()
     if not ws_root.exists():
         return []
     excluded = {".staging", ".checkpoint", ".git", ".pytest_cache", "__pycache__"}
-    return sorted(
-        p
-        for p in ws_root.rglob("*.py")
-        if not (set(p.parts) & excluded)
-    )
+    results: list[Path] = []
+    for p in ws_root.rglob("*"):
+        if not p.is_file():
+            continue
+        rel_parts = p.relative_to(ws_root).parts
+        if any(part.startswith(".") or part in excluded for part in rel_parts):
+            continue
+        if p.suffix.lower() in SUPPORTED_ASSET_EXTENSIONS:
+            results.append(p)
+    return sorted(results)
+
+
+def list_workspace_py_files() -> list[Path]:
+    """Return all user Python (`.py`) files in the active workspace."""
+    return [p for p in list_workspace_files() if p.suffix.lower() == ".py"]
 
 
 class AiderHarness(CodingHarness):
@@ -59,7 +88,16 @@ class AiderHarness(CodingHarness):
     """
 
     def __init__(self, config: AiderConfig | None = None):
-        self.config = config or AiderConfig()
+        if config is None:
+            worker_mod = get_worker_model()
+            model_arg = (
+                worker_mod
+                if worker_mod.startswith(("ollama_chat/", "ollama/"))
+                else f"ollama_chat/{worker_mod}"
+            )
+            self.config = AiderConfig(model=model_arg)
+        else:
+            self.config = config
 
     def execute(
         self,
@@ -145,10 +183,12 @@ class AiderHarness(CodingHarness):
                 for path in declared_files:
                     abs_target = self._safe_workspace_path(path)
                     abs_target.parent.mkdir(parents=True, exist_ok=True)
-                    self._ensure_package_inits(abs_target.parent)
+                    if path.endswith(".py"):
+                        self._ensure_package_inits(abs_target.parent)
 
                 primary_target = declared_files[0]
-                use_staging = (
+                is_python_target = primary_target.endswith(".py")
+                use_staging = is_python_target and (
                     file_task_counts.get(primary_target, 0) > 1
                     or primary_target in staged_snippets
                 )
@@ -188,9 +228,9 @@ class AiderHarness(CodingHarness):
                         for f in dep_task.relevant_files:
                             dep_files.add(_normalize_rel_path(f))
 
-                existing_workspace_py = {
+                existing_workspace_assets = {
                     str(p.relative_to(ws_root))
-                    for p in list_workspace_py_files()
+                    for p in list_workspace_files()
                 }
                 read_only_files = sorted(
                     f
@@ -198,7 +238,7 @@ class AiderHarness(CodingHarness):
                         dep_files
                         | completed_files
                         | set(declared_files)
-                        | existing_workspace_py
+                        | existing_workspace_assets
                     )
                     if f not in editable_files
                     and (not use_staging or f != primary_target)
@@ -248,7 +288,7 @@ class AiderHarness(CodingHarness):
                 print(f"Workspace: {ws_root}")
                 print(f"Model: {self.config.model}")
                 print(f"Batch: {batch.batch_id}")
-                print(f"Target Module: {primary_target}")
+                print(f"Target File: {primary_target}")
                 if task.target_symbol:
                     print(f"Target Symbol: {task.target_symbol}")
                 print(f"Editable File: {', '.join(editable_files)}")
@@ -270,9 +310,6 @@ class AiderHarness(CodingHarness):
                 if use_staging and staged_rel_path:
                     raw_snippet = after.get(staged_rel_path, "").strip()
                     if not raw_snippet:
-                        # Fallback: if the 3B model emitted `primary_target` as the filename
-                        # header in `--edit-format whole` and Aider wrote directly to `primary_target`
-                        # instead of `staged_rel_path`, capture that edit into `staged_rel_path`!
                         after_primary = (
                             self._snapshot_files([primary_target])
                             .get(primary_target, "")
@@ -349,7 +386,7 @@ class AiderHarness(CodingHarness):
 
                 if stop_after_tasks is not None and newly_executed_count >= stop_after_tasks:
                     raise KeyboardInterrupt(
-                        f"Simulated interrupt after {newly_executed_count} task(s) completed (last={task.task_id})."
+                        f"Stopped after {newly_executed_count} task(s) completed (last={task.task_id})."
                     )
         finally:
             self._unload_worker_model()
@@ -357,7 +394,7 @@ class AiderHarness(CodingHarness):
         return task_results
 
     def _ensure_package_inits(self, directory: Path) -> None:
-        """Ensure every intermediate package directory inside the active workspace has an __init__.py."""
+        """Ensure every intermediate Python package directory inside the active workspace has an __init__.py."""
         ws_root = get_workspace_root()
         curr = directory.resolve()
         while curr != ws_root and curr.is_relative_to(ws_root):
@@ -404,24 +441,26 @@ class AiderHarness(CodingHarness):
         sibling_signatures: list[str],
         project_goal: str = "",
     ) -> str:
-        target_import_name = _module_import_name(logical_target)
+        is_python = logical_target.endswith(".py")
+        target_import_name = _module_import_name(logical_target) if is_python else ""
         lines = [
             f"# Batch Objective: {batch.objective}",
         ]
         if project_goal.strip():
             lines.extend(
                 [
-                    "## Full Project Specification (for exact formula & signature reference):",
+                    "## Full Project Specification (for exact formula, schema & signature reference):",
                     project_goal.strip(),
                     "",
                 ]
             )
-        lines.extend(
-            [
-                f"## Current Atomic Task {task.task_id}: {task.objective}",
-                f"Logical Module: {logical_target} (import path: `{target_import_name}`)",
-            ]
-        )
+        lines.append(f"## Current Atomic Task {task.task_id}: {task.objective}")
+        if is_python:
+            lines.append(f"Logical Module: {logical_target} (import path: `{target_import_name}`)")
+        else:
+            lines.append(
+                f"Target Asset File: {logical_target} (format: `{Path(logical_target).suffix.lstrip('.').upper()}`)"
+            )
         if task.target_symbol:
             lines.append(f"Target Function/Symbol to Implement: {task.target_symbol}")
         lines.extend(
@@ -432,7 +471,16 @@ class AiderHarness(CodingHarness):
             ]
         )
 
-        if use_staging:
+        if not is_python:
+            lines.extend(
+                [
+                    "## Non-Python Config / Data File Mode:",
+                    f"  - Write ONLY valid `{Path(logical_target).suffix}` content into `{editable_files[0]}`.",
+                    "  - Do NOT wrap the file content in Python code or extra commentary.",
+                    "",
+                ]
+            )
+        elif use_staging:
             if task.target_symbol and "." in task.target_symbol:
                 cls_name, method_name = task.target_symbol.split(".", 1)
                 lines.extend(
@@ -470,7 +518,10 @@ class AiderHarness(CodingHarness):
 
         if read_only_files:
             ro_descriptions = [
-                f"{rf} (import as `{_module_import_name(rf)}`)" for rf in read_only_files
+                f"{rf} (import as `{_module_import_name(rf)}`)"
+                if rf.endswith(".py")
+                else f"{rf} (data/config file)"
+                for rf in read_only_files
             ]
             lines.append(
                 f"Read-Only Reference Files (do NOT edit): {', '.join(ro_descriptions)}"

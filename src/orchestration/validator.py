@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import ast
+import configparser
+import csv
+import io
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Iterable
 
@@ -56,6 +60,8 @@ def load_target_namespace(workspace_root: Path, target_files: list[str], stdout_
     ns["stdout"] = combined_stdout
 
     for rel_path in target_files:
+        if not rel_path.endswith(".py"):
+            continue
         abs_path = (workspace_root / rel_path).resolve()
         if not abs_path.is_file():
             continue
@@ -243,7 +249,9 @@ def _absolute(path: str) -> Path:
 
 
 def _ensure_parent_package_inits(norm_path: str) -> None:
-    """Ensure parent directories of a nested Python file have `__init__.py`."""
+    """Ensure parent directories of a nested Python (`.py`) file have `__init__.py`."""
+    if not norm_path.endswith(".py"):
+        return
     workspace_root = get_workspace_root()
     parts = Path(norm_path).parts
     if len(parts) <= 1:
@@ -319,6 +327,107 @@ def _check_python_syntax(
         errors.append(f"unable to parse {path}: {exc}")
 
 
+def _check_asset_syntax(
+    path: str,
+    checks: list[str],
+    errors: list[str],
+) -> bool:
+    """
+    Deterministically validate non-Python configuration, data, and documentation
+    files (`.json`, `.toml`, `.yaml`/`.yml`, `.ini`/`.cfg`, `.csv`, `.sql`, `.txt`, `.md`).
+    """
+    absolute = _absolute(path)
+    suffix = absolute.suffix.lower()
+
+    try:
+        source = absolute.read_text(encoding="utf-8")
+    except Exception as exc:
+        errors.append(f"unable to read {path}: {exc}")
+        return False
+
+    if not source.strip():
+        errors.append(f"empty file: {path} has no content")
+        return False
+
+    if suffix == ".json":
+        try:
+            json.loads(source)
+            checks.append(f"syntax OK (JSON): {path}")
+            return True
+        except json.JSONDecodeError as exc:
+            errors.append(
+                f"syntax error in {path} (line {exc.lineno}, col {exc.colno}): invalid JSON ({exc.msg})"
+            )
+            return False
+
+    if suffix == ".toml":
+        try:
+            tomllib.loads(source)
+            checks.append(f"syntax OK (TOML): {path}")
+            return True
+        except Exception as exc:
+            errors.append(f"syntax error in {path}: invalid TOML ({exc})")
+            return False
+
+    if suffix in (".yaml", ".yml"):
+        try:
+            import yaml  # type: ignore[import-untyped]
+            parsed = yaml.safe_load(source)
+            if parsed is None:
+                errors.append(f"syntax error in {path}: YAML parsed to empty/null document")
+                return False
+            checks.append(f"syntax OK (YAML): {path}")
+            return True
+        except ImportError:
+            checks.append(f"syntax OK (YAML text): {path}")
+            return True
+        except Exception as exc:
+            errors.append(f"syntax error in {path}: invalid YAML ({exc})")
+            return False
+
+    if suffix in (".ini", ".cfg"):
+        parser = configparser.ConfigParser()
+        try:
+            parser.read_string(source)
+            checks.append(f"syntax OK (INI): {path}")
+            return True
+        except Exception as exc:
+            errors.append(f"syntax error in {path}: invalid INI/CFG ({exc})")
+            return False
+
+    if suffix == ".csv":
+        try:
+            rows = [
+                row
+                for row in csv.reader(io.StringIO(source.strip()))
+                if any(cell.strip() for cell in row)
+            ]
+            if not rows:
+                errors.append(f"empty file: {path} has no CSV rows")
+                return False
+            expected_cols = len(rows[0])
+            if expected_cols == 0:
+                errors.append(f"syntax error in {path}: CSV header has 0 columns")
+                return False
+            for idx, r in enumerate(rows[1:], start=2):
+                if len(r) != expected_cols:
+                    errors.append(
+                        f"syntax error in {path} (row {idx}): expected {expected_cols} column(s) but found {len(r)}"
+                    )
+                    return False
+            checks.append(
+                f"syntax OK (CSV): {path} ({len(rows)} row(s), {expected_cols} col(s))"
+            )
+            return True
+        except Exception as exc:
+            errors.append(f"syntax error in {path}: invalid CSV ({exc})")
+            return False
+
+    label = suffix.lstrip(".").upper() or "TEXT"
+    checks.append(f"syntax OK ({label}): {path}")
+    return True
+
+
 def _check_python_execution(
     path: str,
     checks: list[str],
@@ -391,7 +500,10 @@ def _check_python_execution(
 
 
 def _is_pytest_file(path: str) -> bool:
-    name = Path(_normalize_rel_path(path)).name
+    norm = _normalize_rel_path(path)
+    if not norm.endswith(".py"):
+        return False
+    name = Path(norm).name
     return name.startswith("test_") or name.endswith("_test.py")
 
 
@@ -545,7 +657,7 @@ def _check_target_symbols(
     errors: list[str],
     failed_task_ids: set[str],
 ) -> None:
-    """Verify via AST that each task with `target_symbol` defines that symbol in its target file."""
+    """Verify via AST that each Python task with `target_symbol` defines that symbol in its target file."""
     for task in batch.tasks:
         if not task.target_symbol:
             continue
@@ -556,7 +668,11 @@ def _check_target_symbols(
         target_files = [
             _normalize_rel_path(f)
             for f in (task.relevant_files or batch.relevant_files)
+            if _normalize_rel_path(f).endswith(".py")
         ]
+        if not target_files:
+            continue
+
         checked_any = False
         found = False
         for norm_path in target_files:
@@ -654,7 +770,6 @@ def _normalize_assertion_code(raw: str) -> str | None:
     if not has_assert:
         return None
 
-    # Unwrap accidental `assert print(expr) == expected` -> `assert expr == expected`
     tree = _UnwrapPrintInAssertTransformer().visit(tree)
     ast.fix_missing_locations(tree)
     return "; ".join(ast.unparse(stmt) for stmt in tree.body)
@@ -802,8 +917,9 @@ def _check_task_and_batch_assertions(
         target_files = [
             _normalize_rel_path(f)
             for f in (task.relevant_files or batch.relevant_files)
+            if _normalize_rel_path(f).endswith(".py")
         ]
-        if any(f in syntax_failed_files or not _absolute(f).is_file() for f in target_files):
+        if not target_files or any(f in syntax_failed_files or not _absolute(f).is_file() for f in target_files):
             continue
 
         raw_assertions = list(task.test_assertions)
@@ -851,7 +967,8 @@ def _check_task_and_batch_assertions(
     batch_files = [
         _normalize_rel_path(f)
         for f in batch.relevant_files
-        if _normalize_rel_path(f) not in syntax_failed_files
+        if _normalize_rel_path(f).endswith(".py")
+        and _normalize_rel_path(f) not in syntax_failed_files
         and _absolute(_normalize_rel_path(f)).is_file()
     ]
     if batch.test_assertions and batch_files:
@@ -874,6 +991,137 @@ def _check_task_and_batch_assertions(
                     errors.append(f"assertion failed (batch {batch.batch_id}): {detail}")
 
     return tasks_with_passed_assertions
+
+
+def emit_pytest_suite(
+    batch: TaskBatch,
+    suite_rel_path: str = "tests/test_generated.py",
+) -> Path | None:
+    """
+    Harvest all passing `Task.test_assertions` and `TaskBatch.test_assertions`
+    from `batch`, generate a self-contained `pytest` module on disk inside the
+    active workspace (`<workspace>/<suite_rel_path>`), and verify it with `pytest -q`.
+    """
+    ws_root = get_workspace_root()
+    py_files = [
+        _normalize_rel_path(f)
+        for f in batch.relevant_files
+        if _normalize_rel_path(f).endswith(".py")
+        and not _is_pytest_file(f)
+        and (_absolute(_normalize_rel_path(f))).is_file()
+    ]
+    if not py_files:
+        return None
+
+    # Discover exportable top-level functions and classes from library modules
+    import_lines: list[str] = []
+    for rel_py in py_files:
+        p = Path(rel_py)
+        if p.name in ("main.py", "app.py", "hello.py", "__init__.py"):
+            continue
+        source = _absolute(rel_py).read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        exported_names = [
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and not node.name.startswith("_")
+        ]
+        if exported_names:
+            mod_dotted = ".".join(p.with_suffix("").parts)
+            import_lines.append(
+                f"from {mod_dotted} import {', '.join(sorted(set(exported_names)))}"
+            )
+
+    # Filter assertions to those that deterministically pass in the workspace
+    test_blocks: list[str] = []
+    seen_assertions: set[str] = set()
+
+    for task in batch.tasks:
+        norm_list = _prepare_assertion_list(task.test_assertions)
+        if not norm_list:
+            continue
+        target_py = [
+            _normalize_rel_path(f)
+            for f in (task.relevant_files or py_files)
+            if _normalize_rel_path(f).endswith(".py")
+        ]
+        outcomes = _run_assertions_in_workspace(
+            target_files=target_py or py_files,
+            target_symbol=task.target_symbol,
+            assertions=norm_list,
+            execution_outputs={},
+        )
+        passing_stmts = [
+            norm_list[i]
+            for i, out in enumerate(outcomes)
+            if i < len(norm_list) and out.get("status") == "passed"
+        ]
+        if passing_stmts:
+            safe_tid = re.sub(r"[^a-zA-Z0-9_]", "_", task.task_id)
+            safe_sym = (
+                "_" + re.sub(r"[^a-zA-Z0-9_]", "_", task.target_symbol)
+                if task.target_symbol
+                else ""
+            )
+            fn_lines = [f"def test_{safe_tid}{safe_sym}() -> None:"]
+            for stmt in passing_stmts:
+                seen_assertions.add(stmt)
+                for sub_stmt in stmt.split("; "):
+                    fn_lines.append(f"    {sub_stmt.strip()}")
+            test_blocks.append("\n".join(fn_lines))
+
+    norm_batch_list = [
+        a for a in _prepare_assertion_list(batch.test_assertions)
+        if a not in seen_assertions
+    ]
+    if norm_batch_list:
+        batch_outcomes = _run_assertions_in_workspace(
+            target_files=py_files,
+            target_symbol=None,
+            assertions=norm_batch_list,
+            execution_outputs={},
+        )
+        passing_batch = [
+            norm_batch_list[i]
+            for i, out in enumerate(batch_outcomes)
+            if i < len(norm_batch_list) and out.get("status") == "passed"
+        ]
+        if passing_batch:
+            safe_bid = re.sub(r"[^a-zA-Z0-9_]", "_", batch.batch_id)
+            fn_lines = [f"def test_batch_{safe_bid}() -> None:"]
+            for stmt in passing_batch:
+                for sub_stmt in stmt.split("; "):
+                    fn_lines.append(f"    {sub_stmt.strip()}")
+            test_blocks.append("\n".join(fn_lines))
+
+    if not test_blocks:
+        return None
+
+    suite_abs = _absolute(suite_rel_path)
+    suite_abs.parent.mkdir(parents=True, exist_ok=True)
+    header = "\n".join(import_lines)
+    full_suite_code = (
+        (header + "\n\n\n" if header else "")
+        + "\n\n\n".join(test_blocks)
+        + "\n"
+    )
+    suite_abs.write_text(full_suite_code, encoding="utf-8")
+
+    # Verify the emitted pytest suite passes cleanly
+    checks: list[str] = []
+    errors: list[str] = []
+    _check_pytest_files([_normalize_rel_path(suite_rel_path)], checks, errors)
+    if errors:
+        print(f"[WARN] Emitted pytest suite had errors ({errors}); removing {suite_rel_path}")
+        suite_abs.unlink(missing_ok=True)
+        return None
+
+    print(f"[PYTEST EMITTER] Generated verified regression suite: {ws_root.name}/{suite_rel_path}")
+    return suite_abs
 
 
 def _extract_quoted_literals(
@@ -928,6 +1176,12 @@ def _pattern_matches(pattern: str, content: str, stdout: str) -> bool:
     if compact_pattern in compact_content or compact_pattern in compact_stdout:
         return True
 
+    # Quote-normalized match (so `'stations'` matches `"stations"` in JSON/TOML/Python)
+    unquoted_pat = compact_pattern.replace("'", '"')
+    unquoted_content = compact_content.replace("'", '"')
+    if unquoted_pat in unquoted_content:
+        return True
+
     cls_match = re.match(r"^(?:class\s+)?([A-Z][a-zA-Z0-9_]*)(?:\s*\(.*\))?:?$", pattern)
     if cls_match:
         cls_name = cls_match.group(1)
@@ -949,6 +1203,19 @@ def _pattern_matches(pattern: str, content: str, stdout: str) -> bool:
         ]
         if exprs and all(e in compact_content for e in exprs) and all(
             sp in compact_content for sp in static_parts
+        ):
+            return True
+
+    # Assignment with module-prefixed call (e.g. `res = check_level(225)` vs `res = processor.check_level(225)`)
+    assign_call_match = re.match(
+        r"^([a-zA-Z_][a-zA-Z0-9_]*)=([a-zA-Z_][a-zA-Z0-9_]*\(.*\))$",
+        compact_pattern,
+    )
+    if assign_call_match:
+        lhs_var, rhs_call = assign_call_match.groups()
+        if re.search(
+            rf"\b{re.escape(lhs_var)}=(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?{re.escape(rhs_call)}",
+            compact_content,
         ):
             return True
 
@@ -981,6 +1248,16 @@ def _criterion_satisfied_by_file(
         if Path(file_path).name == "__init__.py" and not expected_patterns:
             return True
         return False
+
+    # For non-Python config/data files (`.json`, `.csv`, `.toml`, etc.), verify that
+    # any quoted/backticked keys, column names, or values appear in the file.
+    if not file_path.endswith(".py"):
+        if not expected_patterns:
+            return True
+        return all(
+            _pattern_matches(pattern, content, stdout)
+            for pattern in expected_patterns
+        )
 
     content_lower = content.lower()
 
@@ -1061,6 +1338,10 @@ def _try_dynamic_criterion_assertion(
     (e.g. "`parse_scores('10, 20')` returns `[10, 20]`") that didn't match
     static source text, try evaluating it as a runtime assertion.
     """
+    py_targets = [f for f in target_files if f.endswith(".py")]
+    if not py_targets:
+        return False
+
     candidates: list[str] = []
     norm_direct = _normalize_assertion_code(criterion)
     if norm_direct:
@@ -1082,7 +1363,7 @@ def _try_dynamic_criterion_assertion(
         return False
 
     outcomes = _run_assertions_in_workspace(
-        target_files=target_files,
+        target_files=py_targets,
         target_symbol=task.target_symbol,
         assertions=candidates,
         execution_outputs=execution_outputs,
@@ -1155,7 +1436,7 @@ def validate_batch(
     batch: TaskBatch,
     task_results: list[TaskResult],
 ) -> ValidationResult:
-    """Deterministically validate a completed TaskBatch."""
+    """Deterministically validate a completed TaskBatch across Python and non-Python files."""
     checks: list[str] = []
     errors: list[str] = []
     execution_outputs: dict[str, str] = {}
@@ -1191,6 +1472,13 @@ def validate_batch(
                     pytest_files.append(norm_path)
                 stdout = _check_python_execution(norm_path, checks, errors)
                 execution_outputs[norm_path] = stdout
+        else:
+            asset_ok = _check_asset_syntax(norm_path, checks, errors)
+            if not asset_ok:
+                syntax_failed_files.add(norm_path)
+                for t in batch.tasks:
+                    if norm_path in [_normalize_rel_path(f) for f in t.relevant_files]:
+                        failed_task_ids.add(t.task_id)
 
     _check_target_symbols(
         batch=batch,

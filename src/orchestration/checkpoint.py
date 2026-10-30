@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import ast
+import configparser
+import csv
+import io
+import json
+import tomllib
 from pathlib import Path
 
 from .ledger import (
@@ -32,6 +37,52 @@ def _is_valid_python_source(source: str, allow_empty_init: bool = False) -> bool
         return True
     except SyntaxError:
         return False
+
+
+def _is_valid_workspace_file(abs_path: Path) -> bool:
+    """Validate that a workspace file (Python or non-Python asset) exists and is well-formed."""
+    if not abs_path.is_file():
+        return False
+    try:
+        content = abs_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+    suffix = abs_path.suffix.lower()
+    if suffix == ".py":
+        return _is_valid_python_source(
+            content, allow_empty_init=(abs_path.name == "__init__.py")
+        )
+    if not content.strip():
+        return False
+    if suffix == ".json":
+        try:
+            json.loads(content)
+            return True
+        except Exception:
+            return False
+    if suffix == ".toml":
+        try:
+            tomllib.loads(content)
+            return True
+        except Exception:
+            return False
+    if suffix in (".ini", ".cfg"):
+        try:
+            configparser.ConfigParser().read_string(content)
+            return True
+        except Exception:
+            return False
+    if suffix == ".csv":
+        try:
+            rows = [
+                r for r in csv.reader(io.StringIO(content.strip()))
+                if any(c.strip() for c in r)
+            ]
+            return bool(rows) and len(rows[0]) > 0 and all(len(r) == len(rows[0]) for r in rows[1:])
+        except Exception:
+            return False
+    return True
 
 
 def save_checkpoint(
@@ -116,8 +167,6 @@ def save_checkpoint(
     tmp_file.write_text(data.model_dump_json(indent=2), encoding="utf-8")
     tmp_file.replace(ckpt_file)
     return ckpt_file
-
-
 
 
 def update_checkpoint_stage_metadata(
@@ -246,22 +295,10 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
                 for p in (res.files_changed or ([primary_file] if primary_file else []))
                 if _normalize_rel_path(p)
             ]
-            all_ok = bool(changed_paths)
-            for rel_p in changed_paths:
-                abs_p = workspace_root / rel_p
-                if not abs_p.is_file():
-                    all_ok = False
-                    break
-                content = abs_p.read_text(encoding="utf-8")
-                if rel_p.endswith(".py"):
-                    if not _is_valid_python_source(
-                        content, allow_empty_init=(abs_p.name == "__init__.py")
-                    ):
-                        all_ok = False
-                        break
-                elif not content.strip():
-                    all_ok = False
-                    break
+            all_ok = bool(changed_paths) and all(
+                _is_valid_workspace_file(workspace_root / rel_p)
+                for rel_p in changed_paths
+            )
 
             if all_ok:
                 verified_results[res.task_id] = res
@@ -278,7 +315,7 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
             if not task.relevant_files:
                 continue
             primary_file = _normalize_rel_path(task.relevant_files[0])
-            use_staging = (
+            use_staging = primary_file.endswith(".py") and (
                 file_task_counts.get(primary_file, 0) > 1
                 or primary_file in staged_files
             )
@@ -400,3 +437,61 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
         "rework_mode": checkpoint.rework_mode,
         "phase": reconciled_phase,
     }
+
+
+def format_checkpoint_status() -> str:
+    """
+    Build a human-readable status report of the active workspace and its
+    `.checkpoint/state.json`, including read-only disk reconciliation.
+    """
+    ws_root = get_workspace_root()
+    ckpt_file = get_checkpoint_file()
+    lines = [
+        "============================================================",
+        f"ORCHESTRATOR WORKSPACE STATUS: {ws_root}",
+        "============================================================",
+    ]
+    ckpt = load_checkpoint()
+    if ckpt is None:
+        lines.append(f"Checkpoint File: NONE ({ckpt_file})")
+        return "\n".join(lines)
+
+    reconciled = reconcile_checkpoint_with_disk(ckpt)
+    lines.append(f"Checkpoint File: {ckpt_file}")
+    lines.append(f"Cycle ID:        {ckpt.cycle_id}")
+    lines.append(f"Saved Phase:     {ckpt.phase} (Reconciled Phase: {reconciled['phase']})")
+
+    if ckpt.stages:
+        lines.append(
+            f"Multi-Stage:     Stage {ckpt.current_stage_index + 1}/{len(ckpt.stages)} "
+            f"(Completed Stage IDs: {ckpt.completed_stage_ids})"
+        )
+        for stg in ckpt.stages:
+            mark = "DONE" if stg.stage_id in ckpt.completed_stage_ids else "PENDING"
+            lines.append(f"  - [Stage {stg.stage_id}: {mark}] {stg.title} ({', '.join(stg.target_files)})")
+
+    if ckpt.plan:
+        lines.append(f"Plan Objective:  {ckpt.plan.objective}")
+
+    if ckpt.task_batches:
+        active_batch = ckpt.task_batches[-1]
+        verified_ids = {r.task_id for r in reconciled["task_results"]}
+        lines.append(
+            f"Active Batch:    {active_batch.batch_id} "
+            f"({len(verified_ids)}/{len(active_batch.tasks)} task(s) verified on disk)"
+        )
+        for t in active_batch.tasks:
+            t_status = "VERIFIED" if t.task_id in verified_ids else "PENDING"
+            sym = f" :: {t.target_symbol}" if t.target_symbol else ""
+            lines.append(
+                f"  - [{t_status}] {t.task_id} ({', '.join(t.relevant_files)}{sym}): {t.objective}"
+            )
+
+    if ckpt.ledger:
+        lines.append("\nRecent Ledger Entries:")
+        for e in ckpt.ledger[-6:]:
+            lines.append(
+                f"  #{e.step} [{e.status.upper()}] {e.layer}/{e.action} ({e.target}): {e.detail}"
+            )
+
+    return "\n".join(lines)

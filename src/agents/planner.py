@@ -1,4 +1,4 @@
-from src.orchestration.models import PLANNER_MODEL, model_session
+from src.orchestration.models import get_planner_model, model_session
 from src.orchestration.schemas import (
     CycleResult,
     MultiStageBlueprint,
@@ -39,7 +39,7 @@ class PlannerAgent:
     ) -> MultiStageBlueprint:
         """
         Decompose a larger project specification into sequential architectural stages
-        (e.g. Stage 1: Core models/utilities -> Stage 2: Service layer & entry point).
+        (e.g. Stage 1: Config/data & core models -> Stage 2: Service layer & entry point).
         """
         prompt = f"""
 You are the Planner / Architect decomposing a project into at most {max_stages} sequential build stages.
@@ -51,16 +51,16 @@ Architecture context:
 {architecture_context}
 
 Decomposition Rules (CRITICAL):
-1. Order stages from foundational modules/classes (no internal dependencies) up to higher-level services and entry-point scripts (`main.py` / `app.py`).
-2. Group tightly coupled entry scripts (`main.py`) with the final service/application stage so every stage produces valid, testable Python files.
-3. Preserve EXACT file paths, class names, method/function signatures, formulas, and expected print/return strings from the Project goal inside each stage's `objective`.
+1. Order stages from foundational config/data files (`.json`, `.csv`, `.toml`) and core models/utilities up to higher-level services and entry-point scripts (`main.py` / `app.py`).
+2. Group tightly coupled entry scripts (`main.py`) with the final service/application stage so every stage produces valid, testable files.
+3. Preserve EXACT file paths, JSON/CSV keys, class names, method/function signatures, formulas, and expected print/return strings from the Project goal inside each stage's `objective`.
 4. Do NOT invent extra files or stages not requested in the Project goal.
 
 
 Return only the structured MultiStageBlueprint.
 """
 
-        with model_session(PLANNER_MODEL) as llm:
+        with model_session(get_planner_model()) as llm:
             structured = llm.with_structured_output(MultiStageBlueprint)
             blueprint = structured.invoke(prompt)
 
@@ -116,7 +116,7 @@ You are the Planner / Architect.
 Responsibilities:
 - Analyze the project goal.
 - Define the high-level implementation approach.
-- Identify affected repository areas.
+- Identify affected repository areas (including both Python `.py` modules and any non-Python config/data files such as `.json`, `.csv`, `.toml`, `.sql`, `.md`).
 - Define clear acceptance criteria.
 - Do not implement code.
 
@@ -139,7 +139,7 @@ Previous cycle summary:
 Return only the structured Plan.
 """
 
-        with model_session(PLANNER_MODEL) as llm:
+        with model_session(get_planner_model()) as llm:
             structured = llm.with_structured_output(Plan)
             return structured.invoke(prompt)
 
@@ -188,6 +188,6 @@ Instructions:
 Return only the structured PlannerReview.
 """
 
-        with model_session(PLANNER_MODEL) as llm:
+        with model_session(get_planner_model()) as llm:
             structured = llm.with_structured_output(PlannerReview)
             return structured.invoke(prompt)

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import ast
+import csv
 from graphlib import CycleError, TopologicalSorter
+import io
+import json
 import re
+import tomllib
 from pathlib import Path
 
 from langgraph.graph import END, StateGraph
 
 from src.agents.foreman import ForemanAgent
 from src.agents.planner import PlannerAgent
-from src.harnesses.aider import AiderHarness, list_workspace_py_files
+from src.harnesses.aider import AiderHarness, list_workspace_files, list_workspace_py_files
 
 from .checkpoint import (
     clear_checkpoint,
@@ -40,7 +44,7 @@ from .schemas import (
     WorkerProfile,
 )
 from .state import WorkflowState
-from .validator import validate_batch
+from .validator import emit_pytest_suite, validate_batch
 from .workspace import (
     DEFAULT_WORKSPACE_ROOT,
     REPO_ROOT,
@@ -53,6 +57,19 @@ from .workspace import (
 WORKER_WORKSPACE = DEFAULT_WORKSPACE_ROOT
 MAX_FOREMAN_REPAIRS = 2
 MAX_WORKER_REBUILDS = 3
+
+
+def configure_loop_limits(
+    *,
+    max_repairs: int | None = None,
+    max_rebuilds: int | None = None,
+) -> None:
+    """Override Foreman self-repair and Worker rebuild loop limits at runtime."""
+    global MAX_FOREMAN_REPAIRS, MAX_WORKER_REBUILDS
+    if max_repairs is not None and max_repairs >= 0:
+        MAX_FOREMAN_REPAIRS = max_repairs
+    if max_rebuilds is not None and max_rebuilds >= 0:
+        MAX_WORKER_REBUILDS = max_rebuilds
 
 
 def _normalize_workspace_path(path: str) -> str:
@@ -68,27 +85,62 @@ def _sandbox_repo_path(path: str) -> str:
     return normalized
 
 
+def _summarize_non_python_asset(path: Path, source: str) -> str:
+    """Build a compact structural summary for JSON, TOML, CSV, INI, YAML, SQL, or Markdown assets."""
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        try:
+            data = json.loads(source)
+            if isinstance(data, dict):
+                return f"JSON object (keys: {list(data.keys())[:8]})"
+            if isinstance(data, list):
+                return f"JSON array ({len(data)} items)"
+        except Exception:
+            return "JSON (unparsed)"
+    elif suffix == ".toml":
+        try:
+            data = tomllib.loads(source)
+            return f"TOML (keys: {list(data.keys())[:8]})"
+        except Exception:
+            return "TOML (unparsed)"
+    elif suffix == ".csv":
+        try:
+            rows = [
+                r for r in csv.reader(io.StringIO(source.strip()))
+                if any(c.strip() for c in r)
+            ]
+            if rows:
+                return f"CSV ({len(rows)} rows, columns: {rows[0][:8]})"
+        except Exception:
+            return "CSV (unparsed)"
+    lines = [ln for ln in source.splitlines() if ln.strip()]
+    return f"{suffix.lstrip('.').upper() or 'ASSET'} ({len(lines)} non-empty lines)"
+
+
 def _build_repository_map() -> str:
-    """Build a compact AST-based map of existing files, packages, classes, and functions in the active workspace."""
+    """Build a compact map of existing Python modules and non-Python config/data assets in the active workspace."""
     ws_root = get_workspace_root()
-    py_files = list_workspace_py_files()
-    if not py_files:
-        return f"[No Python files currently in workspace {ws_root.name}/]"
+    ws_files = list_workspace_files()
+    if not ws_files:
+        return f"[No files currently in workspace {ws_root.name}/]"
 
     entries: list[str] = []
-    for py_file in py_files:
-        rel_path = str(py_file.relative_to(ws_root))
+    for fpath in ws_files:
+        rel_path = str(fpath.relative_to(ws_root))
         try:
-            source = py_file.read_text(encoding="utf-8")
+            source = fpath.read_text(encoding="utf-8")
             if not source.strip():
-                if py_file.name == "__init__.py":
+                if fpath.name == "__init__.py":
                     entries.append(f"- {rel_path} (package marker)")
                 else:
                     entries.append(f"- {rel_path} (empty file)")
                 continue
 
-            sigs = extract_python_signatures(source)
-            summary = "; ".join(sigs) if sigs else f"{len(source.splitlines())} lines"
+            if fpath.suffix.lower() == ".py":
+                sigs = extract_python_signatures(source)
+                summary = "; ".join(sigs) if sigs else f"{len(source.splitlines())} lines"
+            else:
+                summary = _summarize_non_python_asset(fpath, source)
             entries.append(f"- {rel_path}: {summary}")
         except Exception:
             entries.append(f"- {rel_path} (unparsed)")
@@ -103,9 +155,12 @@ def _enrich_architecture_context(architecture_context: str) -> str:
 
 def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
     """
-    If Foreman omitted `target_symbol` on a function or class-method task, infer it
-    deterministically from `acceptance_criteria`, `test_assertions`, or `objective`.
+    If Foreman omitted `target_symbol` on a Python function or class-method task,
+    infer it deterministically from `acceptance_criteria`, `test_assertions`, or `objective`.
     """
+    if task.relevant_files and not task.relevant_files[0].endswith(".py"):
+        return None
+
     if task.target_symbol and task.target_symbol.strip():
         return task.target_symbol.split("(")[0].strip()
 
@@ -131,7 +186,7 @@ def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
             return m.group(1)
 
     for token in re.findall(r"`([a-zA-Z_][a-zA-Z0-9_.]*)(?:\([^`]*\))?`", task.objective):
-        if not token.endswith(".py"):
+        if not token.endswith((".py", ".json", ".csv", ".toml", ".yaml", ".yml", ".ini", ".sql", ".md", ".txt")):
             return token
 
     m_obj = re.search(
@@ -181,7 +236,7 @@ def _sort_execution_order_topologically(
 ) -> list[str]:
     """
     Deterministically sort task IDs in dependency order using TopologicalSorter:
-    - Preserves Foreman's relative ordering when tasks are at the same depth.
+    - Schedules non-Python config/data tasks (`.json`, `.csv`, `.toml`, etc.) before Python tasks when at the same depth.
     - Ensures `ClassName.__init__` tasks run before other method tasks on the same file/class.
     - Ensures entry-point scripts (`main.py`, `app.py`) run after library/model tasks.
     """
@@ -189,6 +244,12 @@ def _sort_execution_order_topologically(
     rank = {tid: idx for idx, tid in enumerate(initial_order) if tid in valid_ids}
     for t in tasks:
         rank.setdefault(t.task_id, len(rank))
+
+    asset_task_ids = {
+        t.task_id
+        for t in tasks
+        if t.relevant_files and not t.relevant_files[0].endswith(".py")
+    }
 
     init_task_by_file_class: dict[tuple[str, str], str] = {}
     init_task_by_file: dict[str, str] = {}
@@ -220,6 +281,12 @@ def _sort_execution_order_topologically(
     for t in sorted(tasks, key=lambda x: rank[x.task_id]):
         deps = [d for d in t.dependencies if d in valid_ids and d != t.task_id]
 
+        # Ensure non-Python config/data files are created before Python modules
+        if t.task_id not in asset_task_ids and asset_task_ids:
+            for asset_tid in sorted(asset_task_ids, key=lambda tid: rank[tid]):
+                if asset_tid not in deps:
+                    deps.append(asset_tid)
+
         if t.relevant_files and t.target_symbol and not t.target_symbol.endswith("__init__"):
             primary = t.relevant_files[0]
             init_tid: str | None = None
@@ -232,12 +299,13 @@ def _sort_execution_order_topologically(
                 deps.append(init_tid)
 
         if (
-            not deps
-            and t.task_id not in non_entry_ids
+            t.task_id not in non_entry_ids
             and t.task_id not in referenced_as_dep
             and non_entry_ids
         ):
-            deps = sorted(non_entry_ids, key=lambda tid: rank[tid])
+            for lib_tid in sorted(non_entry_ids, key=lambda tid: rank[tid]):
+                if lib_tid not in deps:
+                    deps.append(lib_tid)
 
         graph_deps[t.task_id] = deps
 
@@ -263,8 +331,8 @@ def _prepare_batch_and_workspace(
 ) -> tuple[TaskBatch, dict[str, str]]:
     """
     Normalize batch relevant_files and execution_order, topologically sort tasks,
-    pre-create missing files and package `__init__.py` markers in the active workspace,
-    infer missing `target_symbol`s, and snapshot pre-batch file contents for rollback.
+    pre-create missing files and Python package `__init__.py` markers in the active
+    workspace, infer missing `target_symbol`s, and snapshot pre-batch file contents.
     """
     from .tools import create_file, read_file
 
@@ -311,11 +379,21 @@ def _prepare_batch_and_workspace(
 
     class_prefix_by_file: dict[str, str] = {}
     for task in batch.tasks:
-        if task.relevant_files and task.target_symbol and "." in task.target_symbol:
+        if (
+            task.relevant_files
+            and task.relevant_files[0].endswith(".py")
+            and task.target_symbol
+            and "." in task.target_symbol
+        ):
             class_prefix_by_file[task.relevant_files[0]] = task.target_symbol.split(".", 1)[0]
 
     for task in batch.tasks:
         primary = task.relevant_files[0] if task.relevant_files else ""
+        if not primary.endswith(".py"):
+            task.target_symbol = None
+            task.test_assertions = []
+            continue
+
         inferred = _infer_task_symbol(task, file_counts.get(primary, 0) > 1)
         if inferred:
             if (
@@ -347,8 +425,11 @@ def _prepare_batch_and_workspace(
         batch.tasks, ordered_ids
     )
 
+    # Only create `__init__.py` markers for directories that contain `.py` modules
     package_init_files: set[str] = set()
     for rel_path in list(batch.relevant_files):
+        if not rel_path.endswith(".py"):
+            continue
         parts = Path(rel_path).parts
         if len(parts) > 1:
             for depth in range(1, len(parts)):
@@ -428,6 +509,11 @@ def _build_effective_validation_batch(task_batches: list[TaskBatch]) -> TaskBatc
     return primary
 
 
+def _fence_lang_for_path(path: str) -> str:
+    ext = Path(path).suffix.lower().lstrip(".")
+    return {"py": "python", "yml": "yaml", "md": "markdown"}.get(ext, ext or "text")
+
+
 def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult]) -> str:
     """Inspect the active workspace repository files and construct textual evidence."""
     from .tools import read_file
@@ -444,11 +530,12 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
     repository_evidence: list[str] = []
     for path in relevant_files:
         physical_path = _sandbox_repo_path(path)
+        lang = _fence_lang_for_path(path)
         try:
             result = read_file.func(path=physical_path)
             content = result.get("content", "")
             content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
-            repository_evidence.append(f"FILE: {path}\n~~~python\n{content_display}\n~~~")
+            repository_evidence.append(f"FILE: {path}\n~~~{lang}\n{content_display}\n~~~")
         except Exception as exc:
             repository_evidence.append(
                 f"FILE: {path}\nREAD_ERROR: {type(exc).__name__}: {exc}"
@@ -458,23 +545,24 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
 
 
 def _gather_full_repository_context() -> str:
-    """Gather context from all user Python files in the active workspace for Planner review."""
+    """Gather context from all user files in the active workspace for Planner review."""
     from .tools import read_file
 
     ws_root = get_workspace_root()
     repository_evidence: list[str] = []
-    for py_file in list_workspace_py_files():
+    for fpath in list_workspace_files():
         try:
-            relative_path = py_file.relative_to(ws_root)
+            relative_path = fpath.relative_to(ws_root)
             logical_path = str(relative_path)
+            lang = _fence_lang_for_path(logical_path)
             result = read_file.func(path=logical_path)
             content = result.get("content", "")
-            if not content.strip() and py_file.name == "__init__.py":
+            if not content.strip() and fpath.name == "__init__.py":
                 content_display = "[PACKAGE __init__.py - 0 bytes]"
             else:
                 content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
             repository_evidence.append(
-                f"FILE: {logical_path}\n~~~python\n{content_display}\n~~~"
+                f"FILE: {logical_path}\n~~~{lang}\n{content_display}\n~~~"
             )
         except Exception as exc:
             repository_evidence.append(
@@ -484,7 +572,7 @@ def _gather_full_repository_context() -> str:
     return (
         "\n\n".join(repository_evidence)
         if repository_evidence
-        else f"[No Python files in {ws_root.name}/]"
+        else f"[No files in {ws_root.name}/]"
     )
 
 
@@ -736,7 +824,7 @@ def worker_node(state: WorkflowState) -> dict:
 
 def foreman_assemble_node(state: WorkflowState) -> dict:
     """
-    When a file was split into multiple function-level or class-method-level
+    When a Python file was split into multiple function-level or class-method-level
     tasks in `.staging/`, Foreman assembles the individual snippets into the
     final target module, verifying via AST that every function, class, and
     method in `ast_merged` is retained.
@@ -761,6 +849,9 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
             continue
 
         norm_target = _normalize_workspace_path(target_file)
+        if not norm_target.endswith(".py"):
+            continue
+
         ast_merged = merge_staged_snippets_ast(
             target_filename=norm_target,
             base_source=snapshots.get(norm_target, ""),
@@ -1205,6 +1296,13 @@ def route_from_entry(state: WorkflowState) -> str:
     return "planner"
 
 
+def route_after_planner(state: WorkflowState) -> str:
+    """Allow `--plan-only` runs to checkpoint the Planner blueprint and exit cleanly."""
+    if state.get("rework_mode") == "plan_only":
+        return "end"
+    return "foreman"
+
+
 def route_after_foreman_review(state: WorkflowState) -> str:
     review = state["foreman_review"]
     if review is None:
@@ -1323,7 +1421,14 @@ def build_graph():
         },
     )
 
-    graph.add_edge("planner", "foreman")
+    graph.add_conditional_edges(
+        "planner",
+        route_after_planner,
+        {
+            "foreman": "foreman",
+            "end": END,
+        },
+    )
     graph.add_edge("foreman", "worker")
     graph.add_edge("worker", "foreman_assemble")
     graph.add_edge("foreman_assemble", "validator")
@@ -1358,6 +1463,9 @@ def run_cycle(
     previous_cycle: CycleResult | None,
     resume: bool = False,
     workspace: str | Path | None = None,
+    plan_only: bool = False,
+    emit_tests: bool = False,
+    suite_rel_path: str = "tests/test_generated.py",
 ) -> CycleResult:
     """Execute a single orchestration cycle in the active or specified workspace."""
     if workspace is not None:
@@ -1375,6 +1483,7 @@ def run_cycle(
             if architecture.strip():
                 initial_state["architecture_context"] = architecture
             initial_state["worker_profile"] = worker_profile
+            initial_state["rework_mode"] = "plan_only" if plan_only else "none"
 
     if initial_state is None:
         if staging_dir.exists():
@@ -1399,12 +1508,23 @@ def run_cycle(
             "validation_result": None,
             "foreman_review": None,
             "planner_review": None,
-            "rework_mode": "none",
+            "rework_mode": "plan_only" if plan_only else "none",
             "phase": "initial",
         }
         save_checkpoint(initial_state)
 
     final_state = app.invoke(initial_state)
+
+    if plan_only and final_state.get("phase") == "planned":
+        return CycleResult(
+            cycle_id=cycle_id,
+            plan=final_state["plan"],
+            task_batches=[],
+            task_results=[],
+            ledger=final_state["ledger"],
+            planner_review=None,
+            outcome="planned",
+        )
 
     foreman_review = final_state.get("foreman_review")
     planner_review = final_state.get("planner_review")
@@ -1414,6 +1534,10 @@ def run_cycle(
         and planner_review.accepted
         and (foreman_review is None or foreman_review.accepted)
     )
+
+    if success and emit_tests and final_state.get("task_batches"):
+        effective_batch = _build_effective_validation_batch(final_state["task_batches"])
+        emit_pytest_suite(effective_batch, suite_rel_path=suite_rel_path)
 
     outcome = "overall_success" if success else "partial"
 
@@ -1436,6 +1560,8 @@ def run_project(
     max_cycles: int = 3,
     resume: bool = False,
     workspace: str | Path | None = None,
+    plan_only: bool = False,
+    emit_tests: bool = False,
 ) -> list[CycleResult]:
     """Execute the outer Planner loop across multiple cycles in the target workspace."""
     if workspace is not None:
@@ -1457,6 +1583,8 @@ def run_project(
                     max_cycles_per_stage=max_cycles,
                     resume=True,
                     workspace=workspace,
+                    plan_only=plan_only,
+                    emit_tests=emit_tests,
                 )
             history = list(ckpt.completed_cycles)
             start_cycle = ckpt.cycle_id
@@ -1481,8 +1609,14 @@ def run_project(
             worker_profile=worker_profile,
             previous_cycle=previous_cycle,
             resume=use_resume_this_cycle,
+            plan_only=plan_only,
+            emit_tests=emit_tests,
         )
         history.append(result)
+
+        if plan_only and result.outcome == "planned":
+            print("\n=== PLAN-ONLY MODE COMPLETE (Saved to .checkpoint/state.json) ===")
+            break
 
         if result.outcome == "overall_success":
             print(f"\n=== PROJECT ACCEPTED IN CYCLE {cycle_id} ===")
@@ -1521,11 +1655,14 @@ def run_staged_project(
     max_cycles_per_stage: int = 2,
     resume: bool = False,
     workspace: str | Path | None = None,
+    plan_only: bool = False,
+    stop_after_stage: int | None = None,
+    emit_tests: bool = False,
 ) -> list[CycleResult]:
     """
     Decompose a complex project into sequential StageGoal milestones (or use provided
     `stages`) and execute each stage inside the target workspace, supporting mid-stage
-    checkpointing and resume.
+    checkpointing, `--plan-only`, `--stop-after-stage`, and `--emit-tests`.
     """
     if workspace is not None:
         set_active_workspace(workspace)
@@ -1604,7 +1741,7 @@ def run_staged_project(
                     "validation_result": None,
                     "foreman_review": None,
                     "planner_review": None,
-                    "rework_mode": "none",
+                    "rework_mode": "plan_only" if plan_only else "none",
                     "phase": "initial",
                 }
                 save_checkpoint(
@@ -1615,6 +1752,7 @@ def run_staged_project(
                     completed_stage_ids=completed_stage_ids,
                 )
 
+            suite_path = f"tests/test_stage_{stage.stage_id}.py"
             cycle_result = run_cycle(
                 cycle_id=cycle_id,
                 goal=stage_goal_text,
@@ -1622,9 +1760,24 @@ def run_staged_project(
                 worker_profile=worker_profile,
                 previous_cycle=stage_previous_cycle,
                 resume=use_resume_cycle,
+                plan_only=plan_only,
+                emit_tests=emit_tests,
+                suite_rel_path=suite_path,
             )
             history.append(cycle_result)
             stage_previous_cycle = cycle_result
+
+            if plan_only and cycle_result.outcome == "planned":
+                update_checkpoint_stage_metadata(
+                    completed_cycles=history,
+                    stages=resolved_stages,
+                    current_stage_index=stage_idx,
+                    completed_stage_ids=completed_stage_ids,
+                )
+                print(
+                    f"\n=== STAGE {stage.stage_id}/{total_stages} PLAN-ONLY COMPLETE ==="
+                )
+                return history
 
             if cycle_result.outcome == "overall_success":
                 stage_succeeded = True
@@ -1652,6 +1805,12 @@ def run_staged_project(
         if not stage_succeeded:
             print(
                 f"\n=== STAGE {stage.stage_id}/{total_stages} FAILED TO CONVERGE — STOPPING ==="
+            )
+            break
+
+        if stop_after_stage is not None and stage.stage_id >= stop_after_stage:
+            print(
+                f"\n=== STOPPED AFTER STAGE {stage.stage_id}/{total_stages} (--stop-after-stage {stop_after_stage}) ==="
             )
             break
 
