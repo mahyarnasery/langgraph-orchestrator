@@ -2,19 +2,48 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-from .workspace import get_workspace_root, normalize_workspace_rel_path
+from .workspace import (
+    check_read_permission,
+    get_workspace_root,
+    normalize_workspace_rel_path,
+    request_external_write_permission,
+)
 
 
-def _safe_path(path: str) -> Path:
+def _resolve_read_path(path: str) -> Path:
     """
-    Resolve a relative path and ensure it remains inside the active
-    orchestration workspace.
+    Resolve a file path for reading, enforcing the active AccessMode:
+    - Mode 1 ('sandbox_only'): Must be inside `sandbox/`.
+    - Mode 2 ('read_external', Default) & Mode 3 ('allow_external'): Can read inside `sandbox/`
+      or an external path outside `sandbox/`.
+    """
+    workspace_root = get_workspace_root()
+    candidate = Path(path).expanduser()
+
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        normalized = Path(normalize_workspace_rel_path(path))
+        ws_candidate = (workspace_root / normalized).resolve()
+        if ws_candidate.exists() or ws_candidate.is_relative_to(workspace_root):
+            resolved = ws_candidate
+        else:
+            resolved = (Path.cwd() / candidate).resolve()
+
+    return check_read_permission(resolved)
+
+
+def _safe_write_path(path: str) -> Path:
+    """
+    Resolve a path for creating/modifying a file and enforce both workspace
+    containment and the active AccessMode (Mode 1/2: strictly `sandbox/` only;
+    Mode 3: prompts for confirmation if outside `sandbox/`).
     """
     workspace_root = get_workspace_root()
     candidate = Path(path)
 
     if candidate.is_absolute():
-        raise ValueError(f"Absolute paths are not allowed: {path}")
+        raise ValueError(f"Absolute paths are not allowed for writes: {path}")
 
     normalized = Path(normalize_workspace_rel_path(path))
     resolved = (workspace_root / normalized).resolve()
@@ -24,6 +53,7 @@ def _safe_path(path: str) -> Path:
     except ValueError as exc:
         raise ValueError(f"Path escapes orchestration workspace: {path}") from exc
 
+    request_external_write_permission(resolved, operation="write/modify file")
     return resolved
 
 
@@ -36,8 +66,8 @@ def _ensure_trailing_newline(content: str) -> str:
 
 @tool
 def read_file(path: str) -> dict:
-    """Read content of a file within the workspace."""
-    file_path = _safe_path(path)
+    """Read content of a file (respecting the active sandbox/external read access mode)."""
+    file_path = _resolve_read_path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {path}")
     if not file_path.is_file():
@@ -53,7 +83,7 @@ def create_file(path: str, content: str = "") -> dict:
     Create a new file within the workspace with optional initial content.
     Creates parent directories if necessary.
     """
-    file_path = _safe_path(path)
+    file_path = _safe_write_path(path)
     if file_path.exists():
         raise FileExistsError(f"File already exists: {path}")
 
@@ -65,7 +95,7 @@ def create_file(path: str, content: str = "") -> dict:
 @tool
 def write_file(path: str, content: str) -> dict:
     """Overwrite or write content to a file within the workspace."""
-    file_path = _safe_path(path)
+    file_path = _safe_write_path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(_ensure_trailing_newline(content), encoding="utf-8")
     return {"path": path, "status": "written"}
@@ -74,7 +104,7 @@ def write_file(path: str, content: str) -> dict:
 @tool
 def edit_file(path: str, old_text: str, new_text: str) -> dict:
     """Replace target text in a file within the workspace."""
-    file_path = _safe_path(path)
+    file_path = _safe_write_path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 

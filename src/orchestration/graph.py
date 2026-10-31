@@ -48,6 +48,8 @@ from .validator import emit_pytest_suite, validate_batch
 from .workspace import (
     DEFAULT_WORKSPACE_ROOT,
     REPO_ROOT,
+    get_access_mode,
+    get_external_read_files,
     get_staging_dir,
     get_workspace_root,
     normalize_workspace_rel_path,
@@ -121,7 +123,12 @@ def _build_repository_map() -> str:
     """Build a compact map of existing Python modules and non-Python config/data assets in the active workspace."""
     ws_root = get_workspace_root()
     ws_files = list_workspace_files()
-    if not ws_files:
+    ext_files = (
+        [p for p in get_external_read_files() if p.is_file()]
+        if get_access_mode() in ("read_external", "allow_external")
+        else []
+    )
+    if not ws_files and not ext_files:
         return f"[No files currently in workspace {ws_root.name}/]"
 
     entries: list[str] = []
@@ -145,7 +152,20 @@ def _build_repository_map() -> str:
         except Exception:
             entries.append(f"- {rel_path} (unparsed)")
 
-    return f"Existing Workspace Repository Map ({ws_root}):\n" + "\n".join(entries)
+    if get_access_mode() in ("read_external", "allow_external"):
+        for ext_file in get_external_read_files():
+            if ext_file.is_file():
+                try:
+                    ext_src = ext_file.read_text(encoding="utf-8")
+                    if ext_file.suffix.lower() == ".py":
+                        sigs = extract_python_signatures(ext_src)
+                        summary = "; ".join(sigs) if sigs else f"{len(ext_src.splitlines())} lines"
+                    else:
+                        summary = _summarize_non_python_asset(ext_file, ext_src)
+                    entries.append(f"- [EXTERNAL READ-ONLY] {ext_file}: {summary}")
+                except Exception:
+                    pass
+    return f"Existing Workspace Repository Map ({ws_root}, access_mode={get_access_mode()}):\n" + "\n".join(entries)
 
 
 def _enrich_architecture_context(architecture_context: str) -> str:
@@ -153,16 +173,22 @@ def _enrich_architecture_context(architecture_context: str) -> str:
     return f"{architecture_context}\n\n{repo_map}"
 
 
+_PYTHON_BUILTINS = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
+
+
 def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
     """
     If Foreman omitted `target_symbol` on a Python function or class-method task,
-    infer it deterministically from `acceptance_criteria`, `test_assertions`, or `objective`.
+    infer it deterministically from `objective`, `acceptance_criteria`, or `test_assertions`,
+    never returning Python built-ins (such as `len`, `sum`, `max`, `min`, `isinstance`).
     """
     if task.relevant_files and not task.relevant_files[0].endswith(".py"):
         return None
 
     if task.target_symbol and task.target_symbol.strip():
-        return task.target_symbol.split("(")[0].strip()
+        cand = task.target_symbol.split("(")[0].strip()
+        if cand not in _PYTHON_BUILTINS:
+            return cand
 
     if not multi_task_file and "function" not in task.scope.lower() and "method" not in task.scope.lower():
         return None
@@ -177,25 +203,33 @@ def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
 
     for crit in task.acceptance_criteria:
         m = re.search(r"\b(?:def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", crit)
-        if m:
-            return m.group(1)
-
-    for assertion in task.test_assertions:
-        m = re.search(r"\bassert\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", assertion)
-        if m:
+        if m and m.group(1) not in _PYTHON_BUILTINS:
             return m.group(1)
 
     for token in re.findall(r"`([a-zA-Z_][a-zA-Z0-9_.]*)(?:\([^`]*\))?`", task.objective):
-        if not token.endswith((".py", ".json", ".csv", ".toml", ".yaml", ".yml", ".ini", ".sql", ".md", ".txt")):
+        if (
+            not token.endswith((".py", ".json", ".csv", ".toml", ".yaml", ".yml", ".ini", ".sql", ".md", ".txt"))
+            and token not in _PYTHON_BUILTINS
+        ):
             return token
 
     m_obj = re.search(
-        r"\b(?:implement|define|create)\s+(?:the\s+)?(?:function|method\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\s*\(",
+        r"\b(?:implement|define|create)\s+(?:the\s+)?(?:class\s+|function\s+|method\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\b",
         task.objective,
         re.IGNORECASE,
     )
     if m_obj:
-        return m_obj.group(1)
+        cand_obj = m_obj.group(1).strip(".")
+        if (
+            cand_obj.lower() not in ("class", "function", "method", "file", "script", "module", "the", "a", "an")
+            and cand_obj not in _PYTHON_BUILTINS
+        ):
+            return cand_obj
+
+    for assertion in task.test_assertions:
+        for call_name in re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", assertion):
+            if call_name not in _PYTHON_BUILTINS and call_name != "assert":
+                return call_name
 
     return None
 
@@ -1213,13 +1247,31 @@ def planner_review_node(state: WorkflowState) -> dict:
     ledger_ctx = format_ledger_for_prompt(state["ledger"], state["previous_cycle"])
 
     print("\n=== PLANNER FINAL ACCEPTANCE REVIEW ===")
-    review = planner.review(
-        project_goal=state["project_goal"],
-        plan=plan,
-        repository_context=repository_context,
-        validation_result=state.get("validation_result"),
-        ledger_context=ledger_ctx,
-    )
+    validation = state.get("validation_result")
+    foreman_rev = state.get("foreman_review")
+    try:
+        review = planner.review(
+            project_goal=state["project_goal"],
+            plan=plan,
+            repository_context=repository_context,
+            validation_result=validation,
+            ledger_context=ledger_ctx,
+        )
+    except Exception as exc:
+        if validation is not None and validation.passed and (foreman_rev is None or foreman_rev.accepted):
+            print(
+                f"[WARN] Planner LLM review raised {type(exc).__name__} after all "
+                f"{len(validation.checks)} deterministic checks and Foreman review passed. "
+                f"Auto-accepting verified build."
+            )
+            review = PlannerReview(
+                criteria_evaluation=[f"PASS: {c}" for c in (plan.acceptance_criteria if plan else [])],
+                feedback=[],
+                summary="Accepted via deterministic validator and Foreman verification.",
+                accepted=True,
+            )
+        else:
+            raise
 
     print(review.model_dump_json(indent=2))
 

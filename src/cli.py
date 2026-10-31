@@ -18,7 +18,12 @@ from src.orchestration.graph import (
 from src.orchestration.models import configure_models, get_worker_model
 from src.orchestration.schemas import Task, TaskBatch, TaskResult, WorkerProfile
 from src.orchestration.validator import emit_pytest_suite, validate_batch
-from src.orchestration.workspace import get_workspace_root, set_active_workspace
+from src.orchestration.workspace import (
+    configure_access_policy,
+    get_access_mode,
+    get_workspace_root,
+    set_active_workspace,
+)
 
 
 def clean_active_workspace() -> None:
@@ -94,7 +99,30 @@ def main() -> None:
         "-w",
         "--workspace",
         default=None,
-        help="Target workspace directory to build/inspect/resume in (default: sandbox/).",
+        help="Target workspace directory (default: sandbox/). Modifying folders outside sandbox/ requires --access-mode 3.",
+    )
+    parser.add_argument(
+        "-m",
+        "--access-mode",
+        default="2",
+        choices=["1", "2", "3", "sandbox_only", "read_external", "allow_external"],
+        help=(
+            "File access security mode: "
+            "1 / sandbox_only (read & write strictly in sandbox/ only), "
+            "2 / read_external (DEFAULT: can read outside sandbox/, write only in sandbox/), "
+            "3 / allow_external (can read & write outside sandbox/ with user permission prompt)."
+        ),
+    )
+    parser.add_argument(
+        "--yes-external",
+        action="store_true",
+        help="Pre-approve 'yes to all' for external file/directory writes when using --access-mode 3.",
+    )
+    parser.add_argument(
+        "--read-external",
+        nargs="*",
+        default=[],
+        help="External file(s) or directory(s) outside sandbox/ to include as read-only reference context (Modes 2 & 3).",
     )
     parser.add_argument(
         "--arch",
@@ -190,7 +218,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    ws_root = set_active_workspace(args.workspace)
+    try:
+        configure_access_policy(
+            args.access_mode,
+            approve_all_external=args.yes_external,
+            external_read_files=args.read_external,
+        )
+        ws_root = set_active_workspace(args.workspace)
+    except (PermissionError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     configure_models(
         planner_model=args.planner_model,
         foreman_model=args.foreman_model,
@@ -200,6 +238,8 @@ def main() -> None:
         max_repairs=args.max_repairs,
         max_rebuilds=args.max_rebuilds,
     )
+
+    print(f"[ACCESS POLICY] Mode: {get_access_mode()} | Active Workspace: {ws_root}")
 
     if args.clean:
         clean_active_workspace()

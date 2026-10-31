@@ -154,11 +154,17 @@ Return only the structured Plan.
     ) -> PlannerReview:
         """Evaluate whether the integrated repository code satisfies the blueprint."""
 
-        validation_text = (
-            validation_result.model_dump_json(indent=2)
-            if validation_result is not None
-            else "Not available"
-        )
+        if validation_result is None:
+            validation_text = "Not available"
+        elif validation_result.passed:
+            stdout_checks = [c for c in validation_result.checks if c.startswith("stdout (")]
+            validation_text = (
+                f"PASSED: All {len(validation_result.checks)} deterministic checks passed "
+                f"(0 errors). Files checked: {', '.join(validation_result.files_checked)}. "
+                + (" | ".join(stdout_checks) if stdout_checks else "")
+            )
+        else:
+            validation_text = validation_result.model_dump_json(indent=2)
 
         prompt = f"""
 You are the Planner / Architect conducting the final acceptance review AFTER the Worker and Foreman have finished implementing and assembling the repository.

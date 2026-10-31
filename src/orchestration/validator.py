@@ -662,7 +662,7 @@ def _check_target_symbols(
         if not task.target_symbol:
             continue
         target_sym = task.target_symbol.split("(")[0].strip()
-        if not target_sym:
+        if not target_sym or target_sym in dir(__builtins__):
             continue
 
         target_files = [
@@ -1103,9 +1103,19 @@ def emit_pytest_suite(
 
     suite_abs = _absolute(suite_rel_path)
     suite_abs.parent.mkdir(parents=True, exist_ok=True)
-    header = "\n".join(import_lines)
+    bootstrap_lines = [
+        "import os",
+        "import sys",
+        "from pathlib import Path",
+        "",
+        "_PROJECT_ROOT = Path(__file__).resolve().parents[1]",
+        "if str(_PROJECT_ROOT) not in sys.path:",
+        "    sys.path.insert(0, str(_PROJECT_ROOT))",
+        "os.chdir(_PROJECT_ROOT)",
+    ]
+    header = "\n".join(bootstrap_lines + ([""] + import_lines if import_lines else []))
     full_suite_code = (
-        (header + "\n\n\n" if header else "")
+        header + "\n\n\n"
         + "\n\n\n".join(test_blocks)
         + "\n"
     )

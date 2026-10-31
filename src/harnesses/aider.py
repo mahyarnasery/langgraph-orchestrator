@@ -18,9 +18,12 @@ from src.orchestration.schemas import Task, TaskBatch, TaskResult
 from src.orchestration.workspace import (
     DEFAULT_WORKSPACE_ROOT,
     REPO_ROOT,
+    get_access_mode,
+    get_external_read_files,
     get_staging_dir,
     get_workspace_root,
     normalize_workspace_rel_path,
+    request_external_write_permission,
 )
 
 WORKSPACE_ROOT = DEFAULT_WORKSPACE_ROOT
@@ -113,6 +116,7 @@ class AiderHarness(CodingHarness):
             raise ValueError("TaskBatch must contain at least one task.")
 
         ws_root = get_workspace_root()
+        request_external_write_permission(ws_root, operation='execute Aider worker tasks in workspace')
         staging_dir = get_staging_dir()
         ws_root.mkdir(parents=True, exist_ok=True)
         staging_dir.mkdir(parents=True, exist_ok=True)
@@ -263,8 +267,13 @@ class AiderHarness(CodingHarness):
                     project_goal=project_goal,
                 )
 
+                ext_read_paths = (
+                    [str(p) for p in get_external_read_files() if p.is_file()]
+                    if get_access_mode() in ("read_external", "allow_external")
+                    else []
+                )
                 read_args: list[str] = []
-                for rf in read_only_files:
+                for rf in [*read_only_files, *ext_read_paths]:
                     read_args.extend(["--read", rf])
 
                 command = [

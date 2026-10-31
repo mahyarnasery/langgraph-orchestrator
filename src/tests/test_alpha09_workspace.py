@@ -10,6 +10,7 @@ from src.orchestration.graph import run_staged_project
 from src.orchestration.schemas import StageGoal, Task, TaskBatch, TaskResult, WorkerProfile
 from src.orchestration.validator import _prepare_assertion_list, validate_batch
 from src.orchestration.workspace import (
+    configure_access_policy,
     DEFAULT_WORKSPACE_ROOT,
     ORCHESTRATOR_SRC,
     REPO_ROOT,
@@ -217,6 +218,7 @@ def test_part2_custom_external_workspace_staged_build_and_resume() -> None:
 
 
 def main() -> None:
+    configure_access_policy('allow_external', approve_all_external=True)
     test_part1_workspace_safety_and_assertion_polish()
     test_part2_custom_external_workspace_staged_build_and_resume()
 

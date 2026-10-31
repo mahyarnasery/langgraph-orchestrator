@@ -69,6 +69,7 @@ class _ResilientStructuredRunner:
                         model=self._model_name,
                         base_url=OLLAMA_BASE_URL,
                         temperature=round(0.15 * (attempt - 1), 2),
+                        num_ctx=8192,
                         keep_alive=0,
                         timeout=180,
                     )
@@ -138,6 +139,7 @@ def model_session(model_name: str) -> Iterator[_ResilientChatOllama]:
         model=model_name,
         base_url=OLLAMA_BASE_URL,
         temperature=0,
+        num_ctx=8192,
         keep_alive=0,
         timeout=180,
     )
