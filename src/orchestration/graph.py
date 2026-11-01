@@ -88,11 +88,14 @@ def _sandbox_repo_path(path: str) -> str:
 
 
 def _summarize_non_python_asset(path: Path, source: str) -> str:
-    """Build a compact structural summary for JSON, TOML, CSV, INI, YAML, SQL, or Markdown assets."""
+    """Build a compact summary including actual values for small JSON/CSV/TOML assets so Foreman writes accurate assertions."""
     suffix = path.suffix.lower()
     if suffix == ".json":
         try:
             data = json.loads(source)
+            compact_json = json.dumps(data)
+            if len(compact_json) <= 240:
+                return f"JSON content: {compact_json}"
             if isinstance(data, dict):
                 return f"JSON object (keys: {list(data.keys())[:8]})"
             if isinstance(data, list):
@@ -112,7 +115,8 @@ def _summarize_non_python_asset(path: Path, source: str) -> str:
                 if any(c.strip() for c in r)
             ]
             if rows:
-                return f"CSV ({len(rows)} rows, columns: {rows[0][:8]})"
+                preview = "; ".join(",".join(r) for r in rows[:6])
+                return f"CSV ({len(rows)} rows: {preview})"
         except Exception:
             return "CSV (unparsed)"
     lines = [ln for ln in source.splitlines() if ln.strip()]
@@ -176,21 +180,44 @@ def _enrich_architecture_context(architecture_context: str) -> str:
 _PYTHON_BUILTINS = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
 
 
+def _invalid_symbol_names_for_task(task: Task) -> set[str]:
+    """Return Python builtins plus all directory/file stems from `task.relevant_files`."""
+    invalid = set(_PYTHON_BUILTINS) | {
+        "class", "function", "method", "file", "script", "module",
+        "the", "a", "an", "services", "domain", "models", "core",
+        "config", "data", "tests", "main", "app", "utils", "helpers",
+    }
+    for rf in task.relevant_files:
+        p = Path(_normalize_workspace_path(rf))
+        invalid.add(p.stem)
+        invalid.add(p.name)
+        for part in p.parts:
+            invalid.add(part)
+            invalid.add(Path(part).stem)
+    return invalid
+
+
 def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
     """
-    If Foreman omitted `target_symbol` on a Python function or class-method task,
-    infer it deterministically from `objective`, `acceptance_criteria`, or `test_assertions`,
-    never returning Python built-ins (such as `len`, `sum`, `max`, `min`, `isinstance`).
+    Validate or infer `target_symbol` on a Python task:
+    - If `multi_task_file` is False (only 1 task targets this file), clear any bogus
+      module/directory `target_symbol` (like `'services'`) and keep `target_symbol`
+      only if it is a genuine function or `ClassName.method` name.
+    - Never match path prefixes before `/` (e.g. `services/ingestion.py`).
     """
     if task.relevant_files and not task.relevant_files[0].endswith(".py"):
         return None
 
-    if task.target_symbol and task.target_symbol.strip():
-        cand = task.target_symbol.split("(")[0].strip()
-        if cand not in _PYTHON_BUILTINS:
-            return cand
+    invalid_names = _invalid_symbol_names_for_task(task)
 
-    if not multi_task_file and "function" not in task.scope.lower() and "method" not in task.scope.lower():
+    if task.target_symbol and task.target_symbol.strip():
+        cand = task.target_symbol.split("(")[0].strip().strip(".")
+        if "/" not in cand and cand not in invalid_names and cand.split(".")[0] not in _PYTHON_BUILTINS:
+            return cand
+        task.target_symbol = None
+
+    # Do NOT guess a single target_symbol when an entire multi-function module is in 1 task
+    if not multi_task_file:
         return None
 
     combined_text = f"{task.objective}\n" + "\n".join(task.acceptance_criteria)
@@ -203,32 +230,30 @@ def _infer_task_symbol(task: Task, multi_task_file: bool) -> str | None:
 
     for crit in task.acceptance_criteria:
         m = re.search(r"\b(?:def|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", crit)
-        if m and m.group(1) not in _PYTHON_BUILTINS:
+        if m and m.group(1) not in invalid_names:
             return m.group(1)
 
     for token in re.findall(r"`([a-zA-Z_][a-zA-Z0-9_.]*)(?:\([^`]*\))?`", task.objective):
         if (
-            not token.endswith((".py", ".json", ".csv", ".toml", ".yaml", ".yml", ".ini", ".sql", ".md", ".txt"))
-            and token not in _PYTHON_BUILTINS
+            "/" not in token
+            and not token.endswith((".py", ".json", ".csv", ".toml", ".yaml", ".yml", ".ini", ".sql", ".md", ".txt"))
+            and token not in invalid_names
         ):
             return token
 
     m_obj = re.search(
-        r"\b(?:implement|define|create)\s+(?:the\s+)?(?:class\s+|function\s+|method\s+)?([a-zA-Z_][a-zA-Z0-9_.]*)\b",
+        r"\b(?:implement|define|create)\s+(?:the\s+)?(?:class\s+|function\s+|method\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?![a-zA-Z0-9_./])",
         task.objective,
         re.IGNORECASE,
     )
     if m_obj:
         cand_obj = m_obj.group(1).strip(".")
-        if (
-            cand_obj.lower() not in ("class", "function", "method", "file", "script", "module", "the", "a", "an")
-            and cand_obj not in _PYTHON_BUILTINS
-        ):
+        if cand_obj not in invalid_names:
             return cand_obj
 
     for assertion in task.test_assertions:
         for call_name in re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", assertion):
-            if call_name not in _PYTHON_BUILTINS and call_name != "assert":
+            if call_name not in invalid_names and call_name != "assert":
                 return call_name
 
     return None
@@ -359,9 +384,132 @@ def _sort_execution_order_topologically(
         return sorted(valid_ids, key=lambda x: rank[x])
 
 
+
+def _align_batch_with_plan_blueprints(batch: TaskBatch, plan: Plan | None) -> None:
+    """
+    Deterministically align Foreman's TaskBatch with the Planner's `file_blueprints`:
+    - If a multi-symbol Python file was lumped into a single task by Foreman even though
+      the Planner designed 2+ `SymbolSpec`s for that file, expand it into atomic per-symbol tasks.
+    - If a task's `target_symbol` is missing or imprecise, match it against the Planner's
+      `SymbolSpec`s for that file.
+    """
+    if plan is None or not getattr(plan, "file_blueprints", None):
+        return
+
+    blueprints_by_path = {
+        _normalize_workspace_path(fb.path): fb
+        for fb in plan.file_blueprints
+        if _normalize_workspace_path(fb.path)
+    }
+    if not blueprints_by_path:
+        return
+
+    # Filter out any tasks that target files outside the Planner's file_blueprints
+    # (prevents Foreman from prematurely adding Stage 2 files during Stage 1).
+    allowed_plan_files = set(blueprints_by_path.keys())
+    in_scope_tasks = [
+        t for t in batch.tasks
+        if t.relevant_files
+        and all(_normalize_workspace_path(rf) in allowed_plan_files for rf in t.relevant_files)
+    ]
+    if in_scope_tasks:
+        batch.tasks = in_scope_tasks
+        batch.relevant_files = sorted(
+            {
+                _normalize_workspace_path(rf)
+                for t in batch.tasks
+                for rf in t.relevant_files
+            }
+        )
+
+    tasks_by_file: dict[str, list[Task]] = {}
+    for t in batch.tasks:
+        if t.relevant_files:
+            tasks_by_file.setdefault(_normalize_workspace_path(t.relevant_files[0]), []).append(t)
+
+    new_tasks: list[Task] = []
+    expanded_any = False
+
+    for t in batch.tasks:
+        primary = _normalize_workspace_path(t.relevant_files[0]) if t.relevant_files else ""
+        fb = blueprints_by_path.get(primary)
+        if fb is None or not primary.endswith(".py") or not fb.symbols:
+            new_tasks.append(t)
+            continue
+
+        file_tasks = tasks_by_file.get(primary, [])
+        # Case A: Planner designed 2+ symbols for this file, but Foreman emitted only 1 lumped task
+        if len(fb.symbols) >= 2 and len(file_tasks) == 1:
+            expanded_any = True
+            prev_sub_id: str | None = None
+            for idx, sym_spec in enumerate(fb.symbols, start=1):
+                sub_id = f"{t.task_id}_{idx}"
+                sub_deps = list(t.dependencies)
+                if prev_sub_id and sym_spec.target_symbol.split(".")[-1] != "__init__":
+                    sub_deps.append(prev_sub_id)
+                # Keep relevant test_assertions that reference this symbol or class
+                sym_short = sym_spec.target_symbol.split(".")[-1]
+                cls_prefix = sym_spec.target_symbol.split(".")[0] if "." in sym_spec.target_symbol else ""
+                sub_asserts = [
+                    a for a in t.test_assertions
+                    if sym_short in a or (sym_short == "__init__" and cls_prefix and cls_prefix in a)
+                ]
+                if not sub_asserts and idx == len(fb.symbols):
+                    sub_asserts = list(t.test_assertions)
+                new_tasks.append(
+                    Task(
+                        task_id=sub_id,
+                        objective=f"Implement `{sym_spec.target_symbol}` in `{primary}`: {sym_spec.contract}",
+                        target_symbol=sym_spec.target_symbol,
+                        scope=f"Atomic symbol task from Planner blueprint ({primary})",
+                        relevant_files=[primary],
+                        dependencies=sub_deps,
+                        constraints=list(fb.required_imports),
+                        acceptance_criteria=[sym_spec.signature, sym_spec.contract],
+                        test_assertions=sub_asserts,
+                    )
+                )
+                if sym_spec.target_symbol.endswith(".__init__") or prev_sub_id is None:
+                    prev_sub_id = sub_id
+            continue
+
+        # Case B: Match/correct `task.target_symbol` against the Planner's SymbolSpec list
+        if len(file_tasks) == 1 and len(fb.symbols) == 1 and "." in fb.symbols[0].target_symbol:
+            t.target_symbol = fb.symbols[0].target_symbol.split(".")[0]
+        else:
+            valid_planned_symbols = [s.target_symbol for s in fb.symbols]
+            if t.target_symbol not in valid_planned_symbols:
+                # Check task_id and objective FIRST so a mention of another function in
+                # acceptance_criteria (e.g. "generate_dispatch_report calls simulate_dispatch")
+                # never overwrites the task's actual symbol!
+                matched_sym: str | None = None
+                primary_text = f"{t.task_id} {t.objective}"
+                for sym_spec in fb.symbols:
+                    short_name = sym_spec.target_symbol.split(".")[-1]
+                    if sym_spec.target_symbol in primary_text or re.search(rf"\b{re.escape(short_name)}\b", primary_text):
+                        matched_sym = sym_spec.target_symbol
+                        break
+                if matched_sym is None:
+                    secondary_text = f"{' '.join(t.acceptance_criteria)} {' '.join(t.test_assertions)}"
+                    for sym_spec in fb.symbols:
+                        short_name = sym_spec.target_symbol.split(".")[-1]
+                        if sym_spec.target_symbol in secondary_text or re.search(rf"\b{re.escape(short_name)}\b", secondary_text):
+                            matched_sym = sym_spec.target_symbol
+                            break
+                if matched_sym is not None:
+                    t.target_symbol = matched_sym
+
+        new_tasks.append(t)
+
+    if expanded_any:
+        batch.tasks = new_tasks
+        batch.execution_order = [t.task_id for t in new_tasks]
+
+
 def _prepare_batch_and_workspace(
     batch: TaskBatch,
     existing_snapshots: dict[str, str],
+    plan: Plan | None = None,
 ) -> tuple[TaskBatch, dict[str, str]]:
     """
     Normalize batch relevant_files and execution_order, topologically sort tasks,
@@ -398,6 +546,8 @@ def _prepare_batch_and_workspace(
         task.test_assertions = [
             a.strip() for a in task.test_assertions if a and a.strip()
         ]
+
+    _align_batch_with_plan_blueprints(batch, plan)
 
     if len(batch.tasks) > 1:
         filtered_tasks = [
@@ -700,7 +850,7 @@ def foreman_node(state: WorkflowState) -> dict:
         raise TypeError("ForemanAgent.create_batch() must return TaskBatch.")
 
     batch, snapshots = _prepare_batch_and_workspace(
-        batch, state.get("file_snapshots", {})
+        batch, state.get("file_snapshots", {}), plan=plan
     )
 
     print("\n=== FOREMAN RESULT ===")
@@ -808,6 +958,7 @@ def worker_node(state: WorkflowState) -> dict:
         project_goal=state["project_goal"],
         verified_task_results=verified_by_id,
         on_task_complete=_on_single_task_complete,
+        plan=state.get("plan"),
     )
 
     print("\n=== WORKER SESSION COMPLETE ===")
@@ -1069,9 +1220,14 @@ def foreman_review_node(state: WorkflowState) -> dict:
 
 def foreman_self_repair_node(state: WorkflowState) -> dict:
     """
-    Foreman executes direct localized repairs with exception safety and
-    Zero-Diff Stagnation Detection.
+    Foreman executes direct localized repairs with:
+    1. Automatic markdown-fence sanitization (via `write_file`/`edit_file`).
+    2. Immediate syntax verification (`_is_valid_workspace_file`) — if a Foreman patch
+       introduces a syntax error, it is immediately reverted to `before_content` so
+       Foreman can NEVER corrupt a file on disk.
+    3. Zero-Diff Stagnation Detection.
     """
+    from .checkpoint import _is_valid_workspace_file
     from .tools import edit_file, read_file, write_file
 
     ws_root = get_workspace_root()
@@ -1085,6 +1241,7 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
     for repair in review.direct_repairs:
         physical_path = _sandbox_repo_path(repair.path)
         norm_rel = _normalize_workspace_path(repair.path)
+        abs_target = ws_root / norm_rel
         print(f"Applying Foreman self-repair to {ws_root.name}/{physical_path} ({repair.action})")
         try:
             before_content = ""
@@ -1113,6 +1270,12 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
                     content=repair.content,
                 )
 
+            if not _is_valid_workspace_file(abs_target):
+                abs_target.write_text(before_content, encoding="utf-8")
+                raise ValueError(
+                    f"Foreman patch introduced invalid syntax in {norm_rel}; reverted to previous content."
+                )
+
             after_content = read_file.func(path=physical_path).get("content", "")
             if before_content.strip() == after_content.strip():
                 print(
@@ -1135,7 +1298,7 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
     summary_text = (
         f"Foreman direct repair: {', '.join(review.repair_instructions or ['self-repaired'])}"
         if repaired_files
-        else f"Foreman self-repair produced no file changes on {unchanged_files or ['workspace']}"
+        else f"Foreman self-repair produced no valid changes on {unchanged_files or [r.path for r in review.direct_repairs]}"
     )
     repair_task_result = TaskResult(
         task_id=repair_id,
@@ -1173,7 +1336,15 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
 
 
 def foreman_corrective_node(state: WorkflowState) -> dict:
-    """Foreman rolls back corrupted files (if requested) and creates a corrective TaskBatch."""
+    """
+    Foreman rolls back corrupted files and creates a surgical corrective TaskBatch:
+    - Strictly filters out tasks targeting files that already passed validation so
+      working files (like `config/dam_profile.json` or `data/telemetry.csv`) are NEVER
+      re-edited and broken during a rebuild of another file.
+    - Resets any syntax-corrupted target file on disk before Aider runs so Aider never
+      stalls with `no_change` on malformed file content.
+    """
+    from .checkpoint import _is_valid_workspace_file
     from .tools import write_file
 
     ws_root = get_workspace_root()
@@ -1202,8 +1373,51 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         ledger_context=ledger_ctx,
     )
 
+    # Strictly filter corrective tasks so already-passing tasks/files are NEVER re-run
+    if validation and validation.failed_task_ids:
+        failed_ids = set(validation.failed_task_ids)
+        orig_tasks_by_id = {t.task_id: t for t in batch.tasks}
+        failed_files = {
+            _normalize_workspace_path(rf)
+            for fid in failed_ids
+            if fid in orig_tasks_by_id
+            for rf in orig_tasks_by_id[fid].relevant_files
+        }
+        filtered_corr_tasks = [
+            ct for ct in corrective_batch.tasks
+            if ct.task_id in failed_ids
+            or any(_normalize_workspace_path(rf) in failed_files for rf in ct.relevant_files)
+        ]
+        if filtered_corr_tasks:
+            corrective_batch.tasks = filtered_corr_tasks
+        else:
+            # Fallback: copy the exact failed Task definitions from the effective batch
+            corrective_batch.tasks = [
+                orig_tasks_by_id[fid].model_copy(deep=True)
+                for fid in validation.failed_task_ids
+                if fid in orig_tasks_by_id
+            ]
+        corrective_batch.relevant_files = sorted(
+            {
+                _normalize_workspace_path(rf)
+                for ct in corrective_batch.tasks
+                for rf in ct.relevant_files
+            }
+        )
+        corrective_batch.execution_order = [ct.task_id for ct in corrective_batch.tasks]
+
+    # If any file targeted by the corrective batch is currently syntax-corrupted on disk,
+    # reset it to its pre-batch snapshot (or empty string) so Aider can edit it cleanly.
+    for rel_f in corrective_batch.relevant_files:
+        norm_f = _normalize_workspace_path(rel_f)
+        abs_f = ws_root / norm_f
+        if abs_f.is_file() and not _is_valid_workspace_file(abs_f):
+            fallback_src = snapshots.get(norm_f, "")
+            abs_f.write_text(fallback_src, encoding="utf-8")
+            print(f"[RECOVERY] Cleared corrupted syntax in {ws_root.name}/{norm_f} before Worker rebuild")
+
     corrective_batch, updated_snapshots = _prepare_batch_and_workspace(
-        corrective_batch, snapshots
+        corrective_batch, snapshots, plan=None
     )
 
     rebuild_ids = {t.task_id for t in corrective_batch.tasks}
@@ -1218,7 +1432,7 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         action="corrective_batch",
         target=corrective_batch.batch_id,
         status="warning",
-        detail=f"Created corrective batch with tasks: {', '.join(t.task_id for t in corrective_batch.tasks)}",
+        detail=f"Created surgical corrective batch for failed task(s): {', '.join(t.task_id for t in corrective_batch.tasks)}",
     )
 
     return _persist_node_state(
@@ -1241,13 +1455,41 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
 
 def planner_review_node(state: WorkflowState) -> dict:
     """Planner performs the final evaluation against the initial blueprint."""
-    planner = build_planner()
+    validation = state.get("validation_result")
     plan = state["plan"]
+
+    if validation is not None and not validation.passed:
+        print("\n=== PLANNER FINAL ACCEPTANCE REVIEW (FAST-REJECT: VALIDATION FAILED) ===")
+        review = PlannerReview(
+            criteria_evaluation=[f"FAIL: {err}" for err in validation.errors[:5]],
+            feedback=list(validation.errors[:5]),
+            summary=f"Cycle rejected deterministically because {len(validation.errors)} validation error(s) remain.",
+            accepted=False,
+        )
+        print(review.model_dump_json(indent=2))
+        updated_ledger = record_ledger_entry(
+            state["ledger"],
+            cycle_id=state["cycle_id"],
+            layer="planner",
+            action="final_review",
+            target="project",
+            status="failure",
+            detail=review.summary,
+        )
+        return _persist_node_state(
+            state,
+            {
+                "planner_review": review,
+                "ledger": updated_ledger,
+                "phase": "planner_revision_needed",
+            },
+        )
+
+    planner = build_planner()
     repository_context = _gather_full_repository_context()
     ledger_ctx = format_ledger_for_prompt(state["ledger"], state["previous_cycle"])
 
     print("\n=== PLANNER FINAL ACCEPTANCE REVIEW ===")
-    validation = state.get("validation_result")
     foreman_rev = state.get("foreman_review")
     try:
         review = planner.review(
@@ -1302,8 +1544,9 @@ def planner_review_node(state: WorkflowState) -> dict:
 
 def _count_consecutive_identical_validator_failures(state: WorkflowState) -> int:
     """
-    Count how many consecutive times the Validator has produced the exact same
-    failure detail in the current cycle's ledger.
+    Count how many times the current validation error signature (or any individual
+    failed task/error in `validation_result`) has repeated across validation runs in
+    this cycle — catching both consecutive repeats (`A -> A`) and oscillations (`A -> B -> A`).
     """
     validator_entries = [
         e for e in state.get("ledger", [])
@@ -1313,13 +1556,23 @@ def _count_consecutive_identical_validator_failures(state: WorkflowState) -> int
         return 0
 
     latest_detail = validator_entries[-1].detail
-    consecutive = 0
-    for entry in reversed(validator_entries):
-        if entry.status == "failure" and entry.detail == latest_detail:
-            consecutive += 1
-        else:
-            break
-    return consecutive
+    exact_matches = sum(
+        1 for e in validator_entries if e.status == "failure" and e.detail == latest_detail
+    )
+
+    # Also check if the primary error message (first error in validation.errors) has
+    # appeared in previous validator ledger entries even when secondary errors toggled.
+    validation = state.get("validation_result")
+    primary_err_matches = 0
+    if validation and validation.errors:
+        first_err_prefix = validation.errors[0].splitlines()[0][:80]
+        if first_err_prefix:
+            primary_err_matches = sum(
+                1 for e in validator_entries
+                if e.status == "failure" and first_err_prefix in e.detail
+            )
+
+    return max(exact_matches, primary_err_matches)
 
 
 def route_from_entry(state: WorkflowState) -> str:
@@ -1680,21 +1933,59 @@ def run_project(
     return history
 
 
+def _extract_stage_spec_sections(full_project_goal: str, target_files: list[str]) -> str:
+    """
+    Extract only the numbered specification sections from `full_project_goal` that
+    correspond to `target_files`, preventing Foreman from seeing and scheduling
+    future stages' files during an earlier stage.
+    """
+    if not full_project_goal.strip() or not target_files:
+        return full_project_goal.strip()
+
+    norm_targets = {_normalize_workspace_path(tf) for tf in target_files if tf.strip()}
+    # Split on numbered top-level sections like `1. config/...`
+    blocks = re.split(r"(?=^\s*\d+\.\s+)", full_project_goal.strip(), flags=re.MULTILINE)
+    if len(blocks) <= 2:
+        return full_project_goal.strip()
+
+    matched_blocks: list[str] = []
+    for blk in blocks:
+        blk_stripped = blk.strip()
+        if not blk_stripped:
+            continue
+        if any(tf in blk_stripped or Path(tf).name in blk_stripped for tf in norm_targets):
+            matched_blocks.append(blk_stripped)
+
+    return "\n\n".join(matched_blocks) if matched_blocks else full_project_goal.strip()
+
+
 def _format_stage_goal(
     stage: StageGoal,
     total_stages: int,
+    full_project_goal: str = "",
 ) -> str:
-    """Construct a clean, non-duplicated stage prompt for Planner, Foreman, and Worker."""
+    """
+    Construct a stage prompt scoped strictly to `stage.target_files` while
+    preserving the exact JSON keys, CSV rows, class/method signatures, and formulas
+    for those files from `full_project_goal`.
+    """
     target_files_text = (
         ", ".join(f"`{f}`" for f in stage.target_files)
         if stage.target_files
         else "as specified below"
     )
-    return (
+    scoped_spec = _extract_stage_spec_sections(full_project_goal, stage.target_files)
+    base = (
         f"Build Stage {stage.stage_id} of {total_stages} ({stage.title}).\n"
-        f"Target Files for Stage {stage.stage_id}: {target_files_text}\n\n"
-        f"{stage.objective.strip()}"
+        f"STRICT STAGE SCOPE: Create/modify ONLY {target_files_text}. Do NOT create or reference files from future stages.\n\n"
+        f"Stage {stage.stage_id} Summary:\n{stage.objective.strip()}"
     )
+    if scoped_spec and scoped_spec not in stage.objective:
+        base += (
+            f"\n\nExact Specification for Stage {stage.stage_id} Files ({target_files_text}):\n"
+            f"{scoped_spec}"
+        )
+    return base
 
 
 def run_staged_project(
@@ -1757,7 +2048,7 @@ def run_staged_project(
         print(f"### STAGE {stage.stage_id}/{total_stages}: {stage.title} ({ws_root}) ###")
         print(f"############################################################")
 
-        stage_goal_text = _format_stage_goal(stage, total_stages)
+        stage_goal_text = _format_stage_goal(stage, total_stages, goal)
         stage_previous_cycle: CycleResult | None = None
         stage_succeeded = False
 

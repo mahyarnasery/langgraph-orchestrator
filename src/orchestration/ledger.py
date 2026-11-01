@@ -62,7 +62,7 @@ def format_ledger_for_prompt(
         return "\n".join(lines)
 
     lines.append("=== CURRENT CYCLE EXECUTION LEDGER ===")
-    for e in entries:
+    for e in entries[-12:]:
         lines.append(
             f"  {e.step}. [{e.status.upper()}] {e.layer}/{e.action} -> {e.target}: {e.detail}"
         )

@@ -14,7 +14,7 @@ from src.orchestration.ledger import (
     upsert_staged_snippet,
 )
 from src.orchestration.models import get_worker_model
-from src.orchestration.schemas import Task, TaskBatch, TaskResult
+from src.orchestration.schemas import Plan, Task, TaskBatch, TaskResult
 from src.orchestration.workspace import (
     DEFAULT_WORKSPACE_ROOT,
     REPO_ROOT,
@@ -111,6 +111,7 @@ class AiderHarness(CodingHarness):
         verified_task_results: dict[str, TaskResult] | None = None,
         on_task_complete: Callable[[Task, TaskResult, dict[str, dict[str, str]]], None] | None = None,
         stop_after_tasks: int | None = None,
+        plan: Plan | None = None,
     ) -> list[TaskResult]:
         if not batch.tasks:
             raise ValueError("TaskBatch must contain at least one task.")
@@ -265,6 +266,7 @@ class AiderHarness(CodingHarness):
                     use_staging=use_staging,
                     sibling_signatures=completed_sibling_sigs.get(primary_target, []),
                     project_goal=project_goal,
+                    plan=plan,
                 )
 
                 ext_read_paths = (
@@ -449,6 +451,7 @@ class AiderHarness(CodingHarness):
         use_staging: bool,
         sibling_signatures: list[str],
         project_goal: str = "",
+        plan: Plan | None = None,
     ) -> str:
         is_python = logical_target.endswith(".py")
         target_import_name = _module_import_name(logical_target) if is_python else ""
@@ -496,7 +499,6 @@ class AiderHarness(CodingHarness):
                     [
                         f"## Class Method Staging Mode (`{cls_name}.{method_name}`):",
                         f"  - Write `class {cls_name}:` containing ONLY the `{method_name}` method into `{editable_files[0]}`.",
-                        f"  - IMPORTANT: Use the exact filename `{editable_files[0]}` as the file header in your response (do NOT use `{logical_target}` as the filename header).",
                         f"  - Do NOT write `pass` stubs for other methods of `{cls_name}` — the Foreman will automatically merge all staged methods into `class {cls_name}:` in `{logical_target}`.",
                         f"  - Do NOT write `from {target_import_name} import ...` or `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
                         "  - If your method uses classes/functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <package.module> import ...` at the top of your snippet.",
@@ -509,13 +511,27 @@ class AiderHarness(CodingHarness):
                         "## Staging & Assembly Mode:",
                         f"  - Write ONLY the code required for Task {task.task_id} "
                         f"({task.target_symbol or task.objective}) into `{editable_files[0]}`.",
-                        f"  - IMPORTANT: Use the exact filename `{editable_files[0]}` as the file header in your response (do NOT use `{logical_target}` as the filename header).",
                         f"  - The Foreman will assemble `{editable_files[0]}` into `{logical_target}`.",
                         f"  - Do NOT write `from {target_import_name} import ...` or `from {Path(logical_target).stem} import ...` because your code will be placed directly inside `{logical_target}`.",
                         "  - If your function calls functions from ANOTHER module (listed in Read-Only Reference Files), include the required `from <package.module> import ...` at the top of your snippet.",
                         "",
                     ]
                 )
+
+        if plan is not None and getattr(plan, "file_blueprints", None):
+            for fb in plan.file_blueprints:
+                if _normalize_rel_path(fb.path) == logical_target:
+                    lines.append(f"## Planner Architectural Blueprint for `{logical_target}`:")
+                    lines.append(f"  - Role: {fb.role}")
+                    if fb.required_imports:
+                        lines.append(f"  - Required Imports: {', '.join(fb.required_imports)}")
+                    if fb.symbols:
+                        lines.append("  - Planned Module Symbols:")
+                        for sym in fb.symbols:
+                            marker = " (CURRENT TASK)" if sym.target_symbol == task.target_symbol else ""
+                            lines.append(f"    * `{sym.target_symbol}`{marker}: `{sym.signature}` -> {sym.contract}")
+                    lines.append("")
+                    break
 
         if sibling_signatures:
             lines.append(

@@ -46,7 +46,11 @@ Worker profile:
 Planner plan:
 {plan.model_dump_json(indent=2)}
 
-Task Atomization, Non-Python Assets, Class Method Staging & Verification Rules (CRITICAL):
+Blueprint-Driven Task Dispatch & Verification Rules (CRITICAL):
+0. Follow the Planner's `file_blueprints`:
+   - The Planner has already designed the exact files (`path`), imports (`required_imports`), and functions/methods (`symbols`) in `plan.file_blueprints`.
+   - Translate each `SymbolSpec` in `plan.file_blueprints` directly into an atomic `Task` with the exact `target_symbol` from `SymbolSpec.target_symbol` and `relevant_files: [file_blueprint.path]`.
+   - For files in `plan.file_blueprints` where `symbols` is empty (such as `.json`, `.csv`, or `main.py`), create a SINGLE `Task` for that file with `target_symbol: null`.
 1. Pre-Creation & Package `__init__.py` Files:
    - The orchestration layer automatically pre-creates empty files AND automatically creates `__init__.py` in Python package subdirectories.
    - NEVER create a task just to create an empty file or an empty `__init__.py`.
@@ -72,6 +76,7 @@ Task Atomization, Non-Python Assets, Class Method Staging & Verification Rules (
 8. Preserve exact formulas, f-strings, and return expressions from the Project goal in each task's `acceptance_criteria`.
 9. Deterministic Unit Assertions (`test_assertions`):
    - For every Python task that implements a function or class method, populate `task.test_assertions` with 1 to 2 executable Python `assert` statements using CONCRETE literal inputs and expected outputs.
+   - For class methods, ALWAYS instantiate the class first (e.g. `obj = ClassName(...); assert obj.method(...) == expected`). NEVER call `ClassName.__init__(...)` or unbound `ClassName.method(...)` directly on the class!
    - For pure entry-point scripts (`main.py`, `app.py`) and non-Python files (`.json`, `.csv`, `.toml`, etc.), leave `task.test_assertions` empty (`[]`).
 10. Populate `execution_order` with all `task_id`s in dependency order, and leave `verification_command` as null unless running a dedicated pytest suite without shell pipes.
 
@@ -250,7 +255,7 @@ Foreman direct self-repair attempts used: {foreman_repair_attempts} / {max_forem
 
 Determine the smallest appropriate next action:
 - "accept": Implementation satisfies the Planner's acceptance criteria and passes all deterministic validation checks and unit assertions.
-- "repair": Implementation is close and has a localized issue you (Foreman) can fix directly via `direct_repairs` (prefer `action="overwrite"` with full file content).
+- "repair": Implementation is close and has a localized issue you (Foreman) can fix directly via `direct_repairs` (prefer `action="overwrite"` with raw valid Python/JSON file content — NEVER wrap `content` in ``` markdown code fences!).
 - "rebuild": One or more specific Worker tasks (such as those in `validation_result.failed_task_ids`) need to be sent back to the Worker.
 
 

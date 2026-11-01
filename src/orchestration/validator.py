@@ -698,9 +698,75 @@ def _check_target_symbols(
 
 class _UnwrapPrintInAssertTransformer(ast.NodeTransformer):
     """
-    If an LLM writes `assert print(expr) == expected`, unwrap `print(expr)` to `expr`
-    because `print(...)` returns `None` in Python while the LLM intended to compare `expr`.
+    Normalize common LLM assertion anti-patterns in AST:
+    1. Unwrap `assert print(expr) == expected` -> `assert expr == expected`.
+    2. Rewrite unbound `ClassName.__init__(arg1, arg2, ...)` -> `ClassName(arg1, arg2, ...)`
+       so constructor assertions instantiate the class instead of calling unbound `__init__`.
+    3. Rewrite `ClassName.method(ClassName(...), arg1, ...)` -> `ClassName(...).method(arg1, ...)`.
     """
+
+    def __init__(self, known_ctor_calls: dict[str, ast.Call] | None = None):
+        super().__init__()
+        self.known_ctor_calls: dict[str, ast.Call] = (
+            dict(known_ctor_calls) if known_ctor_calls else {}
+        )
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+
+        # Record direct constructor calls `ClassName(arg1, ...)` where ClassName starts with uppercase
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id[:1].isupper()
+            and node.func.id not in ("Path", "True", "False", "None")
+        ):
+            self.known_ctor_calls[node.func.id] = node
+            return node
+
+        # Check `ClassName.<method>(...)`
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id[:1].isupper()
+        ):
+            cls_name = node.func.value.id
+            method_name = node.func.attr
+
+            # Case A: `ClassName.__init__(a, b, c)` -> `ClassName(a, b, c)`
+            if method_name == "__init__":
+                ctor_call = ast.Call(
+                    func=ast.Name(id=cls_name, ctx=ast.Load()),
+                    args=node.args,
+                    keywords=node.keywords,
+                )
+                self.known_ctor_calls[cls_name] = ctor_call
+                return ctor_call
+
+            # Case B: `ClassName.method(ClassName(...), ...)` -> already passes instance as 1st arg
+            if (
+                node.args
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Name)
+                and node.args[0].func.id == cls_name
+            ):
+                self.known_ctor_calls[cls_name] = node.args[0]
+                return node
+
+            # Case C: Unbound `ClassName.method(arg1, ...)` when we have a known constructor call
+            if cls_name in self.known_ctor_calls:
+                import copy
+                instance_call = copy.deepcopy(self.known_ctor_calls[cls_name])
+                return ast.Call(
+                    func=ast.Attribute(
+                        value=instance_call,
+                        attr=method_name,
+                        ctx=ast.Load(),
+                    ),
+                    args=node.args,
+                    keywords=node.keywords,
+                )
+
+        return node
 
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
         self.generic_visit(node)
@@ -714,7 +780,10 @@ class _UnwrapPrintInAssertTransformer(ast.NodeTransformer):
         return node
 
 
-def _normalize_assertion_code(raw: str) -> str | None:
+def _normalize_assertion_code(
+    raw: str,
+    known_ctor_calls: dict[str, ast.Call] | None = None,
+) -> str | None:
     """
     Normalize a raw assertion string into valid executable Python code containing
     at least one `assert` statement, or return None if it is non-code prose.
@@ -770,7 +839,10 @@ def _normalize_assertion_code(raw: str) -> str | None:
     if not has_assert:
         return None
 
-    tree = _UnwrapPrintInAssertTransformer().visit(tree)
+    transformer = _UnwrapPrintInAssertTransformer(known_ctor_calls)
+    tree = transformer.visit(tree)
+    if known_ctor_calls is not None:
+        known_ctor_calls.update(transformer.known_ctor_calls)
     ast.fix_missing_locations(tree)
     return "; ".join(ast.unparse(stmt) for stmt in tree.body)
 
@@ -783,6 +855,7 @@ def _prepare_assertion_list(raw_assertions: Iterable[str]) -> list[str]:
     """
     pending_setup: list[str] = []
     normalized_list: list[str] = []
+    known_ctor_calls: dict[str, ast.Call] = {}
 
     for raw in raw_assertions:
         cleaned = raw.strip().strip("`").strip()
@@ -805,7 +878,7 @@ def _prepare_assertion_list(raw_assertions: Iterable[str]) -> list[str]:
             continue
 
         combined = "; ".join([*pending_setup, cleaned]) if pending_setup else cleaned
-        norm = _normalize_assertion_code(combined)
+        norm = _normalize_assertion_code(combined, known_ctor_calls=known_ctor_calls)
         if norm and norm not in normalized_list:
             normalized_list.append(norm)
             pending_setup.clear()
@@ -1098,6 +1171,37 @@ def emit_pytest_suite(
                     fn_lines.append(f"    {sub_stmt.strip()}")
             test_blocks.append("\n".join(fn_lines))
 
+    # Also harvest top-level assertions from entry scripts (main.py / app.py)
+    for rel_py in py_files:
+        p = Path(rel_py)
+        if p.name not in ("main.py", "app.py"):
+            continue
+        try:
+            entry_src = _absolute(rel_py).read_text(encoding="utf-8")
+            entry_tree = ast.parse(entry_src)
+        except Exception:
+            continue
+        has_entry_assert = any(isinstance(n, ast.Assert) for n in entry_tree.body)
+        if not has_entry_assert:
+            continue
+        entry_stmts: list[str] = []
+        for node in entry_tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign, ast.Assert)):
+                entry_stmts.append(ast.unparse(node))
+        combined_entry = "; ".join(entry_stmts)
+        if combined_entry and combined_entry not in seen_assertions:
+            outcomes = _run_assertions_in_workspace(
+                target_files=py_files,
+                target_symbol=None,
+                assertions=[combined_entry],
+                execution_outputs={},
+            )
+            if outcomes and outcomes[0].get("status") == "passed":
+                fn_lines = [f"def test_entry_{p.stem}() -> None:"]
+                for stmt in entry_stmts:
+                    fn_lines.append(f"    {stmt}")
+                test_blocks.append("\n".join(fn_lines))
+
     if not test_blocks:
         return None
 
@@ -1329,10 +1433,20 @@ def _criterion_satisfied_by_file(
             for pattern in expected_patterns
         )
 
-    code_keywords = ("print", "def ", "class ", "import ", "return")
-    matched_keywords = [kw for kw in code_keywords if kw in criterion_lower]
-    if matched_keywords:
-        return all(kw.strip() in content_lower for kw in matched_keywords)
+    # Only check structural keywords when they appear as standalone code tokens,
+    # never matching 'return' inside English words like 'returned' or 'returns'.
+    structural_checks = [
+        (r"\bdef\s+", "def "),
+        (r"\bclass\s+", "class "),
+        (r"\bimport\s+", "import "),
+        (r"\bprint\s*\(", "print("),
+    ]
+    matched_tokens = [
+        token for regex_pat, token in structural_checks
+        if re.search(regex_pat, criterion_lower)
+    ]
+    if matched_tokens:
+        return all(token.strip() in content_lower for token in matched_tokens)
 
     return True
 

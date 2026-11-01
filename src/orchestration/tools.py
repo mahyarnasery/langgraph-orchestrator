@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 from langchain_core.tools import tool
 
@@ -11,12 +12,6 @@ from .workspace import (
 
 
 def _resolve_read_path(path: str) -> Path:
-    """
-    Resolve a file path for reading, enforcing the active AccessMode:
-    - Mode 1 ('sandbox_only'): Must be inside `sandbox/`.
-    - Mode 2 ('read_external', Default) & Mode 3 ('allow_external'): Can read inside `sandbox/`
-      or an external path outside `sandbox/`.
-    """
     workspace_root = get_workspace_root()
     candidate = Path(path).expanduser()
 
@@ -34,11 +29,6 @@ def _resolve_read_path(path: str) -> Path:
 
 
 def _safe_write_path(path: str) -> Path:
-    """
-    Resolve a path for creating/modifying a file and enforce both workspace
-    containment and the active AccessMode (Mode 1/2: strictly `sandbox/` only;
-    Mode 3: prompts for confirmation if outside `sandbox/`).
-    """
     workspace_root = get_workspace_root()
     candidate = Path(path)
 
@@ -57,11 +47,41 @@ def _safe_write_path(path: str) -> Path:
     return resolved
 
 
-def _ensure_trailing_newline(content: str) -> str:
-    """Ensure non-empty file content ends with a newline to prevent line concatenation."""
-    if content and not content.endswith("\n"):
-        return content + "\n"
-    return content
+def sanitize_file_content(path: str, content: str) -> str:
+    """
+    Strip accidental outer Markdown code fences (```python ... ``` or ~~~json ... ~~~)
+    and stray terminal progress bars when writing code, config, or data files.
+    """
+    if not content:
+        return ""
+
+    suffix = Path(path).suffix.lower()
+    if suffix == ".md":
+        return content if content.endswith("\n") else content + "\n"
+
+    cleaned = content.strip()
+    fence_match = re.match(
+        r"^(?:```|~~~)[a-zA-Z0-9_-]*\s*\n(.*?)\n?(?:```|~~~)\s*$",
+        cleaned,
+        re.DOTALL,
+    )
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    else:
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith(("```", "~~~")):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith(("```", "~~~")):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    # Remove accidental terminal progress-bar lines (e.g. '11 / 11 lines [████] 100%')
+    filtered_lines = [
+        ln for ln in cleaned.splitlines()
+        if not re.search(r"\d+\s*/\s*\d+\s+lines\s+\[", ln)
+    ]
+    cleaned = "\n".join(filtered_lines).strip()
+    return (cleaned + "\n") if cleaned else ""
 
 
 @tool
@@ -88,7 +108,7 @@ def create_file(path: str, content: str = "") -> dict:
         raise FileExistsError(f"File already exists: {path}")
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(_ensure_trailing_newline(content), encoding="utf-8")
+    file_path.write_text(sanitize_file_content(path, content), encoding="utf-8")
     return {"path": path, "status": "created"}
 
 
@@ -97,7 +117,7 @@ def write_file(path: str, content: str) -> dict:
     """Overwrite or write content to a file within the workspace."""
     file_path = _safe_write_path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(_ensure_trailing_newline(content), encoding="utf-8")
+    file_path.write_text(sanitize_file_content(path, content), encoding="utf-8")
     return {"path": path, "status": "written"}
 
 
@@ -113,5 +133,5 @@ def edit_file(path: str, old_text: str, new_text: str) -> dict:
         raise ValueError(f"Target text not found in {path}")
 
     updated_content = current_content.replace(old_text, new_text, 1)
-    file_path.write_text(_ensure_trailing_newline(updated_content), encoding="utf-8")
+    file_path.write_text(sanitize_file_content(path, updated_content), encoding="utf-8")
     return {"path": path, "status": "edited"}

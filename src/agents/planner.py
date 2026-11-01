@@ -39,10 +39,10 @@ class PlannerAgent:
     ) -> MultiStageBlueprint:
         """
         Decompose a larger project specification into sequential architectural stages
-        (e.g. Stage 1: Config/data & core models -> Stage 2: Service layer & entry point).
+        (e.g. Stage 1: Config/data & core domain models -> Stage 2: Service layer & entry point).
         """
         prompt = f"""
-You are the Planner / Architect decomposing a project into at most {max_stages} sequential build stages.
+You are the Lead Software Architect decomposing a project into at most {max_stages} sequential build stages.
 
 Project goal:
 {project_goal}
@@ -51,9 +51,9 @@ Architecture context:
 {architecture_context}
 
 Decomposition Rules (CRITICAL):
-1. Order stages from foundational config/data files (`.json`, `.csv`, `.toml`) and core models/utilities up to higher-level services and entry-point scripts (`main.py` / `app.py`).
-2. Group tightly coupled entry scripts (`main.py`) with the final service/application stage so every stage produces valid, testable files.
-3. Preserve EXACT file paths, JSON/CSV keys, class names, method/function signatures, formulas, and expected print/return strings from the Project goal inside each stage's `objective`.
+1. Order stages from foundational config/data files (`.json`, `.csv`, `.toml`) and core domain models/classes up to higher-level services and entry-point scripts (`main.py` / `app.py`).
+2. Populate `target_files` for each stage with the exact relative file paths belonging to that stage (e.g. `["config/dam_profile.json", "data/telemetry.csv", "domain/models.py", "domain/controller.py"]`).
+3. In each stage's `objective`, preserve the EXACT file names, JSON keys/values, CSV headers/rows, class names, method/function signatures, and formulas from the Project goal for that stage's files! NEVER replace exact specifications with a vague summary.
 4. Do NOT invent extra files or stages not requested in the Project goal.
 
 
@@ -111,14 +111,25 @@ Return only the structured MultiStageBlueprint.
         worker_profile_text = worker_profile.model_dump_json(indent=2)
 
         prompt = f"""
-You are the Planner / Architect.
+You are the Lead Software Architect / Planner.
 
-Responsibilities:
-- Analyze the project goal.
-- Define the high-level implementation approach.
-- Identify affected repository areas (including both Python `.py` modules and any non-Python config/data files such as `.json`, `.csv`, `.toml`, `.sql`, `.md`).
-- Define clear acceptance criteria.
-- Do not implement code.
+Your job is to design the complete architectural blueprint (`Plan`) for the active stage/goal so the Foreman can deterministically dispatch atomic tasks without guessing file paths, imports, or function/method signatures.
+
+Architectural Responsibilities (CRITICAL):
+1. Analyze the active stage/project goal and existing workspace repository map.
+2. Populate `affected_areas` with ONLY the relative file paths to be created or modified in this stage.
+3. Populate `file_blueprints` with one `FileBlueprint` for each target file in this stage:
+   - Set `path` to the exact relative file path (e.g. `"config/dam_profile.json"`, `"domain/models.py"`, `"domain/controller.py"`).
+   - For non-Python config/data assets (`.json`, `.csv`, `.toml`, etc.): copy the EXACT required JSON keys/values or CSV header/rows into `role`, and leave `required_imports` and `symbols` empty (`[]`).
+   - For Python library/model/service modules (`.py`):
+     * Keep `role` to a brief 1-sentence summary (NEVER write full Python class/function source code inside `role`!).
+     * Populate `required_imports` with the exact import lines needed by the file.
+     * Populate `symbols` with one `SymbolSpec` for EVERY standalone function or class method in that file:
+       - If the file defines standalone functions, set `target_symbol` to the function name (e.g. `"load_dam_profile"`).
+       - If the file defines a class with 2 or more methods, list EACH method as a separate `SymbolSpec` with `target_symbol` set to `"ClassName.method_name"` (e.g. `"TelemetryRecord.__init__"`, `"TelemetryRecord.is_valid"`, `"TelemetryRecord.net_delta"`), starting with `ClassName.__init__`.
+       - Preserve exact parameter names, type hints, formulas, and return strings from the Project Specification in `signature` and `contract`.
+   - For simple entry-point scripts (`main.py` / `app.py`) that only import, assert, and print: describe the exact steps in `role` and `required_imports`, and leave `symbols` empty (`[]`).
+4. Define clear `acceptance_criteria` preserving the exact JSON keys, CSV headers, class/method names, and expected outputs from the Project Specification. NEVER invent substitute keys, columns, or method names.
 
 Project goal:
 {project_goal}
@@ -172,8 +183,9 @@ You are the Planner / Architect conducting the final acceptance review AFTER the
 Project goal:
 {project_goal}
 
-Initial architectural blueprint & acceptance criteria:
-{plan.model_dump_json(indent=2)}
+Initial architectural objective: {plan.objective}
+Acceptance criteria:
+{chr(10).join(f'- {c}' for c in plan.acceptance_criteria)}
 
 Execution Ledger (steps taken & verified in this cycle):
 {ledger_context}

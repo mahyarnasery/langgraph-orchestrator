@@ -58,19 +58,67 @@ class MultiStageBlueprint(BaseModel):
     )
 
 
+class SymbolSpec(BaseModel):
+    """Architectural contract for a single function or Class.method designed by the Planner."""
+
+    target_symbol: str = Field(
+        description=(
+            "Exact function name (e.g. 'load_dam_profile') or Class.method name "
+            "(e.g. 'TelemetryRecord.__init__', 'TelemetryRecord.is_valid')."
+        )
+    )
+    signature: str = Field(
+        description="Exact Python def signature (e.g. 'def is_valid(self) -> bool:')."
+    )
+    contract: str = Field(
+        description="Exact behavior, formula, or return expression required for this symbol."
+    )
+
+
+class FileBlueprint(BaseModel):
+    """Per-file architectural blueprint produced by the Planner."""
+
+    path: str = Field(
+        description="Relative workspace file path (e.g. 'config/dam_profile.json', 'domain/models.py', 'main.py')."
+    )
+    role: str = Field(
+        description="Concise description of this file's purpose or exact data/config content."
+    )
+    required_imports: list[str] = Field(
+        default_factory=list,
+        description="Exact import lines required at the top of this Python file (empty for non-Python files)."
+    )
+    symbols: list[SymbolSpec] = Field(
+        default_factory=list,
+        description=(
+            "Every standalone function or Class.method to implement in this file. "
+            "For a class with 2+ methods, list each method separately as 'ClassName.method_name'. "
+            "Leave empty for non-Python assets (.json, .csv) or simple top-level entry scripts (main.py)."
+        ),
+    )
+
+
 class Plan(BaseModel):
-    """High-level architectural plan produced by the Planner."""
+    """Architectural blueprint produced by the Planner."""
 
     objective: str = Field(
         description="What the implementation should accomplish."
     )
 
     approach: str = Field(
-        description="High-level implementation approach."
+        description="High-level implementation approach and dependency flow."
     )
 
     affected_areas: list[str] = Field(
-        description="Repository files, modules, or components likely to be affected."
+        description="Repository files, modules, or components to be created or modified."
+    )
+
+    file_blueprints: list[FileBlueprint] = Field(
+        default_factory=list,
+        description=(
+            "Detailed per-file architectural blueprints defining exact paths, imports, "
+            "and function/method specifications (SymbolSpec) for the Foreman to dispatch."
+        ),
     )
 
     acceptance_criteria: list[str] = Field(
