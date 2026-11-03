@@ -125,14 +125,17 @@ class _ResilientStructuredRunner:
                     or "ggml_sched_max_split_inputs" in msg
                     or "llama-server process has terminated" in msg
                 )
-                if is_ggml_split_err:
-                    use_cpu_fallback = True
+                if is_ggml_split_err or "status code: 500" in msg:
+                    # Retry on GPU on Attempt 2 after stopping and letting VRAM clear;
+                    # only fall back to slow CPU (num_gpu=0) on Attempt 3 (attempt >= 2).
+                    use_cpu_fallback = (attempt >= 2)
                     subprocess.run(
                         ["ollama", "stop", self._model_name],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         check=False,
                     )
+                    time.sleep(1.0)
 
                 retryable = (
                     is_ggml_split_err
@@ -190,4 +193,5 @@ def model_session(model_name: str) -> Iterator[_ResilientChatOllama]:
             stderr=subprocess.DEVNULL,
             check=False,
         )
+        time.sleep(0.6)
         print(f"=== Finished model: {model_name} ===")

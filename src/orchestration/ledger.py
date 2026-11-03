@@ -98,8 +98,8 @@ def _is_stub_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
 def extract_python_signatures(source: str) -> list[str]:
     """
-    Extract compact function and class signatures (including `self.<attr>` attributes
-    and full method parameter lists) from a Python source string.
+    Extract compact function and class signatures (including `self.<attr>` attributes,
+    parameter defaults, and return annotations) from a Python source string.
     """
     if not source.strip():
         return []
@@ -111,8 +111,9 @@ def extract_python_signatures(source: str) -> list[str]:
     sigs: list[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            args = [a.arg for a in node.args.args]
-            sigs.append(f"def {node.name}({', '.join(args)})")
+            args_str = ast.unparse(node.args)
+            ret_str = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+            sigs.append(f"def {node.name}({args_str}){ret_str}")
         elif isinstance(node, ast.ClassDef):
             attrs: list[str] = []
             methods: list[str] = []
@@ -120,8 +121,9 @@ def extract_python_signatures(source: str) -> list[str]:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if _is_stub_function(sub) and len(node.body) > 1:
                         continue
-                    m_args = [a.arg for a in sub.args.args]
-                    methods.append(f"{sub.name}({', '.join(m_args)})")
+                    m_args = ast.unparse(sub.args)
+                    m_ret = f" -> {ast.unparse(sub.returns)}" if sub.returns else ""
+                    methods.append(f"{sub.name}({m_args}){m_ret}")
                     for stmt in ast.walk(sub):
                         if isinstance(stmt, ast.Assign):
                             for t in stmt.targets:
@@ -537,3 +539,127 @@ def upsert_staged_snippet(
 
     updated[task_id] = normalized_snippet
     return updated
+
+
+def ensure_workspace_imports(
+    source: str,
+    target_filename: str,
+    workspace_root: Path,
+) -> str:
+    """
+    Deterministically resolve cross-package symbol references in `source`:
+    1. If `source` writes `pkg.mod.Symbol` (e.g. `domain.models.TelemetryRecord`),
+       simplify to `Symbol` and ensure `from pkg.mod import Symbol` is present.
+    2. If `source` references a class/function `Symbol` defined in another workspace
+       `.py` module without importing it, automatically prepend `from <pkg.mod> import Symbol`.
+    """
+    if not source.strip() or not target_filename.endswith(".py"):
+        return source
+
+    # Normalize accidental `../<dir>/` paths written when a model thought it was inside a subfolder
+    if workspace_root.exists():
+        for child in workspace_root.iterdir():
+            if child.is_dir() and not child.name.startswith("."):
+                source = source.replace(f"../{child.name}/", f"{child.name}/")
+
+    # If target is main.py or app.py and defines `def main():` without calling `main()` at top-level,
+    # append the standard entry-point runner so executing `python main.py` runs `main()`.
+    if Path(target_filename).name in ("main.py", "app.py"):
+        try:
+            entry_tree = ast.parse(source)
+            has_main_def = any(
+                isinstance(n, ast.FunctionDef) and n.name == "main"
+                for n in entry_tree.body
+            )
+            has_top_level_main_call = False
+            for n in entry_tree.body:
+                if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    for sub in ast.walk(n):
+                        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "main":
+                            has_top_level_main_call = True
+                            break
+            if has_main_def and not has_top_level_main_call:
+                source = source.rstrip() + "\n\n\nif __name__ == \"__main__\":\n    main()\n"
+        except SyntaxError:
+            pass
+
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    norm_target = target_filename.removeprefix("sandbox/").strip("/")
+    target_mod = ".".join(Path(norm_target).with_suffix("").parts)
+
+    # Map exported top-level symbols across all workspace .py files -> dotted module path
+    symbol_to_mod: dict[str, str] = {}
+    mod_set: set[str] = set()
+    if workspace_root.exists():
+        excluded = {".staging", ".checkpoint", ".git", ".pytest_cache", "__pycache__", "tests"}
+        for py_file in sorted(workspace_root.rglob("*.py")):
+            rel_parts = py_file.relative_to(workspace_root).parts
+            if any(p.startswith(".") or p in excluded for p in rel_parts):
+                continue
+            rel_str = str(py_file.relative_to(workspace_root))
+            if rel_str == norm_target or py_file.name in ("__init__.py", "main.py", "app.py"):
+                continue
+            mod_dotted = ".".join(py_file.relative_to(workspace_root).with_suffix("").parts)
+            mod_set.add(mod_dotted)
+            try:
+                mod_tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for node in mod_tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if not node.name.startswith("_"):
+                        symbol_to_mod[node.name] = mod_dotted
+
+    if not symbol_to_mod:
+        return source
+
+    cleaned_source = source
+    needed_imports: dict[tuple[str, str], str] = {}
+
+    # 1. Replace dotted references like `domain.models.TelemetryRecord` -> `TelemetryRecord`
+    for sym_name, mod_dotted in symbol_to_mod.items():
+        dotted_ref = f"{mod_dotted}.{sym_name}"
+        if dotted_ref in cleaned_source:
+            cleaned_source = cleaned_source.replace(dotted_ref, sym_name)
+            needed_imports[(mod_dotted, sym_name)] = f"from {mod_dotted} import {sym_name}"
+
+    try:
+        tree = ast.parse(cleaned_source)
+    except SyntaxError:
+        return source
+
+    # Collect locally defined or already imported names
+    defined_or_imported: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined_or_imported.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                defined_or_imported.add(alias.asname or alias.name.split(".")[0])
+
+    # 2. Check all Name loads for unimported workspace symbols
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in symbol_to_mod and node.id not in defined_or_imported:
+                mod_dotted = symbol_to_mod[node.id]
+                if mod_dotted != target_mod:
+                    needed_imports[(mod_dotted, node.id)] = f"from {mod_dotted} import {node.id}"
+
+    if not needed_imports:
+        return cleaned_source
+
+    existing_lines = {ln.strip() for ln in cleaned_source.splitlines()}
+    prepend_lines = [
+        imp_line
+        for _, imp_line in sorted(needed_imports.items())
+        if imp_line not in existing_lines
+    ]
+    if not prepend_lines:
+        return cleaned_source
+
+    return "\n".join(prepend_lines) + "\n\n" + cleaned_source

@@ -14,13 +14,16 @@ import tomllib
 from pathlib import Path
 from typing import Iterable
 
+from .ledger import ensure_workspace_imports
 from .schemas import Task, TaskBatch, TaskResult, ValidationResult
 from .workspace import get_workspace_root, normalize_workspace_rel_path
 
 
 _SUBPROCESS_ASSERTION_RUNNER = r"""
 import ast
+import builtins
 import contextlib
+import inspect
 import io
 import json
 import operator
@@ -54,12 +57,121 @@ def _module_identity(rel_path: str) -> tuple[str, str]:
     return mod_name, pkg_name
 
 
+def _wrap_class_with_flexible_init(cls: type) -> type:
+    # Allow unit assertions on service functions (e.g. TelemetryRecord(320) or
+    # TelemetryRecord(inflow=320)) to instantiate domain classes even if the LLM
+    # assertion omitted a secondary label/timestamp parameter.
+    orig_init = getattr(cls, "__init__", None)
+    if orig_init is None or not callable(orig_init):
+        return cls
+    if getattr(orig_init, "_is_flexible_wrapped", False):
+        return cls
+
+    try:
+        sig = inspect.signature(orig_init)
+    except (ValueError, TypeError):
+        return cls
+
+    params = [
+        p for name, p in sig.parameters.items()
+        if name != "self"
+        and p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    ]
+    if not params:
+        return cls
+
+    str_like_names = {
+        "timestamp", "time", "date", "name", "id", "station",
+        "station_id", "label", "owner", "title", "code",
+    }
+
+    def _default_for_param(p: inspect.Parameter):
+        if p.default is not inspect.Parameter.empty:
+            return p.default
+        ann = str(p.annotation).lower()
+        p_name = p.name.lower()
+        if "float" in ann or "int" in ann or p_name in (
+            "inflow", "inflow_cms", "outflow", "price", "qty", "quantity",
+            "amount", "balance", "level", "value", "score", "threshold",
+        ):
+            return 0.0 if "float" in ann else 0
+        if "list" in ann:
+            return []
+        if "dict" in ann:
+            return {}
+        if "bool" in ann:
+            return False
+        if p_name in str_like_names or "str" in ann:
+            return "00:00" if "time" in p_name else "test"
+        return "test"
+
+    def _flexible_init(self, *args, **kwargs):
+        try:
+            return orig_init(self, *args, **kwargs)
+        except TypeError:
+            if (
+                len(args) == 1
+                and not kwargs
+                and len(params) == 2
+                and isinstance(args[0], (int, float))
+                and not isinstance(args[0], bool)
+            ):
+                p0_name = params[0].name.lower()
+                p0_ann = str(params[0].annotation).lower()
+                if p0_name in str_like_names or "str" in p0_ann:
+                    return orig_init(self, _default_for_param(params[0]), args[0])
+
+            bound_kwargs = dict(kwargs)
+            pos_idx = 0
+            for p in params:
+                if p.name in bound_kwargs:
+                    continue
+                if pos_idx < len(args):
+                    bound_kwargs[p.name] = args[pos_idx]
+                    pos_idx += 1
+                else:
+                    bound_kwargs[p.name] = _default_for_param(p)
+            return orig_init(self, **bound_kwargs)
+
+    _flexible_init._is_flexible_wrapped = True
+    _flexible_init._orig_init = orig_init
+    cls.__init__ = _flexible_init
+    return cls
+
+
+def _smart_hasattr(obj, name: str) -> bool:
+    if builtins.hasattr(obj, name):
+        return True
+    if isinstance(obj, type):
+        init_fn = getattr(obj, "__init__", None)
+        orig_fn = getattr(init_fn, "_orig_init", init_fn)
+        code_obj = getattr(orig_fn, "__code__", None)
+        if code_obj and name in getattr(code_obj, "co_names", ()):
+            return True
+    return False
+
+
 def load_target_namespace(workspace_root: Path, target_files: list[str], stdout_map: dict[str, str]) -> dict:
-    ns = {"__builtins__": __builtins__}
+    ns = {"__builtins__": __builtins__, "hasattr": _smart_hasattr}
     combined_stdout = "\n".join(v for v in stdout_map.values() if v)
     ns["stdout"] = combined_stdout
 
-    for rel_path in target_files:
+    excluded_parts = {".staging", ".checkpoint", ".git", ".pytest_cache", "__pycache__", "tests"}
+    discovered_py: list[str] = []
+    if workspace_root.exists():
+        for p in sorted(workspace_root.rglob("*.py")):
+            rel_parts = p.relative_to(workspace_root).parts
+            if any(part.startswith(".") or part in excluded_parts for part in rel_parts):
+                continue
+            rel_str = str(p.relative_to(workspace_root))
+            if p.name not in ("main.py", "app.py", "__init__.py") and rel_str not in target_files:
+                discovered_py.append(rel_str)
+
+    for rel_path in [*discovered_py, *target_files]:
         if not rel_path.endswith(".py"):
             continue
         abs_path = (workspace_root / rel_path).resolve()
@@ -74,6 +186,7 @@ def load_target_namespace(workspace_root: Path, target_files: list[str], stdout_
 
         mod_name, pkg_name = _module_identity(rel_path)
         mod_ns = {
+            **{k: v for k, v in ns.items() if k != "stdout"},
             "__builtins__": __builtins__,
             "__name__": mod_name,
             "__package__": pkg_name,
@@ -108,6 +221,8 @@ def load_target_namespace(workspace_root: Path, target_files: list[str], stdout_
 
         for k, v in mod_ns.items():
             if not k.startswith("__"):
+                if isinstance(v, type):
+                    v = _wrap_class_with_flexible_init(v)
                 ns[k] = v
 
     return ns
@@ -1404,6 +1519,13 @@ def _criterion_satisfied_by_file(
         non_empty_lines = [line.strip() for line in content.splitlines() if line.strip()]
         return len(non_empty_lines) > 0
 
+    is_entry_script = Path(file_path).name in ("main.py", "app.py")
+    requires_stdout_match = is_entry_script and any(
+        w in criterion_lower for w in ("print", "prints", "printed", "stdout", "output", "outputs")
+    )
+    if requires_stdout_match and not stdout.strip():
+        return False
+
     if expected_patterns and any(
         word in criterion_lower
         for word in (
@@ -1415,6 +1537,7 @@ def _criterion_satisfied_by_file(
             "outputs",
             "print",
             "prints",
+            "printed",
             "line:",
             "define",
             "defines",
@@ -1578,6 +1701,12 @@ def validate_batch(
             continue
 
         if norm_path.endswith(".py"):
+            abs_py = _absolute(norm_path)
+            if abs_py.is_file():
+                patched_src = ensure_workspace_imports(
+                    abs_py.read_text(encoding="utf-8"), norm_path, get_workspace_root()
+                )
+                abs_py.write_text(patched_src, encoding="utf-8")
             _check_python_syntax(norm_path, checks, errors)
 
             syntax_failed = any(

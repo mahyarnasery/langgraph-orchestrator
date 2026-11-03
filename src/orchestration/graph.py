@@ -24,6 +24,7 @@ from .checkpoint import (
 )
 from .ledger import (
     ensure_class_wrapper,
+    ensure_workspace_imports,
     extract_all_ast_symbol_names,
     extract_python_signatures,
     format_ledger_for_prompt,
@@ -88,16 +89,15 @@ def _sandbox_repo_path(path: str) -> str:
 
 
 def _summarize_non_python_asset(path: Path, source: str) -> str:
-    """Build a compact summary including actual values for small JSON/CSV/TOML assets so Foreman writes accurate assertions."""
+    """Build a compact summary including keys AND actual values for JSON/CSV/TOML assets."""
     suffix = path.suffix.lower()
     if suffix == ".json":
         try:
             data = json.loads(source)
-            compact_json = json.dumps(data)
-            if len(compact_json) <= 240:
-                return f"JSON content: {compact_json}"
+            compact_json = json.dumps(data, separators=(",", ":"))
             if isinstance(data, dict):
-                return f"JSON object (keys: {list(data.keys())[:8]})"
+                keys_part = f"JSON object (keys: {list(data.keys())[:8]})"
+                return f"{keys_part} — {compact_json}" if len(compact_json) <= 600 else keys_part
             if isinstance(data, list):
                 return f"JSON array ({len(data)} items)"
         except Exception:
@@ -105,7 +105,9 @@ def _summarize_non_python_asset(path: Path, source: str) -> str:
     elif suffix == ".toml":
         try:
             data = tomllib.loads(source)
-            return f"TOML (keys: {list(data.keys())[:8]})"
+            compact_toml = json.dumps(data, separators=(",", ":"))
+            keys_part = f"TOML (keys: {list(data.keys())[:8]})"
+            return f"{keys_part} — {compact_toml}" if len(compact_toml) <= 600 else keys_part
         except Exception:
             return "TOML (unparsed)"
     elif suffix == ".csv":
@@ -115,8 +117,8 @@ def _summarize_non_python_asset(path: Path, source: str) -> str:
                 if any(c.strip() for c in r)
             ]
             if rows:
-                preview = "; ".join(",".join(r) for r in rows[:6])
-                return f"CSV ({len(rows)} rows: {preview})"
+                preview = "; ".join(",".join(r) for r in rows[:12])
+                return f"CSV ({len(rows)} rows, columns: {rows[0]}) — {preview}"
         except Exception:
             return "CSV (unparsed)"
     lines = [ln for ln in source.splitlines() if ln.strip()]
@@ -138,6 +140,8 @@ def _build_repository_map() -> str:
     entries: list[str] = []
     for fpath in ws_files:
         rel_path = str(fpath.relative_to(ws_root))
+        if rel_path.startswith("tests/"):
+            continue
         try:
             source = fpath.read_text(encoding="utf-8")
             if not source.strip():
@@ -385,7 +389,155 @@ def _sort_execution_order_topologically(
 
 
 
+def _extract_allowed_stage_files_from_goal(project_goal: str) -> list[str]:
+    """If `project_goal` has a `STRICT STAGE SCOPE: Create/modify ONLY ...` line, extract those paths."""
+    m = re.search(r"STRICT STAGE SCOPE:\s*Create/modify ONLY\s+([^\n]+)", project_goal)
+    if not m:
+        return []
+    raw_segment = m.group(1)
+    paths = [
+        _normalize_workspace_path(tok)
+        for tok in re.findall(r"`([^`]+)`", raw_segment)
+        if _normalize_workspace_path(tok)
+    ]
+    return paths
+
+
+def _normalize_plan_blueprints(plan: Plan | None, project_goal: str = "") -> None:
+    """
+    Deterministically clean up `plan.file_blueprints` and `plan.affected_areas`:
+    1. Enforce `STRICT STAGE SCOPE` if present in `project_goal` so Planner never re-plans Stage 1 files in Stage 2/3.
+    2. Clear `symbols` on non-Python assets (`.json`, `.csv`, etc.) and entry scripts (`main.py`, `app.py`).
+    3. Merge bare class header `SymbolSpec`s (`signature == 'class'`) with their method `SymbolSpec`s,
+       prefixing bare method names (`__init__`, `is_flood`) with `ClassName.`.
+    4. Ensure every `SymbolSpec.contract` and `signature` is non-empty.
+    """
+    if plan is None:
+        return
+
+    allowed_stage_files = _extract_allowed_stage_files_from_goal(project_goal)
+    if allowed_stage_files:
+        allowed_set = set(allowed_stage_files)
+        filtered_areas = [
+            _normalize_workspace_path(a)
+            for a in plan.affected_areas
+            if _normalize_workspace_path(a) in allowed_set
+        ]
+        plan.affected_areas = filtered_areas or list(allowed_stage_files)
+        if plan.file_blueprints:
+            filtered_fbs = [
+                fb for fb in plan.file_blueprints
+                if _normalize_workspace_path(fb.path) in allowed_set
+            ]
+            if filtered_fbs:
+                plan.file_blueprints = filtered_fbs
+
+    ws_root = get_workspace_root()
+    existing_sym_to_mod: dict[str, str] = {}
+    for py_p in list_workspace_py_files():
+        rel_p = str(py_p.relative_to(ws_root))
+        if rel_p.startswith("tests/") or py_p.name in ("__init__.py", "main.py", "app.py"):
+            continue
+        mod_dotted = ".".join(py_p.relative_to(ws_root).with_suffix("").parts)
+        try:
+            for sig in extract_python_signatures(py_p.read_text(encoding="utf-8")):
+                s_name = sig.split("(")[0].split("[")[0].removeprefix("def ").removeprefix("class ").strip()
+                if s_name:
+                    existing_sym_to_mod[s_name] = mod_dotted
+        except Exception:
+            pass
+
+    for fb in getattr(plan, "file_blueprints", []):
+        norm_path = _normalize_workspace_path(fb.path)
+        fb.path = norm_path
+        if not norm_path.endswith(".py") or Path(norm_path).name in ("main.py", "app.py"):
+            if fb.symbols:
+                extra_notes = ", ".join(
+                    f"{s.target_symbol}: {s.signature} {s.contract}".strip()
+                    for s in fb.symbols
+                )
+                if extra_notes and extra_notes not in fb.role:
+                    fb.role = f"{fb.role} ({extra_notes})".strip()
+                fb.symbols = []
+            continue
+
+        # Detect class name if any SymbolSpec is a class header or uses ClassName.method
+        detected_class: str | None = None
+        for sym in fb.symbols:
+            t_sym = sym.target_symbol.strip()
+            if "." in t_sym and t_sym.split(".", 1)[0][:1].isupper():
+                detected_class = t_sym.split(".", 1)[0]
+                break
+            if sym.signature.strip().lower().startswith("class") or (
+                t_sym[:1].isupper() and "(" not in t_sym and not sym.signature.strip().startswith("def ")
+            ):
+                detected_class = t_sym.split("(")[0].strip()
+                break
+
+        cleaned_symbols = []
+        has_method_specs = any(
+            s.target_symbol.strip() != detected_class
+            for s in fb.symbols
+        ) if detected_class else False
+
+        for sym in fb.symbols:
+            t_sym = sym.target_symbol.strip()
+            sig = sym.signature.strip()
+            contract = sym.contract.strip()
+
+            # Skip bare class header SymbolSpec when method SymbolSpecs are present
+            if detected_class and t_sym == detected_class and has_method_specs:
+                continue
+
+            if detected_class and "." not in t_sym and t_sym != detected_class:
+                t_sym = f"{detected_class}.{t_sym}"
+
+            short_name = t_sym.split(".")[-1]
+            if sig.startswith("("):
+                sig = f"def {short_name}{sig}:"
+            elif not sig.startswith(("def ", "class ")) and "(" in sig:
+                sig = f"def {sig}"
+
+            if not contract:
+                contract = f"Implement {t_sym} with signature `{sig}` in `{norm_path}`."
+
+            sym.target_symbol = t_sym
+            sym.signature = sig
+            sym.contract = contract
+            cleaned_symbols.append(sym)
+
+            # Auto-populate required_imports if signature/contract mentions an existing workspace symbol
+            combined_sym_text = f"{sig} {contract}"
+            for ext_sym, ext_mod in existing_sym_to_mod.items():
+                if ext_sym in combined_sym_text:
+                    imp_stmt = f"from {ext_mod} import {ext_sym}"
+                    if imp_stmt not in fb.required_imports:
+                        fb.required_imports.append(imp_stmt)
+
+        # If a class only has <=2 methods (e.g. __init__ and 1 short method), keep it as a single
+        # cohesive class symbol so Aider writes the whole class cleanly in one shot without staging drift!
+        if (
+            detected_class
+            and 1 <= len(cleaned_symbols) <= 2
+            and "method-level" not in project_goal.lower()
+            and all(s.target_symbol.startswith(f"{detected_class}.") for s in cleaned_symbols)
+        ):
+            combined_sigs = "; ".join(s.signature for s in cleaned_symbols)
+            combined_contracts = " ".join(s.contract for s in cleaned_symbols)
+            from .schemas import SymbolSpec
+            cleaned_symbols = [
+                SymbolSpec(
+                    target_symbol=detected_class,
+                    signature=f"class {detected_class}: {combined_sigs}",
+                    contract=combined_contracts,
+                )
+            ]
+
+        fb.symbols = cleaned_symbols
+
+
 def _align_batch_with_plan_blueprints(batch: TaskBatch, plan: Plan | None) -> None:
+    _normalize_plan_blueprints(plan)
     """
     Deterministically align Foreman's TaskBatch with the Planner's `file_blueprints`:
     - If a multi-symbol Python file was lumped into a single task by Foreman even though
@@ -429,11 +581,55 @@ def _align_batch_with_plan_blueprints(batch: TaskBatch, plan: Plan | None) -> No
 
     new_tasks: list[Task] = []
     expanded_any = False
+    collapsed_files: set[str] = set()
 
     for t in batch.tasks:
         primary = _normalize_workspace_path(t.relevant_files[0]) if t.relevant_files else ""
         fb = blueprints_by_path.get(primary)
+        file_tasks = tasks_by_file.get(primary, [])
+
+        # Case 0: If a file has no planned symbols (e.g. main.py, app.py, .json, .csv)
+        # but Foreman split it into multiple tasks, collapse them into ONE direct task
+        # so entry scripts are never staged in `.staging/`.
+        is_single_task_target = (
+            not primary.endswith(".py")
+            or Path(primary).name in ("main.py", "app.py")
+            or (fb is not None and not fb.symbols)
+        )
+        if is_single_task_target and len(file_tasks) > 1:
+            if primary in collapsed_files:
+                expanded_any = True
+                continue
+            collapsed_files.add(primary)
+            expanded_any = True
+            merged_criteria: list[str] = []
+            for ft in file_tasks:
+                for c in ft.acceptance_criteria:
+                    if c and c.strip() and c.strip() not in merged_criteria:
+                        merged_criteria.append(c.strip())
+            merged_deps = [
+                d for ft in file_tasks for d in ft.dependencies
+                if d not in {x.task_id for x in file_tasks}
+            ]
+            new_tasks.append(
+                Task(
+                    task_id=file_tasks[0].task_id,
+                    objective=fb.role if (fb and fb.role) else f"Implement {primary}",
+                    target_symbol=None,
+                    scope=primary,
+                    relevant_files=[primary],
+                    dependencies=merged_deps,
+                    constraints=list(fb.required_imports) if fb else [],
+                    acceptance_criteria=merged_criteria or [f"Implement {primary}"],
+                    test_assertions=[],
+                )
+            )
+            continue
+
         if fb is None or not primary.endswith(".py") or not fb.symbols:
+            if Path(primary).name in ("main.py", "app.py"):
+                t.target_symbol = None
+                t.test_assertions = []
             new_tasks.append(t)
             continue
 
@@ -476,6 +672,13 @@ def _align_batch_with_plan_blueprints(batch: TaskBatch, plan: Plan | None) -> No
         # Case B: Match/correct `task.target_symbol` against the Planner's SymbolSpec list
         if len(file_tasks) == 1 and len(fb.symbols) == 1 and "." in fb.symbols[0].target_symbol:
             t.target_symbol = fb.symbols[0].target_symbol.split(".")[0]
+        elif len(file_tasks) > 1 and len(fb.symbols) == 1 and "." not in fb.symbols[0].target_symbol:
+            # Planner emitted 1 class symbol (e.g. 'Reading'), while Foreman split it into method tasks:
+            # infer or preserve `ClassName.method_name` for each task so they don't collide on 'Reading'!
+            cls_name = fb.symbols[0].target_symbol
+            inferred_m = _infer_task_symbol(t, True)
+            if inferred_m and inferred_m != cls_name:
+                t.target_symbol = inferred_m if "." in inferred_m else f"{cls_name}.{inferred_m}"
         else:
             valid_planned_symbols = [s.target_symbol for s in fb.symbols]
             if t.target_symbol not in valid_planned_symbols:
@@ -543,6 +746,12 @@ def _prepare_batch_and_workspace(
             for p in (task.relevant_files or union_files)
             if _normalize_workspace_path(p) not in ("", ".", "..")
         ]
+        task.acceptance_criteria = [
+            c.strip() for c in task.acceptance_criteria
+            if c and c.strip() and c.strip().lower() != "class"
+        ]
+        if not task.acceptance_criteria:
+            task.acceptance_criteria = [task.objective]
         task.test_assertions = [
             a.strip() for a in task.test_assertions if a and a.strip()
         ]
@@ -799,6 +1008,7 @@ def planner_node(state: WorkflowState) -> dict:
 
     if not isinstance(plan, Plan):
         raise TypeError("PlannerAgent.run() must return Plan.")
+    _normalize_plan_blueprints(plan, state["project_goal"])
 
     print("\n=== PLANNER RESULT ===")
     print(plan.model_dump_json(indent=2))
@@ -1048,7 +1258,16 @@ def foreman_assemble_node(state: WorkflowState) -> dict:
         final_code = ast_merged
         assembly_mode = "AST-deterministic"
 
-        if len(task_snippets) > 1 and plan is not None:
+        ast_merged = ensure_workspace_imports(ast_merged, norm_target, ws_root)
+        final_code = ast_merged
+        planned_syms: set[str] = set()
+        if plan and getattr(plan, "file_blueprints", None):
+            for fb in plan.file_blueprints:
+                if _normalize_workspace_path(fb.path) == norm_target:
+                    for s in fb.symbols:
+                        planned_syms.add(s.target_symbol)
+        missing_planned = planned_syms - expected_symbols
+        if len(task_snippets) > 1 and plan is not None and missing_planned:
             try:
                 assembled = foreman.assemble_module(
                     target_file=norm_target,
@@ -1238,9 +1457,17 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
     unchanged_files: list[str] = []
     repair_errors: list[str] = []
 
+    allowed_batch_files = {
+        _normalize_workspace_path(f)
+        for b in state.get("task_batches", [])
+        for f in b.relevant_files
+    }
     for repair in review.direct_repairs:
         physical_path = _sandbox_repo_path(repair.path)
         norm_rel = _normalize_workspace_path(repair.path)
+        if allowed_batch_files and norm_rel not in allowed_batch_files:
+            print(f"[SCOPE GUARD] Skipping Foreman self-repair on '{norm_rel}' (outside batch scope {sorted(allowed_batch_files)})")
+            continue
         abs_target = ws_root / norm_rel
         print(f"Applying Foreman self-repair to {ws_root.name}/{physical_path} ({repair.action})")
         try:
@@ -1270,6 +1497,11 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
                     content=repair.content,
                 )
 
+            if norm_rel.endswith(".py") and abs_target.is_file():
+                fixed_py = ensure_workspace_imports(
+                    abs_target.read_text(encoding="utf-8"), norm_rel, ws_root
+                )
+                abs_target.write_text(fixed_py, encoding="utf-8")
             if not _is_valid_workspace_file(abs_target):
                 abs_target.write_text(before_content, encoding="utf-8")
                 raise ValueError(
@@ -1373,10 +1605,54 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         ledger_context=ledger_ctx,
     )
 
-    # Strictly filter corrective tasks so already-passing tasks/files are NEVER re-run
+    allowed_orig_files = {_normalize_workspace_path(f) for f in batch.relevant_files}
+    for ct in corrective_batch.tasks:
+        ct.relevant_files = [
+            _normalize_workspace_path(rf)
+            for rf in ct.relevant_files
+            if _normalize_workspace_path(rf) in allowed_orig_files
+        ] or list(batch.relevant_files[:1])
+    # Strictly filter corrective tasks so already-passing non-Python assets are NEVER re-run,
+    # while allowing library tasks to be rebuilt if an integration assert in main.py failed!
     if validation and validation.failed_task_ids:
         failed_ids = set(validation.failed_task_ids)
         orig_tasks_by_id = {t.task_id: t for t in batch.tasks}
+        orig_tasks_by_sym = {
+            t.target_symbol: t for t in batch.tasks if t.target_symbol
+        }
+
+        # Check if review or validation errors implicate a library task/symbol (e.g. `add_ten` in `math_pipeline.py`)
+        review_text = (
+            f"{review.summary if review else ''} "
+            f"{' '.join(review.repair_instructions) if review else ''} "
+            f"{' '.join(validation.errors)}"
+        )
+        for tid, orig_t in orig_tasks_by_id.items():
+            if orig_t.target_symbol and orig_t.target_symbol in review_text:
+                failed_ids.add(tid)
+            elif orig_t.relevant_files and orig_t.relevant_files[0].endswith(".py"):
+                f_name = orig_t.relevant_files[0]
+                if f_name not in ("main.py", "app.py") and f_name in review_text and len(
+                    [t for t in batch.tasks if f_name in t.relevant_files]
+                ) == 1:
+                    failed_ids.add(tid)
+
+        # If failed_ids ONLY contains main.py/app.py, trust Foreman's corrective_batch task selection
+        # if it targets a valid Python library task from the batch.
+        only_entry_failed = all(
+            orig_tasks_by_id.get(fid) is not None
+            and orig_tasks_by_id[fid].relevant_files
+            and Path(orig_tasks_by_id[fid].relevant_files[0]).name in ("main.py", "app.py")
+            for fid in failed_ids
+        )
+        if only_entry_failed:
+            for ct in corrective_batch.tasks:
+                if ct.task_id in orig_tasks_by_id:
+                    failed_ids.add(ct.task_id)
+                elif ct.target_symbol and ct.target_symbol in orig_tasks_by_sym:
+                    ct.task_id = orig_tasks_by_sym[ct.target_symbol].task_id
+                    failed_ids.add(ct.task_id)
+
         failed_files = {
             _normalize_workspace_path(rf)
             for fid in failed_ids
@@ -1386,12 +1662,31 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
         filtered_corr_tasks = [
             ct for ct in corrective_batch.tasks
             if ct.task_id in failed_ids
-            or any(_normalize_workspace_path(rf) in failed_files for rf in ct.relevant_files)
+            or (ct.target_symbol and ct.target_symbol in {orig_tasks_by_id[fid].target_symbol for fid in failed_ids if fid in orig_tasks_by_id})
+            or (
+                not only_entry_failed
+                and any(_normalize_workspace_path(rf) in failed_files for rf in ct.relevant_files)
+                and len([t for t in batch.tasks if t.relevant_files == ct.relevant_files]) == 1
+            )
         ]
+        # If multiple tasks share a file (like t1, t2, t3 in math_pipeline.py), keep ONLY the implicated task(s)
+        non_entry_failed_ids = [
+            fid for fid in failed_ids
+            if fid in orig_tasks_by_id
+            and Path(orig_tasks_by_id[fid].relevant_files[0]).name not in ("main.py", "app.py")
+        ]
+        if non_entry_failed_ids and (
+            not filtered_corr_tasks
+            or all(Path(ct.relevant_files[0]).name in ("main.py", "app.py") for ct in filtered_corr_tasks if ct.relevant_files)
+        ):
+            filtered_corr_tasks = [
+                orig_tasks_by_id[fid].model_copy(deep=True)
+                for fid in sorted(non_entry_failed_ids)
+            ]
+
         if filtered_corr_tasks:
             corrective_batch.tasks = filtered_corr_tasks
         else:
-            # Fallback: copy the exact failed Task definitions from the effective batch
             corrective_batch.tasks = [
                 orig_tasks_by_id[fid].model_copy(deep=True)
                 for fid in validation.failed_task_ids
@@ -1935,15 +2230,14 @@ def run_project(
 
 def _extract_stage_spec_sections(full_project_goal: str, target_files: list[str]) -> str:
     """
-    Extract only the numbered specification sections from `full_project_goal` that
-    correspond to `target_files`, preventing Foreman from seeing and scheduling
-    future stages' files during an earlier stage.
+    Extract only the numbered specification sections from `full_project_goal` whose
+    section header corresponds to `target_files`, preventing future stages' files
+    (like `main.py` referencing earlier files) from leaking into earlier stages.
     """
     if not full_project_goal.strip() or not target_files:
         return full_project_goal.strip()
 
     norm_targets = {_normalize_workspace_path(tf) for tf in target_files if tf.strip()}
-    # Split on numbered top-level sections like `1. config/...`
     blocks = re.split(r"(?=^\s*\d+\.\s+)", full_project_goal.strip(), flags=re.MULTILINE)
     if len(blocks) <= 2:
         return full_project_goal.strip()
@@ -1951,9 +2245,19 @@ def _extract_stage_spec_sections(full_project_goal: str, target_files: list[str]
     matched_blocks: list[str] = []
     for blk in blocks:
         blk_stripped = blk.strip()
-        if not blk_stripped:
+        if not blk_stripped or not re.match(r"^\d+\.\s+", blk_stripped):
             continue
-        if any(tf in blk_stripped or Path(tf).name in blk_stripped for tf in norm_targets):
+        first_line = blk_stripped.splitlines()[0]
+        header_part = first_line.split(":", 1)[0]
+        if any(tf in header_part or Path(tf).name in header_part for tf in norm_targets):
+            matched_blocks.append(blk_stripped)
+
+    if matched_blocks:
+        return "\n\n".join(matched_blocks)
+
+    for blk in blocks:
+        blk_stripped = blk.strip()
+        if blk_stripped and any(tf in blk_stripped or Path(tf).name in blk_stripped for tf in norm_targets):
             matched_blocks.append(blk_stripped)
 
     return "\n\n".join(matched_blocks) if matched_blocks else full_project_goal.strip()

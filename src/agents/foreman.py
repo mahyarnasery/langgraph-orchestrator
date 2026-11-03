@@ -76,7 +76,7 @@ Blueprint-Driven Task Dispatch & Verification Rules (CRITICAL):
 8. Preserve exact formulas, f-strings, and return expressions from the Project goal in each task's `acceptance_criteria`.
 9. Deterministic Unit Assertions (`test_assertions`):
    - For every Python task that implements a function or class method, populate `task.test_assertions` with 1 to 2 executable Python `assert` statements using CONCRETE literal inputs and expected outputs.
-   - For class methods, ALWAYS instantiate the class first (e.g. `obj = ClassName(...); assert obj.method(...) == expected`). NEVER call `ClassName.__init__(...)` or unbound `ClassName.method(...)` directly on the class!
+   - For class methods or functions taking domain objects, ALWAYS instantiate the class using its EXACT `__init__` parameter list from the Existing Workspace Repository Map (e.g. `TelemetryRecord('08:00', 320)`, NEVER omit required constructor arguments like `timestamp`). NEVER call `ClassName.__init__(...)` or unbound `ClassName.method(...)` directly on the class!
    - For pure entry-point scripts (`main.py`, `app.py`) and non-Python files (`.json`, `.csv`, `.toml`, etc.), leave `task.test_assertions` empty (`[]`).
 10. Populate `execution_order` with all `task_id`s in dependency order, and leave `verification_command` as null unless running a dedicated pytest suite without shell pipes.
 

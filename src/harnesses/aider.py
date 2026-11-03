@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from .base import CodingHarness
 from .config import AiderConfig
 from src.orchestration.ledger import (
     ensure_class_wrapper,
+    ensure_workspace_imports,
     extract_python_signatures,
     merge_staged_snippets_ast,
     upsert_staged_snippet,
@@ -159,6 +161,11 @@ class AiderHarness(CodingHarness):
         env = os.environ.copy()
         env.pop("GIT_DIR", None)
         env.pop("GIT_WORK_TREE", None)
+        env["AIDER_ANALYTICS"] = "false"
+        env["AIDER_CHECK_UPDATE"] = "false"
+        env["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        env["POSTHOG_DISABLED"] = "1"
+        env["TELEMETRY_DISABLED"] = "1" 
 
         env_stop = os.environ.get("ORCHESTRATOR_STOP_AFTER_TASKS")
         if stop_after_tasks is None and env_stop and env_stop.isdigit():
@@ -226,29 +233,19 @@ class AiderHarness(CodingHarness):
                         if uncompleted:
                             editable_files = uncompleted
 
-                dep_files: set[str] = set()
-                for dep_id in task.dependencies:
-                    dep_task = tasks_by_id.get(dep_id)
-                    if dep_task:
-                        for f in dep_task.relevant_files:
-                            dep_files.add(_normalize_rel_path(f))
-
-                existing_workspace_assets = {
-                    str(p.relative_to(ws_root))
-                    for p in list_workspace_files()
-                }
-                read_only_files = sorted(
+                read_only_files = [
                     f
-                    for f in (
-                        dep_files
-                        | completed_files
-                        | set(declared_files)
-                        | existing_workspace_assets
+                    for f in _resolve_task_read_only_files(
+                        task=task,
+                        batch=batch,
+                        primary_target=primary_target,
+                        ws_root=ws_root,
+                        plan=plan,
                     )
                     if f not in editable_files
                     and (not use_staging or f != primary_target)
                     and self._is_non_empty_file(f)
-                )
+                ]
 
                 before = self._snapshot_files(editable_files)
                 before_primary = (
@@ -288,7 +285,9 @@ class AiderHarness(CodingHarness):
                     "--no-auto-commits",
                     "--no-auto-lint",
                     "--no-git",
-                    "--subtree-only",
+                    "--no-analytics",
+                    "--no-check-update",
+                    "--no-show-model-warnings",
                     *read_args,
                     "--message",
                     prompt,
@@ -320,6 +319,32 @@ class AiderHarness(CodingHarness):
 
                 if use_staging and staged_rel_path:
                     raw_snippet = after.get(staged_rel_path, "").strip()
+                    if not raw_snippet:
+                        staged_fname = Path(staged_rel_path).name
+                        for stray_cand in (
+                            ws_root / f".{staged_fname}",
+                            ws_root / staged_fname,
+                            staging_dir / f".{staged_fname}",
+                            ws_root / f".path/to/{staged_rel_path}",
+                            ws_root / f".path/to/{staged_fname}",
+                            ws_root / f"path/to/{staged_rel_path}",
+                            ws_root / f"path/to/{ primary_target }",
+                        ):
+                            if stray_cand.is_file() and stray_cand.read_text(encoding="utf-8").strip():
+                                raw_snippet = stray_cand.read_text(encoding="utf-8").strip()
+                                stray_cand.unlink(missing_ok=True)
+                                self._safe_workspace_path(staged_rel_path).write_text(
+                                    raw_snippet + "\n", encoding="utf-8"
+                                )
+                                break
+                    if not raw_snippet:
+                        nested_staging = staging_dir / primary_target
+                        if nested_staging.is_file() and nested_staging.read_text(encoding="utf-8").strip():
+                            raw_snippet = nested_staging.read_text(encoding="utf-8").strip()
+                            nested_staging.unlink(missing_ok=True)
+                            self._safe_workspace_path(staged_rel_path).write_text(
+                                raw_snippet + "\n", encoding="utf-8"
+                            )
                     if not raw_snippet:
                         after_primary = (
                             self._snapshot_files([primary_target])
@@ -365,6 +390,13 @@ class AiderHarness(CodingHarness):
                 else:
                     changed = changed_physical
                     for f in changed:
+                        if f.endswith(".py"):
+                            abs_f = self._safe_workspace_path(f)
+                            if abs_f.is_file():
+                                fixed_src = ensure_workspace_imports(
+                                    abs_f.read_text(encoding="utf-8"), f, ws_root
+                                )
+                                abs_f.write_text(fixed_src, encoding="utf-8")
                         completed_files.add(f)
 
                 errors: list[str] = []
@@ -458,11 +490,12 @@ class AiderHarness(CodingHarness):
         lines = [
             f"# Batch Objective: {batch.objective}",
         ]
-        if project_goal.strip():
+        scoped_file_spec = _extract_file_spec_section(project_goal, logical_target)
+        if scoped_file_spec:
             lines.extend(
                 [
-                    "## Full Project Specification (for exact formula, schema & signature reference):",
-                    project_goal.strip(),
+                    f"## Specification for `{logical_target}`:",
+                    scoped_file_spec,
                     "",
                 ]
             )
@@ -589,3 +622,99 @@ class AiderHarness(CodingHarness):
             else:
                 snapshot[f] = ""
         return snapshot
+
+
+def _resolve_task_read_only_files(
+    task: Task,
+    batch: TaskBatch,
+    primary_target: str,
+    ws_root: Path,
+    plan: Plan | None,
+) -> list[str]:
+    """Resolve direct imported Python dependencies and required config assets, excluding tests/."""
+    referenced: set[str] = set()
+
+    if plan and getattr(plan, "file_blueprints", None):
+        for fb in plan.file_blueprints:
+            if _normalize_rel_path(fb.path) == primary_target:
+                for imp in fb.required_imports:
+                    cleaned = imp.strip()
+                    if cleaned.startswith("from "):
+                        mod_token = cleaned.removeprefix("from ").split()[0].strip()
+                    elif cleaned.startswith("import "):
+                        mod_token = cleaned.removeprefix("import ").split()[0].split(",")[0].strip()
+                    else:
+                        continue
+                    cand_py = mod_token.replace(".", "/") + ".py"
+                    if (ws_root / cand_py).is_file():
+                        referenced.add(_normalize_rel_path(cand_py))
+
+    tasks_by_id = {t.task_id: t for t in batch.tasks}
+    for dep_id in task.dependencies:
+        dep_task = tasks_by_id.get(dep_id)
+        if dep_task:
+            for f in dep_task.relevant_files:
+                norm_f = _normalize_rel_path(f)
+                if norm_f != primary_target and (ws_root / norm_f).is_file():
+                    referenced.add(norm_f)
+
+    # Also scan task objective, acceptance criteria, and assertions for references to existing workspace .py modules
+    task_text = f"{task.objective} {' '.join(task.acceptance_criteria)} {' '.join(task.test_assertions)}"
+    for py_path in list_workspace_py_files():
+        rel_py = str(py_path.relative_to(ws_root))
+        if rel_py == primary_target or rel_py.startswith("tests/") or py_path.name in ("__init__.py", "main.py", "app.py"):
+            continue
+        if py_path.stem in task_text or rel_py in task_text:
+            referenced.add(rel_py)
+        else:
+            try:
+                src = py_path.read_text(encoding="utf-8")
+                for sig in extract_python_signatures(src):
+                    sym_name = sig.split("(")[0].split("[")[0].removeprefix("def ").removeprefix("class ").strip()
+                    if sym_name and sym_name in task_text:
+                        referenced.add(rel_py)
+                        break
+            except Exception:
+                pass
+
+    # If target is main.py/app.py or mentions config/data files, include matching non-Python assets
+    if Path(primary_target).name in ("main.py", "app.py") or not referenced:
+        for asset_path in list_workspace_files():
+            rel_asset = str(asset_path.relative_to(ws_root))
+            if rel_asset == primary_target or rel_asset.startswith("tests/") or asset_path.name == "__init__.py":
+                continue
+            if Path(primary_target).name in ("main.py", "app.py") or asset_path.name in task_text or rel_asset in task_text:
+                referenced.add(rel_asset)
+
+    return sorted(
+        f for f in referenced
+        if f != primary_target
+        and not f.startswith("tests/")
+        and not f.endswith("__init__.py")
+    )
+
+
+def _extract_file_spec_section(full_project_goal: str, target_file: str) -> str:
+    """Extract only the specification block whose header matches `target_file`."""
+    if not full_project_goal.strip():
+        return ""
+    fname = Path(target_file).name
+    blocks = re.split(r"(?=^\s*\d+\.\s+)", full_project_goal.strip(), flags=re.MULTILINE)
+    if len(blocks) <= 2:
+        return full_project_goal.strip()
+    header_matched = []
+    for blk in blocks:
+        blk_s = blk.strip()
+        if not blk_s or not re.match(r"^\d+\.\s+", blk_s):
+            continue
+        header = blk_s.splitlines()[0].split(":", 1)[0]
+        if target_file in header or fname in header:
+            header_matched.append(blk_s)
+    if header_matched:
+        return "\n\n".join(header_matched)
+    matched = [
+        blk.strip()
+        for blk in blocks
+        if blk.strip() and (target_file in blk or fname in blk)
+    ]
+    return "\n\n".join(matched) if matched else full_project_goal.strip()

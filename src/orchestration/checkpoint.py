@@ -18,11 +18,15 @@ from .ledger import (
 from .schemas import CheckpointData, CycleResult, StageGoal, Task, TaskResult
 from .state import WorkflowState
 from .workspace import (
+    DEFAULT_WORKSPACE_ROOT,
     get_checkpoint_dir,
     get_checkpoint_file,
     get_workspace_root,
     normalize_workspace_rel_path,
 )
+
+
+CHECKPOINT_FILE = DEFAULT_WORKSPACE_ROOT / ".checkpoint" / "state.json"
 
 
 def _normalize_rel_path(path: str) -> str:
