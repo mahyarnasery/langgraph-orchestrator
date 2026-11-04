@@ -1298,6 +1298,19 @@ def emit_pytest_suite(
             continue
         has_entry_assert = any(isinstance(n, ast.Assert) for n in entry_tree.body)
         if not has_entry_assert:
+            # Check if `main.py` / `app.py` defines `def main():` or `def run():` containing an assert
+            for fn_node in entry_tree.body:
+                if isinstance(fn_node, ast.FunctionDef) and fn_node.name in ("main", "run"):
+                    if any(isinstance(sub, ast.Assert) for sub in ast.walk(fn_node)):
+                        call_stmt = f"from {p.stem} import {fn_node.name}; {fn_node.name}()"
+                        if call_stmt not in seen_assertions:
+                            seen_assertions.add(call_stmt)
+                            fn_lines = [
+                                f"def test_entry_{p.stem}_{fn_node.name}() -> None:",
+                                f"    from {p.stem} import {fn_node.name}",
+                                f"    {fn_node.name}()",
+                            ]
+                            test_blocks.append("\n".join(fn_lines))
             continue
         entry_stmts: list[str] = []
         for node in entry_tree.body:

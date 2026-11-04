@@ -24,6 +24,7 @@ from .checkpoint import (
 )
 from .ledger import (
     ensure_class_wrapper,
+    generate_pyi_stub,
     ensure_workspace_imports,
     extract_all_ast_symbol_names,
     extract_python_signatures,
@@ -931,8 +932,17 @@ def _fence_lang_for_path(path: str) -> str:
     return {"py": "python", "yml": "yaml", "md": "markdown"}.get(ext, ext or "text")
 
 
-def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult]) -> str:
-    """Inspect the active workspace repository files and construct textual evidence."""
+def _gather_repository_context(
+    batch: TaskBatch,
+    task_results: list[TaskResult],
+    validation_result: ValidationResult | None = None,
+) -> str:
+    """
+    Construct failure-scoped repository evidence for Foreman review:
+    - If `validation_result` has failed tasks/errors, emit full file content ONLY for
+      failed files, and emit 1-line `.pyi`/AST summaries for already-passing files.
+    - If all checks passed, emit compact `.pyi` stubs / previews to save tokens.
+    """
     from .tools import read_file
 
     relevant_files = sorted(
@@ -944,6 +954,20 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
         }
     )
 
+    failed_files: set[str] = set()
+    if validation_result and not validation_result.passed:
+        tasks_by_id = {t.task_id: t for t in batch.tasks}
+        for fid in validation_result.failed_task_ids:
+            if fid in tasks_by_id:
+                for rf in tasks_by_id[fid].relevant_files:
+                    failed_files.add(_normalize_workspace_path(rf))
+        for err in validation_result.errors:
+            for rf in relevant_files:
+                if rf in err or Path(rf).name in err:
+                    failed_files.add(rf)
+        if not failed_files:
+            failed_files = set(relevant_files)
+
     repository_evidence: list[str] = []
     for path in relevant_files:
         physical_path = _sandbox_repo_path(path)
@@ -951,8 +975,24 @@ def _gather_repository_context(batch: TaskBatch, task_results: list[TaskResult])
         try:
             result = read_file.func(path=physical_path)
             content = result.get("content", "")
-            content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
-            repository_evidence.append(f"FILE: {path}\n~~~{lang}\n{content_display}\n~~~")
+            if not content.strip():
+                repository_evidence.append(f"FILE: {path}\n[EMPTY FILE - 0 bytes]")
+                continue
+
+            if validation_result is not None and validation_result.passed:
+                if path.endswith(".py") and len(content.splitlines()) > 25:
+                    stub = generate_pyi_stub(content)
+                    repository_evidence.append(
+                        f"FILE: {path} [PASSED ALL CHECKS - {len(content.splitlines())} lines]\n~~~python\n{stub}\n~~~"
+                    )
+                else:
+                    repository_evidence.append(f"FILE: {path} [PASSED]\n~~~{lang}\n{content.strip()}\n~~~")
+            elif failed_files and path not in failed_files:
+                sigs = extract_python_signatures(content) if path.endswith(".py") else []
+                sig_summary = "; ".join(sigs) if sigs else f"{len(content.splitlines())} lines"
+                repository_evidence.append(f"FILE: {path} — [PASSED ALL CHECKS; {sig_summary}]")
+            else:
+                repository_evidence.append(f"FILE: {path}\n~~~{lang}\n{content}\n~~~")
         except Exception as exc:
             repository_evidence.append(
                 f"FILE: {path}\nREAD_ERROR: {type(exc).__name__}: {exc}"
@@ -967,7 +1007,9 @@ def _gather_full_repository_context() -> str:
 
     ws_root = get_workspace_root()
     repository_evidence: list[str] = []
-    for fpath in list_workspace_files():
+    ws_all = [p for p in list_workspace_files() if not str(p.relative_to(ws_root)).startswith("tests/")]
+    use_compact_digest = len(ws_all) >= 5
+    for fpath in ws_all:
         try:
             relative_path = fpath.relative_to(ws_root)
             logical_path = str(relative_path)
@@ -976,6 +1018,10 @@ def _gather_full_repository_context() -> str:
             content = result.get("content", "")
             if not content.strip() and fpath.name == "__init__.py":
                 content_display = "[PACKAGE __init__.py - 0 bytes]"
+            elif use_compact_digest and logical_path.endswith(".py") and len(content.splitlines()) > 18:
+                content_display = generate_pyi_stub(content)
+            elif use_compact_digest and logical_path.endswith(".py") and len(content.splitlines()) > 18:
+                content_display = generate_pyi_stub(content)
             else:
                 content_display = content if content.strip() else "[EMPTY FILE - 0 bytes]"
             repository_evidence.append(
@@ -1202,6 +1248,10 @@ def worker_node(state: WorkflowState) -> dict:
         }
         save_checkpoint(partial_state)
 
+    prev_val = state.get("validation_result")
+    err_ctx = "\n".join(prev_val.errors[:4]) if (prev_val and prev_val.errors) else ""
+    is_rebuild_run = bool(state.get("rebuild_attempts", 0) >= 1 or len(state.get("task_batches", [])) > 1)
+
     results = worker.execute(
         batch,
         existing_staged=staged_files,
@@ -1210,6 +1260,8 @@ def worker_node(state: WorkflowState) -> dict:
         verified_task_results=verified_by_id,
         on_task_complete=_on_single_task_complete,
         plan=state.get("plan"),
+        is_rebuild=is_rebuild_run,
+        error_context=err_ctx,
     )
 
     print("\n=== WORKER SESSION COMPLETE ===")
@@ -1432,25 +1484,44 @@ def foreman_review_node(state: WorkflowState) -> dict:
 
     batch = _build_effective_validation_batch(state["task_batches"])
     repository_context = _gather_repository_context(
-        batch, state["task_results"]
+        batch, state["task_results"], validation_result=validation
     )
     enriched_arch = _enrich_architecture_context(state["architecture_context"])
     ledger_ctx = format_ledger_for_prompt(state["ledger"], state["previous_cycle"])
 
-    foreman = build_foreman()
-    review = foreman.review(
-        project_goal=state["project_goal"],
-        architecture_context=enriched_arch,
-        plan=plan,
-        batch=batch,
-        task_results=state["task_results"],
-        validation_result=validation,
-        repository_context=repository_context,
-        worker_attempts=state["worker_attempts"],
-        foreman_repair_attempts=state["foreman_repair_attempts"],
-        max_foreman_repairs=MAX_FOREMAN_REPAIRS,
-        ledger_context=ledger_ctx,
-    )
+    if validation.passed:
+        print("\n=== FOREMAN REVIEW (FAST-ACCEPT: ALL DETERMINISTIC CHECKS PASSED) ===")
+        review = ForemanReview(
+            decision="accept",
+            accepted=True,
+            reviewed_task_ids=[t.task_id for t in batch.tasks],
+            summary=f"All {len(validation.checks)} deterministic validation checks passed.",
+        )
+    elif state["foreman_repair_attempts"] >= MAX_FOREMAN_REPAIRS and validation.failed_task_ids:
+        print("\n=== FOREMAN REVIEW (FAST-ESCALATE TO REBUILD: SELF-REPAIRS EXHAUSTED) ===")
+        review = ForemanReview(
+            decision="rebuild",
+            accepted=False,
+            reviewed_task_ids=[t.task_id for t in batch.tasks],
+            problems=list(validation.errors[:4]),
+            rebuild_task_ids=list(validation.failed_task_ids),
+            summary=f"Direct self-repairs exhausted ({state['foreman_repair_attempts']}/{MAX_FOREMAN_REPAIRS}); escalating failed tasks {validation.failed_task_ids} to rebuild.",
+        )
+    else:
+        foreman = build_foreman()
+        review = foreman.review(
+            project_goal=state["project_goal"],
+            architecture_context=enriched_arch,
+            plan=plan,
+            batch=batch,
+            task_results=state["task_results"],
+            validation_result=validation,
+            repository_context=repository_context,
+            worker_attempts=state["worker_attempts"],
+            foreman_repair_attempts=state["foreman_repair_attempts"],
+            max_foreman_repairs=MAX_FOREMAN_REPAIRS,
+            ledger_context=ledger_ctx,
+        )
 
     if not isinstance(review, ForemanReview):
         raise TypeError("ForemanAgent.review() must return ForemanReview.")
@@ -1638,13 +1709,36 @@ def foreman_corrective_node(state: WorkflowState) -> dict:
                 print(f"Reverted {ws_root.name}/{physical_path} to pre-batch snapshot")
 
     print("\n=== FOREMAN GENERATING CORRECTIVE BATCH ===")
-    corrective_batch = foreman.create_corrective_batch(
-        batch=batch,
-        review=review,
-        task_results=state["task_results"],
-        validation_result=validation,
-        ledger_context=ledger_ctx,
-    )
+    orig_by_id = {t.task_id: t for t in batch.tasks}
+    direct_failed_lib_ids = [
+        fid for fid in (validation.failed_task_ids if validation else [])
+        if fid in orig_by_id
+        and orig_by_id[fid].relevant_files
+        and Path(orig_by_id[fid].relevant_files[0]).name not in ("main.py", "app.py")
+    ]
+    if direct_failed_lib_ids:
+        failed_lib_set = set(direct_failed_lib_ids)
+        # Keep only root-cause failed library tasks (exclude task B if B depends on A and A also failed)
+        root_cause_ids = [
+            fid for fid in direct_failed_lib_ids
+            if not (set(orig_by_id[fid].dependencies) & (failed_lib_set - {fid}))
+        ] or direct_failed_lib_ids
+        root_tasks = [orig_by_id[fid].model_copy(deep=True) for fid in root_cause_ids]
+        corrective_batch = TaskBatch(
+            batch_id=f"{batch.batch_id}_repaired_{state['rebuild_attempts'] + 1}",
+            objective=f"Surgical rebuild for {', '.join(root_cause_ids)}",
+            tasks=root_tasks,
+            relevant_files=sorted({rf for t in root_tasks for rf in t.relevant_files}),
+            execution_order=list(root_cause_ids),
+        )
+    else:
+        corrective_batch = foreman.create_corrective_batch(
+            batch=batch,
+            review=review,
+            task_results=state["task_results"],
+            validation_result=validation,
+            ledger_context=ledger_ctx,
+        )
 
     allowed_orig_files = {_normalize_workspace_path(f) for f in batch.relevant_files}
     for ct in corrective_batch.tasks:

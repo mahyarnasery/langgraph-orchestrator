@@ -44,27 +44,26 @@ def format_ledger_for_prompt(
     ledger: Iterable[LedgerEntry],
     previous_cycle: CycleResult | None = None,
 ) -> str:
-    """Format the ExecutionLedger into a compact, token-efficient summary block."""
+    """Format the ExecutionLedger into a compact, telegraphic state block."""
     lines: list[str] = []
 
     if previous_cycle is not None and previous_cycle.ledger:
         lines.append(f"=== PREVIOUS CYCLE ({previous_cycle.cycle_id}) LEDGER SUMMARY ===")
-        for e in previous_cycle.ledger[-8:]:
-            lines.append(
-                f"  - [{e.status.upper()}] {e.layer}/{e.action} ({e.target}): {e.detail}"
-            )
+        prev_fails = [e for e in previous_cycle.ledger if e.status != "success"]
+        sample_prev = prev_fails[-4:] if prev_fails else previous_cycle.ledger[-3:]
+        for e in sample_prev:
+            lines.append(f"  - [{e.status.upper()}] {e.layer}/{e.action} ({e.target}): {e.detail[:120]}")
         lines.append("")
 
     entries = list(ledger)
+    lines.append("=== CURRENT CYCLE EXECUTION LEDGER ===")
     if not entries:
-        lines.append("=== CURRENT CYCLE EXECUTION LEDGER ===")
         lines.append("  (No steps executed yet in this cycle)")
         return "\n".join(lines)
 
-    lines.append("=== CURRENT CYCLE EXECUTION LEDGER ===")
-    for e in entries[-12:]:
+    for e in entries[-8:]:
         lines.append(
-            f"  {e.step}. [{e.status.upper()}] {e.layer}/{e.action} -> {e.target}: {e.detail}"
+            f"  {e.step}. [{e.status.upper()}] {e.layer}/{e.action} -> {e.target}: {e.detail[:140]}"
         )
     return "\n".join(lines)
 
@@ -663,3 +662,60 @@ def ensure_workspace_imports(
         return cleaned_source
 
     return "\n".join(prepend_lines) + "\n\n" + cleaned_source
+
+
+def generate_pyi_stub(source: str, max_lines: int = 40) -> str:
+    """
+    Project a Python source string into a compact `.pyi` interface stub:
+    - Strips function and method bodies down to `...`
+    - Preserves top-level constants, class headers, `self.<attr>` names, and full `def` signatures.
+    """
+    if not source.strip():
+        return ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        lines = [ln for ln in source.splitlines() if ln.strip()][:max_lines]
+        return "\n".join(lines)
+
+    stub_lines: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            seg = ast.unparse(node).strip()
+            if len(seg) <= 100:
+                stub_lines.append(seg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            args_str = ast.unparse(node.args)
+            ret_str = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+            stub_lines.append(f"{prefix} {node.name}({args_str}){ret_str}: ...")
+        elif isinstance(node, ast.ClassDef):
+            bases = [ast.unparse(b).strip() for b in node.bases]
+            base_str = f"({', '.join(bases)})" if bases else ""
+            stub_lines.append(f"class {node.name}{base_str}:")
+            attrs: list[str] = []
+            method_lines: list[str] = []
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if _is_stub_function(sub) and len(node.body) > 1:
+                        continue
+                    m_prefix = "async def" if isinstance(sub, ast.AsyncFunctionDef) else "def"
+                    m_args = ast.unparse(sub.args)
+                    m_ret = f" -> {ast.unparse(sub.returns)}" if sub.returns else ""
+                    method_lines.append(f"    {m_prefix} {sub.name}({m_args}){m_ret}: ...")
+                    for stmt in ast.walk(sub):
+                        if isinstance(stmt, ast.Assign):
+                            for t in stmt.targets:
+                                if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self":
+                                    if t.attr not in attrs:
+                                        attrs.append(t.attr)
+                        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Attribute) and isinstance(stmt.target.value, ast.Name) and stmt.target.value.id == "self":
+                            if stmt.target.attr not in attrs:
+                                attrs.append(stmt.target.attr)
+            for a in attrs:
+                stub_lines.append(f"    {a}: Any")
+            stub_lines.extend(method_lines)
+            if not attrs and not method_lines:
+                stub_lines.append("    ...")
+
+    return "\n".join(stub_lines[:max_lines])

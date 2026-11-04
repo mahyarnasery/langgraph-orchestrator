@@ -11,6 +11,7 @@ from .base import CodingHarness
 from .config import AiderConfig
 from src.orchestration.ledger import (
     ensure_class_wrapper,
+    generate_pyi_stub,
     ensure_workspace_imports,
     extract_python_signatures,
     merge_staged_snippets_ast,
@@ -115,6 +116,8 @@ class AiderHarness(CodingHarness):
         on_task_complete: Callable[[Task, TaskResult, dict[str, dict[str, str]]], None] | None = None,
         stop_after_tasks: int | None = None,
         plan: Plan | None = None,
+        is_rebuild: bool = False,
+        error_context: str = "",
     ) -> list[TaskResult]:
         if not batch.tasks:
             raise ValueError("TaskBatch must contain at least one task.")
@@ -273,7 +276,7 @@ class AiderHarness(CodingHarness):
                     else []
                 )
                 read_args: list[str] = []
-                for rf in [*read_only_files, *ext_read_paths]:
+                for rf in ext_read_paths:
                     read_args.extend(["--read", rf])
 
                 command = [
@@ -306,12 +309,62 @@ class AiderHarness(CodingHarness):
                 if read_only_files:
                     print(f"Read-Only Context: {', '.join(read_only_files)}")
 
-                completed = subprocess.run(
-                    command,
-                    cwd=ws_root,
-                    env=env,
-                    text=True,
-                )
+                if is_rebuild and is_python_target:
+                    print(f"[8B ESCALATION] Escalating rebuild task {task.task_id} ({primary_target}::{task.target_symbol or 'module'}) directly to 8B Foreman...")
+                    self._unload_worker_model()
+                    from src.agents.foreman import ForemanAgent
+                    inline_dep_str = build_inline_dependency_context(read_only_files, ws_root)
+                    prev_src = ""
+                    if use_staging and staged_rel_path:
+                        prev_src = staged_snippets.get(primary_target, {}).get(task.task_id, "")
+                    if not prev_src:
+                        prev_src = before_primary or before.get(editable_files[0], "")
+                    escalated_code = ForemanAgent().implement_atomic_task(
+                        target_file=primary_target,
+                        target_symbol=task.target_symbol,
+                        task_objective=task.objective,
+                        acceptance_criteria=task.acceptance_criteria,
+                        test_assertions=task.test_assertions,
+                        dependency_stubs=inline_dep_str,
+                        sibling_signatures=completed_sibling_sigs.get(primary_target, []),
+                        previous_code=prev_src,
+                        error_context=error_context,
+                    )
+                    if escalated_code.strip():
+                        self._safe_workspace_path(editable_files[0]).write_text(
+                            escalated_code, encoding="utf-8"
+                        )
+                    completed = subprocess.CompletedProcess(command, 0)
+                else:
+                    completed = subprocess.run(
+                        command,
+                        cwd=ws_root,
+                        env=env,
+                        text=True,
+                    )
+                    # Automatic fallback to 8B Foreman if 3B produced empty/syntax-broken code on a staged Python task
+                    after_check = self._snapshot_files(editable_files).get(editable_files[0], "").strip()
+                    if is_python_target and (completed.returncode != 0 or (use_staging and not after_check)):
+                        print(f"[8B FALLBACK] 3B Worker produced empty/failed output on {task.task_id}; escalating to 8B Foreman...")
+                        self._unload_worker_model()
+                        from src.agents.foreman import ForemanAgent
+                        inline_dep_str = build_inline_dependency_context(read_only_files, ws_root)
+                        escalated_code = ForemanAgent().implement_atomic_task(
+                            target_file=primary_target,
+                            target_symbol=task.target_symbol,
+                            task_objective=task.objective,
+                            acceptance_criteria=task.acceptance_criteria,
+                            test_assertions=task.test_assertions,
+                            dependency_stubs=inline_dep_str,
+                            sibling_signatures=completed_sibling_sigs.get(primary_target, []),
+                            previous_code="",
+                            error_context=error_context,
+                        )
+                        if escalated_code.strip():
+                            self._safe_workspace_path(editable_files[0]).write_text(
+                                escalated_code, encoding="utf-8"
+                            )
+                            completed = subprocess.CompletedProcess(command, 0)
 
                 after = self._snapshot_files(editable_files)
                 changed_physical = [
@@ -576,8 +629,10 @@ class AiderHarness(CodingHarness):
                     if fb.symbols:
                         lines.append("  - Planned Module Symbols:")
                         for sym in fb.symbols:
-                            marker = " (CURRENT TASK)" if sym.target_symbol == task.target_symbol else ""
-                            lines.append(f"    * `{sym.target_symbol}`{marker}: `{sym.signature}` -> {sym.contract}")
+                            if not task.target_symbol or sym.target_symbol == task.target_symbol:
+                                lines.append(f"    * [ACTIVE TARGET] `{sym.target_symbol}`: `{sym.signature}` -> {sym.contract}")
+                            else:
+                                lines.append(f"    * [SIBLING] `{sym.target_symbol}`: `{sym.signature}`")
                     lines.append("")
                     break
 
@@ -590,16 +645,11 @@ class AiderHarness(CodingHarness):
             lines.append("")
 
         if read_only_files:
-            ro_descriptions = [
-                f"{rf} (import as `{_module_import_name(rf)}`)"
-                if rf.endswith(".py")
-                else f"{rf} (data/config file)"
-                for rf in read_only_files
-            ]
-            lines.append(
-                f"Read-Only Reference Files (do NOT edit): {', '.join(ro_descriptions)}"
-            )
-            lines.append("")
+            inline_ctx = build_inline_dependency_context(read_only_files, get_workspace_root())
+            if inline_ctx:
+                lines.append("## Imported Interfaces & Config Ground-Truth (DO NOT REDEFINE):")
+                lines.append(inline_ctx)
+                lines.append("")
 
         if task.constraints or batch.constraints:
             lines.append("## Constraints:")
@@ -739,3 +789,41 @@ def _extract_file_spec_section(full_project_goal: str, target_file: str) -> str:
         if blk.strip() and (target_file in blk or fname in blk)
     ]
     return "\n\n".join(matched) if matched else full_project_goal.strip()
+
+
+def build_inline_dependency_context(
+    read_only_files: list[str],
+    ws_root: Path,
+) -> str:
+    """
+    Build a compact inline block of `.pyi` interface stubs for Python dependencies
+    and exact literal contents for small config/data files (`.json`, `.csv`, `.toml`).
+    """
+    if not read_only_files:
+        return ""
+
+    blocks: list[str] = []
+    for rel_f in read_only_files:
+        abs_f = (ws_root / rel_f).resolve()
+        if not abs_f.is_file():
+            continue
+        try:
+            raw = abs_f.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if not raw:
+            continue
+
+        if rel_f.endswith(".py"):
+            mod_name = _module_import_name(rel_f)
+            stub = generate_pyi_stub(raw)
+            if stub:
+                blocks.append(f"# Module `{rel_f}` (import from `{mod_name}`):\n{stub}")
+        else:
+            preview_lines = raw.splitlines()[:10]
+            preview = "\n".join(preview_lines)
+            if len(preview) > 600:
+                preview = preview[:600] + "..."
+            blocks.append(f"# Asset `{rel_f}` (exact ground-truth content):\n{preview}")
+
+    return "\n\n".join(blocks)

@@ -1,6 +1,7 @@
 from src.orchestration.models import get_foreman_model, model_session
 from src.orchestration.schemas import (
     AssembledModule,
+    AtomicCodeSnippet,
     CycleResult,
     ForemanReview,
     Plan,
@@ -265,3 +266,66 @@ Return only the structured ForemanReview.
         with model_session(get_foreman_model()) as llm:
             structured = llm.with_structured_output(ForemanReview)
             return structured.invoke(prompt)
+
+    def implement_atomic_task(
+        self,
+        *,
+        target_file: str,
+        target_symbol: str | None,
+        task_objective: str,
+        acceptance_criteria: list[str],
+        test_assertions: list[str],
+        dependency_stubs: str = "",
+        sibling_signatures: list[str] | None = None,
+        previous_code: str = "",
+        error_context: str = "",
+    ) -> str:
+        """
+        8B Foreman Escalation: directly implement a single atomic function, class method,
+        or file when the 3B Worker fails or during a surgical rebuild.
+        """
+        from src.orchestration.tools import sanitize_file_content
+
+        sym_line = f"Target Symbol: `{target_symbol}`" if target_symbol else "Target Scope: Full File"
+        sib_block = (
+            "Sibling symbols already in this module:\n" + "\n".join(f"- {s}" for s in sibling_signatures)
+            if sibling_signatures
+            else ""
+        )
+        dep_block = f"Imported Interfaces & Config Ground-Truth:\n{dependency_stubs}" if dependency_stubs else ""
+        prev_block = f"Previous broken implementation:\n~~~python\n{previous_code}\n~~~" if previous_code.strip() else ""
+        err_block = f"Validation / Assertion Errors to fix:\n{error_context}" if error_context.strip() else ""
+
+        class_hint = ""
+        if target_symbol and "." in target_symbol:
+            cls_name, m_name = target_symbol.split(".", 1)
+            class_hint = (
+                f"CRITICAL: Write `class {cls_name}:` containing ONLY `def {m_name}(self, ...):` "
+                f"(do not write `pass` stubs for other methods)."
+            )
+
+        prompt = f"""You are the 8B Lead Engineer escalating a failed Worker task.
+Write clean, exact code for `{target_file}`.
+{sym_line}
+Objective: {task_objective}
+{class_hint}
+
+Acceptance Criteria:
+{chr(10).join(f'- {c}' for c in acceptance_criteria)}
+
+Must Pass Assertions:
+{chr(10).join(f'- {a}' for a in test_assertions) if test_assertions else '- None'}
+
+{sib_block}
+{dep_block}
+{prev_block}
+{err_block}
+
+Rules:
+- Return ONLY valid code for `{target_file}` inside `AtomicCodeSnippet.code` (NEVER include ``` markdown fences or test assertions inside the module).
+- Preserve required imports at top of snippet.
+"""
+        with model_session(get_foreman_model()) as llm:
+            structured = llm.with_structured_output(AtomicCodeSnippet)
+            res = structured.invoke(prompt)
+        return sanitize_file_content(target_file, res.code)

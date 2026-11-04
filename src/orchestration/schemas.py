@@ -300,6 +300,18 @@ class TaskResult(BaseModel):
 # Foreman Assembly, Review & Self-Repair
 # ---------------------------------------------------------------------------
 
+class AtomicCodeSnippet(BaseModel):
+    """Focused code output produced when Foreman (8B) escalates a failed 3B Worker task."""
+
+    target_symbol: str | None = Field(
+        default=None,
+        description="Function or Class.method implemented.",
+    )
+    code: str = Field(
+        description="Valid raw Python code (or JSON/CSV content) for this task without markdown fences."
+    )
+
+
 class AssembledModule(BaseModel):
     """Output produced when Foreman assembles multiple staged Worker snippets into a module."""
 
