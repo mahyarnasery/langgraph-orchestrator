@@ -264,7 +264,7 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
             )
         )
 
-        if res.status != "completed":
+        if res.status not in ("completed", "no_change"):
             invalidated_tasks.append(f"{res.task_id}(status={res.status})")
             if primary_file in staged_files:
                 staged_files[primary_file].pop(res.task_id, None)
@@ -365,7 +365,16 @@ def reconcile_checkpoint_with_disk(checkpoint: CheckpointData) -> WorkflowState:
                 print(f"[RECONCILE] Restored live AST merge for {mod_file}")
 
     reconciled_phase = checkpoint.phase
-    if checkpoint.plan is None:
+    if checkpoint.phase == "planner_revision_needed":
+        reconciled_phase = "initial"
+        checkpoint.plan = None
+        checkpoint.task_batches = []
+        verified_results.clear()
+        staged_files.clear()
+        checkpoint.foreman_repair_attempts = 0
+        checkpoint.rebuild_attempts = 0
+        checkpoint.worker_attempts = {}
+    elif checkpoint.plan is None:
         reconciled_phase = "initial"
     elif not checkpoint.task_batches:
         reconciled_phase = "planned"

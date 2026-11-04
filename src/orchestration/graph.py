@@ -350,6 +350,30 @@ def _sort_execution_order_topologically(
                 if asset_tid not in deps:
                     deps.append(asset_tid)
 
+        # Ensure foundational domain/models/core tasks run before services/analytics tasks
+        t_file = t.relevant_files[0] if t.relevant_files else ""
+        t_text = f"{t.objective} {' '.join(t.constraints)} {' '.join(t.acceptance_criteria)} {' '.join(t.test_assertions)}"
+        if t_file.startswith(("services/", "analytics/")):
+            for other_t in tasks:
+                if other_t.task_id == t.task_id or not other_t.relevant_files:
+                    continue
+                o_file = other_t.relevant_files[0]
+                if o_file.startswith(("domain/", "models/", "core/")) and other_t.task_id not in deps:
+                    deps.append(other_t.task_id)
+
+        # If task `t` mentions another task's `target_symbol` (e.g. sibling helper function or class),
+        # schedule that symbol's task before `t` (unless both mention each other).
+        for other_t in tasks:
+            if other_t.task_id == t.task_id or not other_t.target_symbol:
+                continue
+            sym_short = other_t.target_symbol.split(".")[-1]
+            if len(sym_short) >= 3 and sym_short != "__init__" and sym_short in t_text:
+                other_text = f"{other_t.objective} {' '.join(other_t.acceptance_criteria)}"
+                my_sym = (t.target_symbol or "").split(".")[-1]
+                if not (my_sym and my_sym in other_text):
+                    if other_t.task_id not in deps:
+                        deps.append(other_t.task_id)
+
         if t.relevant_files and t.target_symbol and not t.target_symbol.endswith("__init__"):
             primary = t.relevant_files[0]
             init_tid: str | None = None
@@ -1027,6 +1051,15 @@ def planner_node(state: WorkflowState) -> dict:
         state,
         {
             "plan": plan,
+            "task_batches": [],
+            "task_results": [],
+            "staged_files": {},
+            "worker_attempts": {},
+            "foreman_repair_attempts": 0,
+            "rebuild_attempts": 0,
+            "validation_result": None,
+            "foreman_review": None,
+            "planner_review": None,
             "ledger": updated_ledger,
             "phase": "planned",
         },
@@ -1084,6 +1117,14 @@ def foreman_node(state: WorkflowState) -> dict:
         state,
         {
             "task_batches": [batch],
+            "task_results": [],
+            "staged_files": {},
+            "worker_attempts": {},
+            "foreman_repair_attempts": 0,
+            "rebuild_attempts": 0,
+            "validation_result": None,
+            "foreman_review": None,
+            "planner_review": None,
             "file_snapshots": snapshots,
             "ledger": updated_ledger,
             "phase": "task_ready",
@@ -2237,8 +2278,9 @@ def _extract_stage_spec_sections(full_project_goal: str, target_files: list[str]
     if not full_project_goal.strip() or not target_files:
         return full_project_goal.strip()
 
+    cleaned_goal = full_project_goal.replace("\u200b", "").replace("\ufeff", "").strip()
     norm_targets = {_normalize_workspace_path(tf) for tf in target_files if tf.strip()}
-    blocks = re.split(r"(?=^\s*\d+\.\s+)", full_project_goal.strip(), flags=re.MULTILINE)
+    blocks = re.split(r"(?=^\s*\d+\.\s+)", cleaned_goal, flags=re.MULTILINE)
     if len(blocks) <= 2:
         return full_project_goal.strip()
 
@@ -2342,6 +2384,10 @@ def run_staged_project(
                 architecture_context=architecture,
                 max_stages=max_stages,
             )
+            for stg in blueprint.stages:
+                scoped_sec = _extract_stage_spec_sections(goal, stg.target_files)
+                if scoped_sec and scoped_sec not in stg.objective:
+                    stg.objective = f"{stg.objective.strip()}\n\nExact Specification for Stage {stg.stage_id} Files:\n{scoped_sec}"
             print(blueprint.model_dump_json(indent=2))
             resolved_stages = list(blueprint.stages)
 

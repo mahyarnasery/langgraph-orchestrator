@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -338,13 +339,23 @@ class AiderHarness(CodingHarness):
                                 )
                                 break
                     if not raw_snippet:
-                        nested_staging = staging_dir / primary_target
-                        if nested_staging.is_file() and nested_staging.read_text(encoding="utf-8").strip():
-                            raw_snippet = nested_staging.read_text(encoding="utf-8").strip()
-                            nested_staging.unlink(missing_ok=True)
-                            self._safe_workspace_path(staged_rel_path).write_text(
-                                raw_snippet + "\n", encoding="utf-8"
-                            )
+                        for cand_sub in (
+                            staging_dir / primary_target,
+                            staging_dir / "path/to" / primary_target,
+                            staging_dir / ".path/to" / primary_target,
+                            staging_dir / "path/to" / Path(staged_rel_path).name,
+                            staging_dir / ".path/to" / Path(staged_rel_path).name,
+                        ):
+                            if cand_sub.is_file() and cand_sub.read_text(encoding="utf-8").strip():
+                                raw_snippet = cand_sub.read_text(encoding="utf-8").strip()
+                                cand_sub.unlink(missing_ok=True)
+                                self._safe_workspace_path(staged_rel_path).write_text(
+                                    raw_snippet + "\n", encoding="utf-8"
+                                )
+                                break
+                        for stray_dir in (staging_dir / "path", staging_dir / ".path", ws_root / "path", ws_root / ".path"):
+                            if stray_dir.is_dir():
+                                shutil.rmtree(stray_dir, ignore_errors=True)
                     if not raw_snippet:
                         after_primary = (
                             self._snapshot_files([primary_target])
@@ -406,6 +417,10 @@ class AiderHarness(CodingHarness):
                     )
                     status = "failure"
                 elif changed:
+                    status = "completed"
+                elif not use_staging and self._is_non_empty_file(primary_target):
+                    changed = [primary_target]
+                    completed_files.add(primary_target)
                     status = "completed"
                 else:
                     status = "no_change"
@@ -677,14 +692,19 @@ def _resolve_task_read_only_files(
             except Exception:
                 pass
 
-    # If target is main.py/app.py or mentions config/data files, include matching non-Python assets
-    if Path(primary_target).name in ("main.py", "app.py") or not referenced:
+    # For any Python task, include existing non-Python config/data assets (.json, .csv, .toml, .ini)
+    # under 4KB so the Worker always sees exact config keys and CSV column headers.
+    if primary_target.endswith(".py"):
         for asset_path in list_workspace_files():
             rel_asset = str(asset_path.relative_to(ws_root))
-            if rel_asset == primary_target or rel_asset.startswith("tests/") or asset_path.name == "__init__.py":
+            if rel_asset == primary_target or rel_asset.startswith("tests/"):
                 continue
-            if Path(primary_target).name in ("main.py", "app.py") or asset_path.name in task_text or rel_asset in task_text:
-                referenced.add(rel_asset)
+            if asset_path.suffix.lower() in (".json", ".csv", ".toml", ".yaml", ".yml", ".ini", ".cfg"):
+                try:
+                    if asset_path.stat().st_size <= 4096:
+                        referenced.add(rel_asset)
+                except Exception:
+                    pass
 
     return sorted(
         f for f in referenced
@@ -699,7 +719,8 @@ def _extract_file_spec_section(full_project_goal: str, target_file: str) -> str:
     if not full_project_goal.strip():
         return ""
     fname = Path(target_file).name
-    blocks = re.split(r"(?=^\s*\d+\.\s+)", full_project_goal.strip(), flags=re.MULTILINE)
+    cleaned_goal = full_project_goal.replace("\u200b", "").replace("\ufeff", "").strip()
+    blocks = re.split(r"(?=^\s*\d+\.\s+)", cleaned_goal, flags=re.MULTILINE)
     if len(blocks) <= 2:
         return full_project_goal.strip()
     header_matched = []
