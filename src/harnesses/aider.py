@@ -343,6 +343,35 @@ class AiderHarness(CodingHarness):
                         text=True,
                     )
                     # Automatic fallback to 8B Foreman if 3B produced empty/syntax-broken code on a staged Python task
+                    # Recover stray dotfiles or nested paths written by Aider before verifying output emptiness
+                    if use_staging and staged_rel_path:
+                        staged_fname = Path(staged_rel_path).name
+                        for stray_cand in (
+                            ws_root / f".{staged_fname}",
+                            ws_root / staged_fname,
+                            staging_dir / f".{staged_fname}",
+                            ws_root / f".path/to/{staged_rel_path}",
+                            ws_root / f".path/to/{staged_fname}",
+                            ws_root / f"path/to/{staged_rel_path}",
+                            ws_root / f"path/to/{staged_fname}",
+                            ws_root / f"path/to/{primary_target}",
+                            staging_dir / primary_target,
+                            staging_dir / "path/to" / primary_target,
+                            staging_dir / ".path/to" / primary_target,
+                            staging_dir / "path/to" / staged_fname,
+                            staging_dir / ".path/to" / staged_fname,
+                        ):
+                            if stray_cand.is_file() and stray_cand.read_text(encoding="utf-8").strip():
+                                raw_recovered = stray_cand.read_text(encoding="utf-8").strip()
+                                stray_cand.unlink(missing_ok=True)
+                                self._safe_workspace_path(staged_rel_path).write_text(
+                                    raw_recovered + "\n", encoding="utf-8"
+                                )
+                                break
+                        for stray_dir in (staging_dir / "path", staging_dir / ".path", ws_root / "path", ws_root / ".path"):
+                            if stray_dir.is_dir():
+                                shutil.rmtree(stray_dir, ignore_errors=True)
+
                     after_check = self._snapshot_files(editable_files).get(editable_files[0], "").strip()
                     if is_python_target and (completed.returncode != 0 or (use_staging and not after_check)):
                         print(f"[8B FALLBACK] 3B Worker produced empty/failed output on {task.task_id}; escalating to 8B Foreman...")

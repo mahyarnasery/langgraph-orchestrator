@@ -178,50 +178,64 @@ def extract_all_ast_symbol_names(source: str) -> set[str]:
     return symbols
 
 
-def ensure_class_wrapper(snippet: str, target_symbol: str | None) -> str:
+def ensure_class_wrapper(snippet_source: str, target_symbol: str | None = None) -> str:
     """
-    If `target_symbol` is `'ClassName.method_name'` and the Worker wrote a bare
-    top-level `def method_name(self, ...):` without `class ClassName:`, wrap the
-    function definition inside `class ClassName:` while keeping imports at top level.
+    1. If `target_symbol` is `'ClassName.method_name'` and `snippet_source` defines a top-level
+       `def method_name(...)` without wrapping it inside `class ClassName:`, wrap it automatically.
+    2. If `snippet_source` defines `class ClassName:`, prune any other methods from that class definition
+       so only `method_name` is kept for this task's snippet.
     """
-    if not target_symbol or "." not in target_symbol or not snippet.strip():
-        return snippet
+    if not target_symbol or "." not in target_symbol or not snippet_source.strip():
+        return snippet_source
 
-    cls_name = target_symbol.split(".", 1)[0].strip()
-    if not cls_name:
-        return snippet
+    class_name, method_name = [part.strip() for part in target_symbol.split(".", 1)]
+    if not class_name or not method_name:
+        return snippet_source
 
     try:
-        tree = ast.parse(snippet)
+        tree = ast.parse(snippet_source)
     except SyntaxError:
-        return snippet
+        return snippet_source
 
-    if any(isinstance(n, ast.ClassDef) and n.name == cls_name for n in tree.body):
-        return snippet
+    class_def = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name), None)
+    if class_def is not None:
+        new_class_body = [
+            sub for sub in class_def.body
+            if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+            or sub.name == method_name
+        ]
+        if new_class_body:
+            class_def.body = new_class_body
+        return ast.unparse(tree) + "\n"
 
-    top_imports: list[str] = []
-    body_segments: list[str] = []
-    has_func = False
-
-    for node in tree.body:
-        seg = (ast.get_source_segment(snippet, node) or ast.unparse(node)).strip()
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            top_imports.append(seg)
+    import_lines: list[str] = []
+    other_lines: list[str] = []
+    for line in snippet_source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("import ", "from ")):
+            import_lines.append(stripped)
         else:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                has_func = True
-            dedented = textwrap.dedent(seg)
-            body_segments.append(textwrap.indent(dedented, "    "))
+            other_lines.append(line)
 
-    if not has_func or not body_segments:
-        return snippet
+    indented_body = "\n".join(
+        f"    {line}" if line.strip() else "" for line in other_lines
+    ).strip("\n")
+    if not indented_body:
+        return snippet_source
 
-    parts: list[str] = []
-    if top_imports:
-        parts.append("\n".join(top_imports))
-    class_block = f"class {cls_name}:\n" + "\n\n".join(body_segments)
-    parts.append(class_block)
-    return "\n\n".join(parts) + "\n"
+    header = "\n".join(import_lines)
+    wrapped = (
+        f"{header}\n\nclass {class_name}:\n{indented_body}\n"
+        if header
+        else f"class {class_name}:\n{indented_body}\n"
+    )
+    try:
+        ast.parse(wrapped)
+        return wrapped
+    except SyntaxError:
+        return snippet_source
+
+
 
 
 def _strip_self_imports(source: str, target_filename: str) -> str:

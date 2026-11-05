@@ -362,18 +362,20 @@ def _sort_execution_order_topologically(
                 if o_file.startswith(("domain/", "models/", "core/")) and other_t.task_id not in deps:
                     deps.append(other_t.task_id)
 
-        # If task `t` mentions another task's `target_symbol` (e.g. sibling helper function or class),
-        # schedule that symbol's task before `t` (unless both mention each other).
-        for other_t in tasks:
-            if other_t.task_id == t.task_id or not other_t.target_symbol:
-                continue
-            sym_short = other_t.target_symbol.split(".")[-1]
-            if len(sym_short) >= 3 and sym_short != "__init__" and sym_short in t_text:
-                other_text = f"{other_t.objective} {' '.join(other_t.acceptance_criteria)}"
-                my_sym = (t.target_symbol or "").split(".")[-1]
-                if not (my_sym and my_sym in other_text):
-                    if other_t.task_id not in deps:
-                        deps.append(other_t.task_id)
+        # If task `t` mentions another task's `target_symbol` in its objective/criteria,
+        # schedule that symbol's task before `t` (never make `__init__` depend on other methods).
+        my_sym_short = (t.target_symbol or "").split(".")[-1]
+        t_obj_crit = f"{t.objective} {' '.join(t.acceptance_criteria)}"
+        if my_sym_short != "__init__":
+            for other_t in tasks:
+                if other_t.task_id == t.task_id or not other_t.target_symbol:
+                    continue
+                sym_short = other_t.target_symbol.split(".")[-1]
+                if len(sym_short) >= 3 and sym_short != "__init__" and sym_short in t_obj_crit:
+                    other_text = f"{other_t.objective} {' '.join(other_t.acceptance_criteria)}"
+                    if not (my_sym_short and my_sym_short in other_text):
+                        if other_t.task_id not in deps:
+                            deps.append(other_t.task_id)
 
         if t.relevant_files and t.target_symbol and not t.target_symbol.endswith("__init__"):
             primary = t.relevant_files[0]
@@ -459,6 +461,14 @@ def _normalize_plan_blueprints(plan: Plan | None, project_goal: str = "") -> Non
 
     ws_root = get_workspace_root()
     existing_sym_to_mod: dict[str, str] = {}
+    for fb_scan in getattr(plan, "file_blueprints", []):
+        norm_scan = _normalize_workspace_path(fb_scan.path)
+        if norm_scan.endswith(".py") and Path(norm_scan).name not in ("__init__.py", "main.py", "app.py"):
+            mod_scan = ".".join(Path(norm_scan).with_suffix("").parts)
+            for sym_scan in fb_scan.symbols:
+                top_sym = sym_scan.target_symbol.split(".")[0].strip()
+                if top_sym:
+                    existing_sym_to_mod[top_sym] = mod_scan
     for py_p in list_workspace_py_files():
         rel_p = str(py_p.relative_to(ws_root))
         if rel_p.startswith("tests/") or py_p.name in ("__init__.py", "main.py", "app.py"):
