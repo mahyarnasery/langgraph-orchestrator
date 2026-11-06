@@ -484,7 +484,13 @@ def merge_staged_snippets_ast(
         sections.append("\n\n".join(main_blocks))
 
     assembled = "\n\n".join(sections).strip()
-    return (assembled + "\n") if assembled else ""
+    if not assembled:
+        return ""
+    try:
+        assembled = ast.unparse(ast.parse(assembled)).strip()
+    except SyntaxError:
+        pass
+    return assembled + "\n"
 
 
 def _extract_snippet_symbol_keys(snippet: str) -> set[str]:
@@ -733,3 +739,362 @@ def generate_pyi_stub(source: str, max_lines: int = 40) -> str:
                 stub_lines.append("    ...")
 
     return "\n".join(stub_lines[:max_lines])
+
+
+_FILE_PATH_TOKEN_RE = re.compile(
+    r"(?<![a-zA-Z0-9_./-])"
+    r"((?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_.-]+\.(?:py|json|csv|toml|yaml|yml|ini|cfg|sql|txt|md))"
+    r"(?![a-zA-Z0-9_./-])"
+)
+
+
+def extract_file_paths_from_goal(project_goal: str) -> list[str]:
+    """Extract all explicit workspace file paths in order of appearance from a prompt."""
+    if not project_goal.strip():
+        return []
+    found: list[str] = []
+    for match in _FILE_PATH_TOKEN_RE.finditer(project_goal):
+        raw = match.group(1).strip().removeprefix("sandbox/").strip("/")
+        if not raw or raw.startswith("path/to/") or raw in ("__init__.py",):
+            continue
+        if raw not in found:
+            found.append(raw)
+    return found
+
+
+def file_architectural_tier(rel_path: str) -> int:
+    """
+    Classify a workspace file into its bottom-up architectural tier:
+    - Tier 0: Non-Python config/data assets (.json, .csv, .toml, .yaml, .ini, .sql, .txt)
+    - Tier 1: Foundational Python domain/model/core/schema modules
+    - Tier 2: Service, analytics, and processing Python modules
+    - Tier 3: Entry-point scripts (main.py, app.py, cli.py, run.py)
+    """
+    norm = rel_path.strip().removeprefix("sandbox/").strip("/")
+    p = Path(norm)
+    if p.suffix.lower() != ".py":
+        return 0
+    if p.name in ("main.py", "app.py", "cli.py", "run.py"):
+        return 3
+    first_dir = p.parts[0].lower() if len(p.parts) > 1 else ""
+    if first_dir in ("domain", "models", "core", "schemas", "entities", "utils"):
+        return 1
+    return 2
+
+
+def has_numbered_spec_sections(project_goal: str) -> bool:
+    """Return True if `project_goal` is structured with top-level numbered sections (`1. ... 2. ...`)."""
+    cleaned = project_goal.replace("\u200b", "").replace("\ufeff", "").strip()
+    blocks = [
+        b.strip()
+        for b in re.split(r"(?=^\s*\d+\.\s+)", cleaned, flags=re.MULTILINE)
+        if b.strip() and re.match(r"^\d+\.\s+", b.strip())
+    ]
+    return len(blocks) >= 2
+
+
+def _split_prose_into_segments(text: str) -> list[str]:
+    """
+    Split free-form prose into sentence/line segments while preserving inline JSON `{...}`,
+    function signatures `(...)`, lists `[...]`, backticks `` `...` ``, and decimal numbers.
+    """
+    segments: list[str] = []
+    buf: list[str] = []
+    in_backtick = False
+    in_quote: str | None = None
+    paren_depth = 0
+    brace_depth = 0
+    bracket_depth = 0
+    n = len(text)
+    i = 0
+
+    while i < n:
+        ch = text[i]
+        prev_ch = text[i - 1] if i > 0 else ""
+
+        if ch == "`" and in_quote is None:
+            in_backtick = not in_backtick
+            buf.append(ch)
+            i += 1
+            continue
+
+        if not in_backtick:
+            if in_quote is not None:
+                if ch == in_quote and prev_ch != "\\":
+                    in_quote = None
+                buf.append(ch)
+                i += 1
+                continue
+            elif ch in ('"', "'"):
+                if ch == "'" and prev_ch.isalnum() and (i + 1 < n and text[i + 1].isalnum()):
+                    buf.append(ch)
+                    i += 1
+                    continue
+                in_quote = ch
+                buf.append(ch)
+                i += 1
+                continue
+
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+            elif ch == "{":
+                brace_depth += 1
+            elif ch == "}" and brace_depth > 0:
+                brace_depth -= 1
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]" and bracket_depth > 0:
+                bracket_depth -= 1
+
+        at_top = (
+            not in_backtick
+            and in_quote is None
+            and paren_depth == 0
+            and brace_depth == 0
+            and bracket_depth == 0
+        )
+
+        if at_top and ch == "\n":
+            seg = "".join(buf).strip()
+            if seg:
+                segments.append(seg)
+            buf = []
+            i += 1
+            continue
+
+        if at_top and ch == ";" and i + 1 < n and text[i + 1].isspace():
+            seg = "".join(buf).strip()
+            if seg:
+                segments.append(seg)
+            buf = []
+            i += 1
+            continue
+
+        if at_top and ch == "." and (i + 1 == n or text[i + 1].isspace()):
+            current_str = "".join(buf).strip()
+            if not re.match(r"^\d+$", current_str) and not re.search(
+                r"\b(?:e\.g|i\.e|etc|vs)$", current_str, re.IGNORECASE
+            ):
+                buf.append(ch)
+                seg = "".join(buf).strip()
+                if seg:
+                    segments.append(seg)
+                buf = []
+                i += 1
+                continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _find_mentioned_files_in_segment(seg: str, known_files: list[str]) -> list[str]:
+    """Return known files mentioned in `seg`, ordered by their first appearance offset in `seg`."""
+    hits: list[tuple[int, str]] = []
+    name_counts: dict[str, int] = {}
+    for kf in known_files:
+        bname = Path(kf).name
+        name_counts[bname] = name_counts.get(bname, 0) + 1
+
+    for kf in known_files:
+        m_exact = re.search(
+            rf"(?<![a-zA-Z0-9_./-]){re.escape(kf)}(?![a-zA-Z0-9_./-])", seg
+        )
+        if m_exact:
+            hits.append((m_exact.start(), kf))
+            continue
+        # Only match dotted module path (e.g. `domain.models`) when `kf` is inside a package directory
+        if kf.endswith(".py") and len(Path(kf).parts) > 1:
+            mod_dotted = ".".join(Path(kf).with_suffix("").parts)
+            m_mod = re.search(
+                rf"(?<![a-zA-Z0-9_./-]){re.escape(mod_dotted)}(?![a-zA-Z0-9_./-])",
+                seg,
+            )
+            if m_mod:
+                hits.append((m_mod.start(), kf))
+                continue
+        bname = Path(kf).name
+        if name_counts.get(bname, 0) == 1:
+            m_b = re.search(
+                rf"(?<![a-zA-Z0-9_./-]){re.escape(bname)}(?![a-zA-Z0-9_./-])", seg
+            )
+            if m_b:
+                hits.append((m_b.start(), kf))
+
+    hits.sort(key=lambda pair: pair[0])
+    ordered: list[str] = []
+    for _, kf in hits:
+        if kf not in ordered:
+            ordered.append(kf)
+    return ordered
+
+
+def _is_file_subject_opener(seg: str, file_path: str) -> bool:
+    """Return True if `seg` begins by introducing `file_path` as the subject module being specified."""
+    bname = Path(file_path).name
+    pat = (
+        rf"^(?:first,\s*|next,\s*|then,\s*|finally,\s*|also,\s*|for\s+[^,]+,\s*)?"
+        rf"(?:start\s+by\s+creating|in|for|create|implement|write|define|update|modify)?\s*"
+        rf"`?(?:{re.escape(file_path)}|{re.escape(bname)})`?\s*(?:[:,]|at\b|which\b|with\b|containing\b|to\b)"
+    )
+    return bool(re.match(pat, seg.strip(), re.IGNORECASE))
+
+
+def slice_tier1_spec_for_files(
+    full_project_goal: str,
+    target_files: list[str],
+    all_known_files: list[str] | None = None,
+) -> str:
+    """
+    Slice a Tier-0 project specification (numbered OR un-numbered free-form prose)
+    into self-contained, canonical Tier-1 specification blocks scoped strictly to
+    `target_files`.
+    """
+    if not full_project_goal.strip() or not target_files:
+        return full_project_goal.strip()
+
+    norm_targets = [
+        tf.strip().removeprefix("sandbox/").strip("/")
+        for tf in target_files
+        if tf and tf.strip()
+    ]
+    if not norm_targets:
+        return full_project_goal.strip()
+
+    cleaned_goal = full_project_goal.replace("\u200b", "").replace("\ufeff", "").strip()
+
+    # Fast path for numbered specification prompts (`1. ... 2. ...`)
+    if has_numbered_spec_sections(cleaned_goal):
+        blocks = re.split(r"(?=^\s*\d+\.\s+)", cleaned_goal, flags=re.MULTILINE)
+        matched_blocks: list[str] = []
+        for blk in blocks:
+            blk_s = blk.strip()
+            if not blk_s or not re.match(r"^\d+\.\s+", blk_s):
+                continue
+            header_part = blk_s.splitlines()[0].split(":", 1)[0]
+            if any(tf in header_part or Path(tf).name in header_part for tf in norm_targets):
+                matched_blocks.append(blk_s)
+        if matched_blocks:
+            return "\n\n".join(matched_blocks)
+
+    discovered = extract_file_paths_from_goal(cleaned_goal)
+    known_files: list[str] = []
+    for f in (all_known_files or []) + discovered + norm_targets:
+        nf = f.strip().removeprefix("sandbox/").strip("/")
+        if nf and nf not in known_files:
+            known_files.append(nf)
+
+    segments = _split_prose_into_segments(cleaned_goal)
+    if not segments:
+        return cleaned_goal
+
+    seg_mentions: list[list[str]] = [
+        _find_mentioned_files_in_segment(seg, known_files) for seg in segments
+    ]
+
+    per_file_segments: dict[str, list[str]] = {kf: [] for kf in known_files}
+    defined_files: set[str] = set()
+    active_files: list[str] = []
+
+    for seg_idx, (seg, mentioned) in enumerate(zip(segments, seg_mentions)):
+        if not mentioned:
+            for af in active_files:
+                if seg not in per_file_segments.setdefault(af, []):
+                    per_file_segments[af].append(seg)
+            continue
+
+        tiers = {mf: file_architectural_tier(mf) for mf in mentioned}
+        has_concrete_spec = any(
+            tok in seg
+            for tok in (
+                "{",
+                "def ",
+                "class ",
+                "__init__",
+                "->",
+                "assert",
+                "print",
+                "==",
+                "import ",
+            )
+        )
+        later_mentioned = {
+            mf
+            for later_list in seg_mentions[seg_idx + 1 :]
+            for mf in later_list
+        }
+        if (
+            not defined_files
+            and len(mentioned) >= 3
+            and len(set(tiers.values())) >= 2
+            and not has_concrete_spec
+            and all(mf in later_mentioned for mf in mentioned)
+        ):
+            continue
+
+        unseen = [mf for mf in mentioned if mf not in defined_files]
+        active_max_tier = max(
+            (file_architectural_tier(af) for af in active_files), default=-1
+        )
+        starts_with_subject = any(
+            _is_file_subject_opener(seg, mf) for mf in mentioned
+        )
+
+        # If all mentioned files were already defined in earlier segments, `active_files` is
+        # at a higher architectural tier, and this sentence does not open a file as subject,
+        # treat it as a continuation sentence of `active_files` referencing dependencies.
+        if (
+            not unseen
+            and active_files
+            and active_max_tier > max(tiers.values())
+            and not starts_with_subject
+        ):
+            assigned = list(active_files)
+        elif len(mentioned) == 1:
+            assigned = [mentioned[0]]
+        else:
+            first_f = mentioned[0]
+            max_tier = max(tiers.values())
+
+            if tiers[first_f] == max_tier and tiers[first_f] > min(tiers.values()):
+                assigned = [mf for mf in mentioned if tiers[mf] == max_tier]
+            elif unseen:
+                max_unseen_tier = max(tiers[mf] for mf in unseen)
+                if tiers[first_f] == max_unseen_tier and len({tiers[mf] for mf in unseen}) > 1:
+                    assigned = [mf for mf in unseen if tiers[mf] == max_unseen_tier]
+                else:
+                    assigned = unseen
+            else:
+                assigned = [mf for mf in mentioned if tiers[mf] == max_tier]
+
+        for af in assigned:
+            if seg not in per_file_segments.setdefault(af, []):
+                per_file_segments[af].append(seg)
+        defined_files.update(assigned)
+
+        if len(assigned) > 1 and seg.rstrip().endswith(":"):
+            active_files = [assigned[-1]]
+        else:
+            active_files = list(assigned)
+
+    blocks_out: list[str] = []
+    for idx, tf in enumerate(norm_targets, start=1):
+        segs = per_file_segments.get(tf, [])
+        if not segs:
+            bname = Path(tf).name
+            segs = [
+                s
+                for s in segments
+                if re.search(rf"(?<![a-zA-Z0-9_./-]){re.escape(bname)}(?![a-zA-Z0-9_./-])", s)
+            ]
+        if segs:
+            body = "\n   ".join(segs)
+            blocks_out.append(f"{idx}. `{tf}`:\n   {body}")
+
+    return "\n\n".join(blocks_out) if blocks_out else cleaned_goal

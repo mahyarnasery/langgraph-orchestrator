@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import textwrap
 import tomllib
 
 from .ledger import _is_stub_function
@@ -288,27 +289,95 @@ def _check_symbol_defined(source: str, target_symbol: str) -> tuple[bool, str]:
     return False, f"'{target_symbol}' not defined"
 
 
+def _split_assertion_lines(items: list[str]) -> list[str]:
+    """
+    Split assertion/setup strings on embedded `\n` newlines (and literal `\\n`
+    outside quotes) so every item is a single line.
+    """
+    out: list[str] = []
+    for item in items:
+        if not item:
+            continue
+        normalized = re.sub(r"(?<!['\"\\])\\n", "\n", item)
+        for sub_line in normalized.splitlines():
+            stripped = sub_line.strip()
+            if stripped:
+                out.append(stripped)
+    return out
+
+
+def _extract_assigned_names(stmt: str) -> set[str]:
+    """Return variable names bound via assignment (`ast.Store`) in `stmt`."""
+    try:
+        tree = ast.parse(stmt)
+    except SyntaxError:
+        return set()
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+
+
+def _select_referenced_setup_lines(
+    assertion_stmt: str,
+    candidate_setup_lines: list[str],
+) -> list[str]:
+    """
+    Return only the setup lines from `candidate_setup_lines` whose assigned variable
+    is actually referenced (`_find_unbound_symbol`) by `assertion_stmt` (including
+    transitive setup dependencies).
+    """
+    if not candidate_setup_lines:
+        return []
+
+    selected_rev: list[str] = []
+    current_stmt = assertion_stmt.strip()
+
+    for setup_ln in reversed(candidate_setup_lines):
+        setup_clean = setup_ln.strip()
+        if not setup_clean or setup_clean in current_stmt:
+            continue
+        assigned = _extract_assigned_names(setup_clean)
+        if not assigned:
+            continue
+        try:
+            tree = ast.parse(current_stmt)
+            all_loaded = {
+                n.id
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+            }
+        except SyntaxError:
+            all_loaded = set()
+
+        non_target_globals = all_loaded - assigned
+        if _find_unbound_symbol(current_stmt, non_target_globals) is not None:
+            selected_rev.append(setup_clean)
+            current_stmt = f"{setup_clean}; {current_stmt}"
+
+    return list(reversed(selected_rev))
+
+
 def _prepare_assertions(
     raw_assertions: list[str],
     shared_setup_lines: list[str] | None = None,
 ) -> list[str]:
     """
-    Pair multi-line setup statements (e.g. `items = [1, 2]`) with subsequent `assert ...`
-    statements so every returned string is a self-contained executable assertion line.
+    Split embedded newlines and prepend only those setup statements whose assigned
+    variables are actually referenced (`_find_unbound_symbol`) by each assertion.
     """
-    setup_lines: list[str] = list(shared_setup_lines or [])
-    prepared: list[str] = []
+    setup_lines: list[str] = []
+    for s_line in _split_assertion_lines(list(shared_setup_lines or [])):
+        if "assert " not in s_line and "=" in s_line and s_line not in setup_lines:
+            setup_lines.append(s_line)
 
-    expanded_raw: list[str] = []
-    for item in raw_assertions:
-        for sub_line in item.splitlines():
-            if sub_line.strip():
-                expanded_raw.append(sub_line.strip())
+    prepared: list[str] = []
+    expanded_raw = _split_assertion_lines(raw_assertions)
+
     for raw in expanded_raw:
         cleaned = raw.strip()
-        if not cleaned:
-            continue
-        if cleaned.startswith(("print(", "return ")):
+        if not cleaned or cleaned.startswith(("print(", "return ")):
             continue
         # Fix common Foreman typo: `assert round(expr), 10.0` -> `assert round(expr, 2) == 10.0`
         m_comma = re.match(r"^assert\s+round\((.+)\)\s*,\s*([0-9.]+)\s*$", cleaned)
@@ -316,18 +385,19 @@ def _prepare_assertions(
             cleaned = f"assert round({m_comma.group(1)}, 2) == {m_comma.group(2)}"
 
         if "assert " in cleaned:
-            if setup_lines:
-                prefix = "; ".join(setup_lines)
-                full_stmt = f"{prefix}; {cleaned}" if prefix not in cleaned else cleaned
-                prepared.append(full_stmt)
-            else:
-                prepared.append(cleaned)
-            # Also retain any assignment part inside `a = 1; assert a == 1` for subsequent assertions
             for part in cleaned.split(";"):
                 p_strip = part.strip()
                 if p_strip and not p_strip.startswith("assert ") and "=" in p_strip:
                     if p_strip not in setup_lines:
                         setup_lines.append(p_strip)
+
+            needed_setup = _select_referenced_setup_lines(cleaned, setup_lines)
+            if needed_setup:
+                prefix = "; ".join(needed_setup)
+                full_stmt = f"{prefix}; {cleaned}" if prefix not in cleaned else cleaned
+                prepared.append(full_stmt)
+            else:
+                prepared.append(cleaned)
         elif "=" in cleaned:
             try:
                 parsed = ast.parse(cleaned)
@@ -675,8 +745,7 @@ def validate_batch(
         if not task.relevant_files:
             continue
         tf = _normalize_path(task.relevant_files[0])
-        for raw_a in task.test_assertions:
-            cleaned_a = raw_a.strip()
+        for cleaned_a in _split_assertion_lines(task.test_assertions):
             if cleaned_a and "assert " not in cleaned_a and "=" in cleaned_a:
                 shared_setup_by_file.setdefault(tf, [])
                 if cleaned_a not in shared_setup_by_file[tf]:
@@ -867,8 +936,7 @@ def emit_pytest_suite(
         if not task.relevant_files:
             continue
         tf = _normalize_path(task.relevant_files[0])
-        for raw_a in task.test_assertions:
-            cleaned_a = raw_a.strip()
+        for cleaned_a in _split_assertion_lines(task.test_assertions):
             if cleaned_a and "assert " not in cleaned_a and "=" in cleaned_a:
                 shared_setup_by_file.setdefault(tf, [])
                 if cleaned_a not in shared_setup_by_file[tf]:
@@ -912,7 +980,8 @@ def emit_pytest_suite(
             safe_tid = re.sub(r"[^a-zA-Z0-9_]", "_", task.task_id)
             fn_lines = [f"def test_{safe_tid}_{safe_sym}() -> None:"]
             for st in valid_stmts:
-                fn_lines.append(f"    {st}")
+                for sub_st in _split_assertion_lines([st]):
+                    fn_lines.append(f"    {sub_st}")
             test_blocks.append("\n".join(fn_lines))
 
     # Harvest top-level or `def main():` / `def run():` assertions from entry scripts
@@ -937,7 +1006,7 @@ def emit_pytest_suite(
                 seg = ast.unparse(n).strip()
                 if seg.startswith("print("):
                     continue
-                body_lines.append(f"    {seg}")
+                body_lines.append(textwrap.indent(seg, "    "))
             if body_lines:
                 test_blocks.append(f"def test_entry_{p.stem}() -> None:\n" + "\n".join(body_lines))
         else:

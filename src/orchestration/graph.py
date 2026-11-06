@@ -24,13 +24,14 @@ from .checkpoint import (
 )
 from .ledger import (
     ensure_class_wrapper,
-    generate_pyi_stub,
     ensure_workspace_imports,
     extract_all_ast_symbol_names,
     extract_python_signatures,
     format_ledger_for_prompt,
+    generate_pyi_stub,
     merge_staged_snippets_ast,
     record_ledger_entry,
+    slice_tier1_spec_for_files,
     upsert_staged_snippet,
 )
 from .schemas import (
@@ -2373,68 +2374,53 @@ def run_project(
     return history
 
 
-def _extract_stage_spec_sections(full_project_goal: str, target_files: list[str]) -> str:
+def _extract_stage_spec_sections(
+    full_project_goal: str,
+    target_files: list[str],
+    all_known_files: list[str] | None = None,
+) -> str:
     """
-    Extract only the numbered specification sections from `full_project_goal` whose
-    section header corresponds to `target_files`, preventing future stages' files
-    (like `main.py` referencing earlier files) from leaking into earlier stages.
+    Extract self-contained Tier-1 specification blocks for `target_files` from either
+    a numbered specification (`1. ... 2. ...`) or an un-numbered free-form prose prompt,
+    preventing future stages' files from leaking into earlier stages.
     """
-    if not full_project_goal.strip() or not target_files:
-        return full_project_goal.strip()
-
-    cleaned_goal = full_project_goal.replace("\u200b", "").replace("\ufeff", "").strip()
-    norm_targets = {_normalize_workspace_path(tf) for tf in target_files if tf.strip()}
-    blocks = re.split(r"(?=^\s*\d+\.\s+)", cleaned_goal, flags=re.MULTILINE)
-    if len(blocks) <= 2:
-        return full_project_goal.strip()
-
-    matched_blocks: list[str] = []
-    for blk in blocks:
-        blk_stripped = blk.strip()
-        if not blk_stripped or not re.match(r"^\d+\.\s+", blk_stripped):
-            continue
-        first_line = blk_stripped.splitlines()[0]
-        header_part = first_line.split(":", 1)[0]
-        if any(tf in header_part or Path(tf).name in header_part for tf in norm_targets):
-            matched_blocks.append(blk_stripped)
-
-    if matched_blocks:
-        return "\n\n".join(matched_blocks)
-
-    for blk in blocks:
-        blk_stripped = blk.strip()
-        if blk_stripped and any(tf in blk_stripped or Path(tf).name in blk_stripped for tf in norm_targets):
-            matched_blocks.append(blk_stripped)
-
-    return "\n\n".join(matched_blocks) if matched_blocks else full_project_goal.strip()
+    return slice_tier1_spec_for_files(
+        full_project_goal=full_project_goal,
+        target_files=target_files,
+        all_known_files=all_known_files,
+    )
 
 
 def _format_stage_goal(
     stage: StageGoal,
     total_stages: int,
     full_project_goal: str = "",
+    all_stage_files: list[str] | None = None,
 ) -> str:
     """
     Construct a stage prompt scoped strictly to `stage.target_files` while
     preserving the exact JSON keys, CSV rows, class/method signatures, and formulas
-    for those files from `full_project_goal`.
+    for those files without attaching the full Tier-0 prose prompt.
     """
     target_files_text = (
         ", ".join(f"`{f}`" for f in stage.target_files)
         if stage.target_files
         else "as specified below"
     )
-    scoped_spec = _extract_stage_spec_sections(full_project_goal, stage.target_files)
     base = (
         f"Build Stage {stage.stage_id} of {total_stages} ({stage.title}).\n"
         f"STRICT STAGE SCOPE: Create/modify ONLY {target_files_text}. Do NOT create or reference files from future stages.\n\n"
         f"Stage {stage.stage_id} Summary:\n{stage.objective.strip()}"
     )
-    if scoped_spec and scoped_spec not in stage.objective:
-        base += (
-            f"\n\nExact Specification for Stage {stage.stage_id} Files ({target_files_text}):\n"
-            f"{scoped_spec}"
+    if "Exact Specification for Stage" not in stage.objective and full_project_goal.strip():
+        scoped_spec = _extract_stage_spec_sections(
+            full_project_goal, stage.target_files, all_stage_files
         )
+        if scoped_spec and scoped_spec not in stage.objective:
+            base += (
+                f"\n\nExact Specification for Stage {stage.stage_id} Files ({target_files_text}):\n"
+                f"{scoped_spec}"
+            )
     return base
 
 
@@ -2496,13 +2482,16 @@ def run_staged_project(
             resolved_stages = list(blueprint.stages)
 
     total_stages = len(resolved_stages)
+    all_stage_files = [f for s in resolved_stages for f in s.target_files]
     for stage_idx in range(start_stage_idx, total_stages):
         stage = resolved_stages[stage_idx]
         print(f"\n############################################################")
         print(f"### STAGE {stage.stage_id}/{total_stages}: {stage.title} ({ws_root}) ###")
         print(f"############################################################")
 
-        stage_goal_text = _format_stage_goal(stage, total_stages, goal)
+        stage_goal_text = _format_stage_goal(
+            stage, total_stages, goal, all_stage_files=all_stage_files
+        )
         stage_previous_cycle: CycleResult | None = None
         stage_succeeded = False
 

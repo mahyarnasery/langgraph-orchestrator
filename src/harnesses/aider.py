@@ -11,12 +11,14 @@ from .base import CodingHarness
 from .config import AiderConfig
 from src.orchestration.ledger import (
     ensure_class_wrapper,
-    generate_pyi_stub,
     ensure_workspace_imports,
     extract_python_signatures,
+    generate_pyi_stub,
     merge_staged_snippets_ast,
+    slice_tier1_spec_for_files,
     upsert_staged_snippet,
 )
+from src.orchestration.tools import sanitize_file_content
 from src.orchestration.models import get_worker_model
 from src.orchestration.schemas import Plan, Task, TaskBatch, TaskResult
 from src.orchestration.workspace import (
@@ -450,6 +452,7 @@ class AiderHarness(CodingHarness):
                                 raw_snippet + "\n", encoding="utf-8"
                             )
 
+                    raw_snippet = sanitize_file_content(primary_target, raw_snippet).strip()
                     snippet_code = ensure_class_wrapper(raw_snippet, task.target_symbol).strip()
                     if snippet_code and snippet_code != raw_snippet:
                         self._safe_workspace_path(staged_rel_path).write_text(
@@ -483,13 +486,16 @@ class AiderHarness(CodingHarness):
                 else:
                     changed = changed_physical
                     for f in changed:
-                        if f.endswith(".py"):
-                            abs_f = self._safe_workspace_path(f)
-                            if abs_f.is_file():
-                                fixed_src = ensure_workspace_imports(
-                                    abs_f.read_text(encoding="utf-8"), f, ws_root
+                        abs_f = self._safe_workspace_path(f)
+                        if abs_f.is_file():
+                            cleaned_src = sanitize_file_content(
+                                f, abs_f.read_text(encoding="utf-8")
+                            )
+                            if f.endswith(".py"):
+                                cleaned_src = ensure_workspace_imports(
+                                    cleaned_src, f, ws_root
                                 )
-                                abs_f.write_text(fixed_src, encoding="utf-8")
+                            abs_f.write_text(cleaned_src, encoding="utf-8")
                         completed_files.add(f)
 
                 errors: list[str] = []
@@ -794,30 +800,10 @@ def _resolve_task_read_only_files(
 
 
 def _extract_file_spec_section(full_project_goal: str, target_file: str) -> str:
-    """Extract only the specification block whose header matches `target_file`."""
+    """Extract only the Tier-1 specification block for `target_file` (numbered or prose)."""
     if not full_project_goal.strip():
         return ""
-    fname = Path(target_file).name
-    cleaned_goal = full_project_goal.replace("\u200b", "").replace("\ufeff", "").strip()
-    blocks = re.split(r"(?=^\s*\d+\.\s+)", cleaned_goal, flags=re.MULTILINE)
-    if len(blocks) <= 2:
-        return full_project_goal.strip()
-    header_matched = []
-    for blk in blocks:
-        blk_s = blk.strip()
-        if not blk_s or not re.match(r"^\d+\.\s+", blk_s):
-            continue
-        header = blk_s.splitlines()[0].split(":", 1)[0]
-        if target_file in header or fname in header:
-            header_matched.append(blk_s)
-    if header_matched:
-        return "\n\n".join(header_matched)
-    matched = [
-        blk.strip()
-        for blk in blocks
-        if blk.strip() and (target_file in blk or fname in blk)
-    ]
-    return "\n\n".join(matched) if matched else full_project_goal.strip()
+    return slice_tier1_spec_for_files(full_project_goal, [target_file])
 
 
 def build_inline_dependency_context(

@@ -49,8 +49,9 @@ def _safe_write_path(path: str) -> Path:
 
 def sanitize_file_content(path: str, content: str) -> str:
     """
-    Strip accidental outer Markdown code fences (```python ... ``` or ~~~json ... ~~~)
-    and stray terminal progress bars when writing code, config, or data files.
+    Strip accidental outer Markdown code fences (```python ... ``` or ~~~json ... ~~~),
+    bare `path/to/...` header lines echoed by the 3B model, and stray terminal
+    progress bars when writing code, config, or data files.
     """
     if not content:
         return ""
@@ -75,11 +76,23 @@ def sanitize_file_content(path: str, content: str) -> str:
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
 
-    # Remove accidental terminal progress-bar lines (e.g. '11 / 11 lines [████] 100%')
-    filtered_lines = [
-        ln for ln in cleaned.splitlines()
-        if not re.search(r"\d+\s*/\s*\d+\s+lines\s+\[", ln)
-    ]
+    norm_target = normalize_workspace_rel_path(path)
+    target_name = Path(norm_target).name
+
+    filtered_lines: list[str] = []
+    for idx, ln in enumerate(cleaned.splitlines()):
+        stripped = ln.strip()
+        # Remove accidental terminal progress-bar lines (e.g. '11 / 11 lines [████] 100%')
+        if re.search(r"\d+\s*/\s*\d+\s+lines\s+\[", stripped):
+            continue
+        # Remove bare or commented `path/to/...` and `.path/to/...` lines echoed by 3B model
+        if re.match(r"^(?:#\s*)?\.?path/to/\S+\s*$", stripped, re.IGNORECASE):
+            continue
+        # Remove bare target file path echoed on line 0 (e.g. `services/hydrology.py`)
+        if idx == 0 and stripped in (norm_target, target_name, f"./{norm_target}"):
+            continue
+        filtered_lines.append(ln)
+
     cleaned = "\n".join(filtered_lines).strip()
     return (cleaned + "\n") if cleaned else ""
 
