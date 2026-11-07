@@ -15,3 +15,16 @@ __pycache__/
 # VS Code
 .vscode/
 .aider*
+pycache/
+*.py[cod]
+.pytest_cache/
+sandbox/
+.staging/
+.checkpoint/
+.aider*
+.aider
+.aider.chat.history.md
+.aider.input.history
+.venv/
+venv/
+*.log
