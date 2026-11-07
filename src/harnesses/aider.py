@@ -12,7 +12,9 @@ from .config import AiderConfig
 from src.orchestration.ledger import (
     ensure_class_wrapper,
     ensure_workspace_imports,
+    extract_all_ast_symbol_names,
     extract_python_signatures,
+    extract_symbol_source_ast,
     generate_pyi_stub,
     merge_staged_snippets_ast,
     slice_tier1_spec_for_files,
@@ -182,6 +184,13 @@ class AiderHarness(CodingHarness):
         completed_sibling_sigs: dict[str, list[str]] = {}
         newly_executed_count = 0
 
+        for mod_file, snap_code in snapshots.items():
+            if mod_file.endswith(".py") and snap_code.strip():
+                for sig in extract_python_signatures(snap_code):
+                    entry_str = f"{sig} (existing in {mod_file})"
+                    if entry_str not in completed_sibling_sigs.setdefault(mod_file, []):
+                        completed_sibling_sigs[mod_file].append(entry_str)
+
         for mod_file, snippets_map in staged_snippets.items():
             for prev_tid, prev_code in snippets_map.items():
                 for sig in extract_python_signatures(prev_code):
@@ -206,9 +215,16 @@ class AiderHarness(CodingHarness):
 
                 primary_target = declared_files[0]
                 is_python_target = primary_target.endswith(".py")
+                base_existing_src = snapshots.get(primary_target, "").strip()
+                has_preexisting_py_symbols = (
+                    is_python_target
+                    and Path(primary_target).name not in ("main.py", "app.py", "hello.py", "__init__.py")
+                    and bool(extract_all_ast_symbol_names(base_existing_src))
+                )
                 use_staging = is_python_target and (
                     file_task_counts.get(primary_target, 0) > 1
                     or primary_target in staged_snippets
+                    or has_preexisting_py_symbols
                 )
 
                 prev_res = verified_map.get(task.task_id)
@@ -222,12 +238,17 @@ class AiderHarness(CodingHarness):
                     task_results.append(prev_res)
                     continue
 
+                seed_snippet = ""
                 if use_staging:
                     safe_name = primary_target.replace("/", "__")
                     staged_rel_path = f".staging/{task.task_id}__{safe_name}"
                     staged_abs_path = self._safe_workspace_path(staged_rel_path)
                     staged_abs_path.parent.mkdir(parents=True, exist_ok=True)
-                    staged_abs_path.write_text("", encoding="utf-8")
+                    if has_preexisting_py_symbols and task.target_symbol:
+                        seed_snippet = extract_symbol_source_ast(
+                            base_existing_src, task.target_symbol
+                        )
+                    staged_abs_path.write_text(seed_snippet, encoding="utf-8")
                     editable_files = [staged_rel_path]
                 else:
                     staged_rel_path = None
@@ -375,8 +396,17 @@ class AiderHarness(CodingHarness):
                                 shutil.rmtree(stray_dir, ignore_errors=True)
 
                     after_check = self._snapshot_files(editable_files).get(editable_files[0], "").strip()
-                    if is_python_target and (completed.returncode != 0 or (use_staging and not after_check)):
-                        print(f"[8B FALLBACK] 3B Worker produced empty/failed output on {task.task_id}; escalating to 8B Foreman...")
+                    unchanged_seed = bool(seed_snippet and after_check == seed_snippet.strip())
+                    missing_ast_defs = bool(
+                        use_staging
+                        and is_python_target
+                        and not extract_all_ast_symbol_names(after_check)
+                    )
+                    if is_python_target and (
+                        completed.returncode != 0
+                        or (use_staging and (not after_check or unchanged_seed or missing_ast_defs))
+                    ):
+                        print(f"[8B FALLBACK] 3B Worker produced empty/unchanged output on {task.task_id}; escalating to 8B Foreman...")
                         self._unload_worker_model()
                         from src.agents.foreman import ForemanAgent
                         inline_dep_str = build_inline_dependency_context(read_only_files, ws_root)
@@ -388,7 +418,7 @@ class AiderHarness(CodingHarness):
                             test_assertions=task.test_assertions,
                             dependency_stubs=inline_dep_str,
                             sibling_signatures=completed_sibling_sigs.get(primary_target, []),
-                            previous_code="",
+                            previous_code=seed_snippet,
                             error_context=error_context,
                         )
                         if escalated_code.strip():
@@ -477,6 +507,9 @@ class AiderHarness(CodingHarness):
                             target_filename=primary_target,
                             base_source=snapshots.get(primary_target, ""),
                             ordered_snippets=ordered_pairs,
+                        )
+                        merged_live = ensure_workspace_imports(
+                            merged_live, primary_target, ws_root
                         )
                         target_abs = self._safe_workspace_path(primary_target)
                         target_abs.parent.mkdir(parents=True, exist_ok=True)

@@ -17,6 +17,7 @@ from src.harnesses.aider import AiderHarness, list_workspace_files, list_workspa
 
 from .checkpoint import (
     clear_checkpoint,
+    inspect_workspace_baseline,
     load_checkpoint,
     reconcile_checkpoint_with_disk,
     save_checkpoint,
@@ -27,10 +28,14 @@ from .ledger import (
     ensure_workspace_imports,
     extract_all_ast_symbol_names,
     extract_python_signatures,
+    extract_symbol_source_ast,
     format_ledger_for_prompt,
     generate_pyi_stub,
+    is_noop_preservation_task,
     merge_staged_snippets_ast,
+    rank_repository_files_by_impact,
     record_ledger_entry,
+    refine_existing_class_method_symbol,
     slice_tier1_spec_for_files,
     upsert_staged_snippet,
 )
@@ -127,8 +132,14 @@ def _summarize_non_python_asset(path: Path, source: str) -> str:
     return f"{suffix.lstrip('.').upper() or 'ASSET'} ({len(lines)} non-empty lines)"
 
 
-def _build_repository_map() -> str:
-    """Build a compact map of existing Python modules and non-Python config/data assets in the active workspace."""
+def _build_repository_map(project_goal: str = "") -> str:
+    """
+    Build an AST-impact-sliced map of existing Python modules and non-Python assets
+    in the active workspace:
+    - Focal & 1-hop dependency files receive full `.pyi` signatures and attribute contracts.
+    - Unrelated background modules (in workspaces with >5 files) are compressed to 1-line
+      exported symbol summaries to preserve the 4GB VRAM context window.
+    """
     ws_root = get_workspace_root()
     ws_files = list_workspace_files()
     ext_files = (
@@ -139,13 +150,28 @@ def _build_repository_map() -> str:
     if not ws_files and not ext_files:
         return f"[No files currently in workspace {ws_root.name}/]"
 
+    origin, _, _ = inspect_workspace_baseline()
+    file_sources: dict[str, str] = {}
+    for fpath in ws_files:
+        rel_path = str(fpath.relative_to(ws_root))
+        if rel_path.startswith("tests/") or fpath.name.startswith("test_"):
+            continue
+        try:
+            file_sources[rel_path] = fpath.read_text(encoding="utf-8")
+        except Exception:
+            file_sources[rel_path] = ""
+
+    focal_files, background_files = rank_repository_files_by_impact(
+        project_goal, file_sources
+    )
+
     entries: list[str] = []
     for fpath in ws_files:
         rel_path = str(fpath.relative_to(ws_root))
-        if rel_path.startswith("tests/"):
+        if rel_path.startswith("tests/") or fpath.name.startswith("test_"):
             continue
         try:
-            source = fpath.read_text(encoding="utf-8")
+            source = file_sources.get(rel_path, "")
             if not source.strip():
                 if fpath.name == "__init__.py":
                     entries.append(f"- {rel_path} (package marker)")
@@ -154,11 +180,20 @@ def _build_repository_map() -> str:
                 continue
 
             if fpath.suffix.lower() == ".py":
-                sigs = extract_python_signatures(source)
-                summary = "; ".join(sigs) if sigs else f"{len(source.splitlines())} lines"
+                if rel_path in background_files and rel_path not in focal_files:
+                    top_syms = sorted(
+                        s for s in extract_all_ast_symbol_names(source) if "." not in s
+                    )
+                    entries.append(
+                        f"- {rel_path} [background unchanged]: symbols={top_syms}"
+                    )
+                else:
+                    sigs = extract_python_signatures(source)
+                    summary = "; ".join(sigs) if sigs else f"{len(source.splitlines())} lines"
+                    entries.append(f"- {rel_path}: {summary}")
             else:
                 summary = _summarize_non_python_asset(fpath, source)
-            entries.append(f"- {rel_path}: {summary}")
+                entries.append(f"- {rel_path}: {summary}")
         except Exception:
             entries.append(f"- {rel_path} (unparsed)")
 
@@ -175,11 +210,14 @@ def _build_repository_map() -> str:
                     entries.append(f"- [EXTERNAL READ-ONLY] {ext_file}: {summary}")
                 except Exception:
                     pass
-    return f"Existing Workspace Repository Map ({ws_root}, access_mode={get_access_mode()}):\n" + "\n".join(entries)
+    return (
+        f"Existing Workspace Repository Map ({ws_root}, mode={origin}, access_mode={get_access_mode()}):\n"
+        + "\n".join(entries)
+    )
 
 
-def _enrich_architecture_context(architecture_context: str) -> str:
-    repo_map = _build_repository_map()
+def _enrich_architecture_context(architecture_context: str, project_goal: str = "") -> str:
+    repo_map = _build_repository_map(project_goal=project_goal)
     return f"{architecture_context}\n\n{repo_map}"
 
 
@@ -550,10 +588,35 @@ def _normalize_plan_blueprints(plan: Plan | None, project_goal: str = "") -> Non
                     if imp_stmt not in fb.required_imports:
                         fb.required_imports.append(imp_stmt)
 
-        # If a class only has <=2 methods (e.g. __init__ and 1 short method), keep it as a single
-        # cohesive class symbol so Aider writes the whole class cleanly in one shot without staging drift!
+        existing_disk_syms: set[str] = set()
+        abs_fb_path = ws_root / norm_path
+        if abs_fb_path.is_file():
+            try:
+                existing_disk_syms = extract_all_ast_symbol_names(
+                    abs_fb_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                existing_disk_syms = set()
+
+        # If editing an existing class on disk and a SymbolSpec used bare `ClassName`,
+        # refine it to `ClassName.method_name` when the signature/contract targets a single method.
+        if existing_disk_syms:
+            for sym in cleaned_symbols:
+                refined = refine_existing_class_method_symbol(
+                    sym.target_symbol,
+                    sym.contract,
+                    [sym.signature, sym.contract],
+                    existing_disk_syms,
+                )
+                if refined:
+                    sym.target_symbol = refined
+
+        # If a brand-new class only has <=2 methods (e.g. __init__ and 1 short method) and does NOT
+        # already exist on disk, keep it as a single cohesive class symbol so Aider writes the whole
+        # class cleanly in one shot. Never collapse when the class already exists on disk!
         if (
             detected_class
+            and detected_class not in existing_disk_syms
             and 1 <= len(cleaned_symbols) <= 2
             and "method-level" not in project_goal.lower()
             and all(s.target_symbol.startswith(f"{detected_class}.") for s in cleaned_symbols)
@@ -705,10 +768,48 @@ def _align_batch_with_plan_blueprints(batch: TaskBatch, plan: Plan | None) -> No
                     prev_sub_id = sub_id
             continue
 
+        existing_primary_syms: set[str] = set()
+        abs_primary = get_workspace_root() / primary
+        if abs_primary.is_file():
+            try:
+                existing_primary_syms = extract_all_ast_symbol_names(
+                    abs_primary.read_text(encoding="utf-8")
+                )
+            except Exception:
+                existing_primary_syms = set()
+
+        planned_sym_set = {s.target_symbol for s in fb.symbols}
+        if (
+            len(file_tasks) > 1
+            and existing_primary_syms
+            and is_noop_preservation_task(
+                t.objective,
+                t.acceptance_criteria,
+                t.target_symbol,
+                planned_sym_set,
+                existing_primary_syms,
+            )
+        ):
+            expanded_any = True
+            continue
+
         # Case B: Match/correct `task.target_symbol` against the Planner's SymbolSpec list
-        if len(file_tasks) == 1 and len(fb.symbols) == 1 and "." in fb.symbols[0].target_symbol:
+        if (
+            len(file_tasks) == 1
+            and len(fb.symbols) == 1
+            and "." in fb.symbols[0].target_symbol
+            and fb.symbols[0].target_symbol.split(".")[0] not in existing_primary_syms
+        ):
             t.target_symbol = fb.symbols[0].target_symbol.split(".")[0]
-        elif len(file_tasks) > 1 and len(fb.symbols) == 1 and "." not in fb.symbols[0].target_symbol:
+        elif (
+            len(file_tasks) > 1
+            and len(fb.symbols) == 1
+            and "." not in fb.symbols[0].target_symbol
+            and (
+                fb.symbols[0].target_symbol[:1].isupper()
+                or fb.symbols[0].signature.strip().startswith("class ")
+            )
+        ):
             # Planner emitted 1 class symbol (e.g. 'Reading'), while Foreman split it into method tasks:
             # infer or preserve `ClassName.method_name` for each task so they don't collide on 'Reading'!
             cls_name = fb.symbols[0].target_symbol
@@ -823,7 +924,21 @@ def _prepare_batch_and_workspace(
             task.test_assertions = []
             continue
 
-        inferred = _infer_task_symbol(task, file_counts.get(primary, 0) > 1)
+        preexisting_file_src = existing_snapshots.get(primary, "")
+        if not preexisting_file_src and (ws_root / primary).is_file():
+            try:
+                preexisting_file_src = (ws_root / primary).read_text(encoding="utf-8")
+            except Exception:
+                preexisting_file_src = ""
+        preexisting_syms = (
+            extract_all_ast_symbol_names(preexisting_file_src)
+            if Path(primary).name not in ("main.py", "app.py", "hello.py", "__init__.py")
+            else set()
+        )
+
+        inferred = _infer_task_symbol(
+            task, file_counts.get(primary, 0) > 1 or bool(preexisting_syms)
+        )
         if inferred:
             if (
                 "." not in inferred
@@ -832,6 +947,14 @@ def _prepare_batch_and_workspace(
             ):
                 inferred = f"{class_prefix_by_file[primary]}.{inferred}"
             task.target_symbol = inferred
+
+        if preexisting_syms:
+            task.target_symbol = refine_existing_class_method_symbol(
+                task.target_symbol,
+                task.objective,
+                task.acceptance_criteria,
+                preexisting_syms,
+            )
 
         if (
             task.target_symbol is None
@@ -1076,7 +1199,9 @@ def build_worker() -> AiderHarness:
 
 def planner_node(state: WorkflowState) -> dict:
     planner = build_planner()
-    enriched_arch = _enrich_architecture_context(state["architecture_context"])
+    enriched_arch = _enrich_architecture_context(
+        state["architecture_context"], state["project_goal"]
+    )
     ledger_ctx = format_ledger_for_prompt(state["ledger"], state["previous_cycle"])
 
     plan = planner.run(
@@ -1134,7 +1259,9 @@ def foreman_node(state: WorkflowState) -> dict:
         raise RuntimeError("Planner output missing.")
 
     foreman = build_foreman()
-    enriched_arch = _enrich_architecture_context(state["architecture_context"])
+    enriched_arch = _enrich_architecture_context(
+        state["architecture_context"], state["project_goal"]
+    )
     ledger_ctx = format_ledger_for_prompt(state["ledger"], state["previous_cycle"])
 
     batch = foreman.create_batch(
@@ -1260,7 +1387,13 @@ def worker_node(state: WorkflowState) -> dict:
         save_checkpoint(partial_state)
 
     prev_val = state.get("validation_result")
-    err_ctx = "\n".join(prev_val.errors[:4]) if (prev_val and prev_val.errors) else ""
+    err_lines: list[str] = []
+    if prev_val:
+        err_lines.extend(prev_val.errors[:4])
+        for chk in prev_val.checks:
+            if chk.startswith("stdout ("):
+                err_lines.append(f"Observed {chk}")
+    err_ctx = "\n".join(err_lines)
     is_rebuild_run = bool(state.get("rebuild_attempts", 0) >= 1 or len(state.get("task_batches", [])) > 1)
 
     results = worker.execute(
@@ -1441,6 +1574,7 @@ def validator_node(state: WorkflowState) -> dict:
     validation = validate_batch(
         batch=effective_batch,
         task_results=state["task_results"],
+        file_snapshots=state.get("file_snapshots", {}),
     )
 
     if not isinstance(validation, ValidationResult):
@@ -1679,10 +1813,26 @@ def foreman_self_repair_node(state: WorkflowState) -> dict:
         detail=repair_task_result.summary,
     )
 
+    updated_staged = {
+        _normalize_workspace_path(k): dict(v)
+        for k, v in state.get("staged_files", {}).items()
+    }
+    updated_snapshots = dict(state.get("file_snapshots", {}))
+    for rep_f in repaired_files:
+        updated_staged.pop(rep_f, None)
+        abs_rep = ws_root / rep_f
+        if abs_rep.is_file():
+            try:
+                updated_snapshots[rep_f] = abs_rep.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
     return _persist_node_state(
         state,
         {
             "task_results": state["task_results"] + [repair_task_result],
+            "staged_files": updated_staged,
+            "file_snapshots": updated_snapshots,
             "foreman_repair_attempts": next_repair_attempts,
             "ledger": updated_ledger,
             "phase": "foreman_repaired",
@@ -2231,10 +2381,34 @@ def run_cycle(
             initial_state["worker_profile"] = worker_profile
             initial_state["rework_mode"] = "plan_only" if plan_only else "none"
 
+    if initial_state is None and cycle_id > 1 and previous_cycle is not None:
+        prev_ckpt = load_checkpoint()
+        if prev_ckpt is not None and prev_ckpt.file_snapshots:
+            ws_root_restore = get_workspace_root()
+            for rel_f, orig_src in prev_ckpt.file_snapshots.items():
+                abs_f = (ws_root_restore / rel_f).resolve()
+                if abs_f.is_relative_to(ws_root_restore):
+                    abs_f.parent.mkdir(parents=True, exist_ok=True)
+                    abs_f.write_text(orig_src, encoding="utf-8")
+
+    ws_origin, baseline_snapshots, next_stage_num = inspect_workspace_baseline()
+    if (
+        suite_rel_path == "tests/test_generated.py"
+        and ws_origin == "orchestrator_native"
+        and next_stage_num > 1
+    ):
+        suite_rel_path = f"tests/test_stage_{next_stage_num}.py"
+
     if initial_state is None:
         if staging_dir.exists():
             for f in staging_dir.rglob("*.py"):
                 f.unlink(missing_ok=True)
+
+        if ws_origin != "greenfield":
+            print(
+                f"\n[INCREMENTAL BASELINE] Detected '{ws_origin}' workspace with "
+                f"{len(baseline_snapshots)} pre-existing file(s): {sorted(baseline_snapshots.keys())}"
+            )
 
         initial_state = {
             "cycle_id": cycle_id,
@@ -2247,7 +2421,7 @@ def run_cycle(
             "task_results": [],
             "ledger": [],
             "staged_files": {},
-            "file_snapshots": {},
+            "file_snapshots": dict(baseline_snapshots),
             "worker_attempts": {},
             "foreman_repair_attempts": 0,
             "rebuild_attempts": 0,
@@ -2262,6 +2436,13 @@ def run_cycle(
     final_state = app.invoke(initial_state)
 
     if plan_only and final_state.get("phase") == "planned":
+        print(
+            format_plan_preview(
+                final_state["plan"],
+                workspace_origin=ws_origin,
+                snapshot_count=len(baseline_snapshots),
+            )
+        )
         return CycleResult(
             cycle_id=cycle_id,
             plan=final_state["plan"],
@@ -2560,6 +2741,15 @@ def run_staged_project(
                     current_stage_index=stage_idx,
                     completed_stage_ids=completed_stage_ids,
                 )
+                ws_origin, baseline_snaps, _ = inspect_workspace_baseline()
+                print(
+                    format_plan_preview(
+                        cycle_result.plan,
+                        stages=resolved_stages,
+                        workspace_origin=ws_origin,
+                        snapshot_count=len(baseline_snaps),
+                    )
+                )
                 print(
                     f"\n=== STAGE {stage.stage_id}/{total_stages} PLAN-ONLY COMPLETE ==="
                 )
@@ -2601,3 +2791,58 @@ def run_staged_project(
             break
 
     return history
+
+
+# === ALPHA14 CLI SPEC & BLUEPRINT PREVIEW ===
+
+
+def format_plan_preview(
+    plan: Plan | None,
+    *,
+    stages: list[StageGoal] | None = None,
+    workspace_origin: str = "greenfield",
+    snapshot_count: int = 0,
+) -> str:
+    """
+    Format a human-readable CLI preview of the Tier-1 stage specifications and
+    Planner `file_blueprints` when running with `--plan-only`.
+    """
+    ws_root = get_workspace_root()
+    lines = [
+        "",
+        "============================================================",
+        f"CLI SPEC & ARCHITECTURAL BLUEPRINT PREVIEW ({ws_root.name}/)",
+        "============================================================",
+        f"Workspace Mode: {workspace_origin} ({snapshot_count} pre-existing file(s) snapshotted)",
+    ]
+
+    if stages:
+        lines.append(f"\n--- MULTI-STAGE TIER-1 DECOMPOSITION ({len(stages)} Stage(s)) ---")
+        for stg in stages:
+            t_files = ", ".join(stg.target_files) if stg.target_files else "(auto)"
+            lines.append(f"\n[Stage {stg.stage_id}: {stg.title}]")
+            lines.append(f"  Target Files: {t_files}")
+            lines.append("  Tier-1 Scoped Specification:")
+            for obj_ln in stg.objective.strip().splitlines():
+                lines.append(f"    {obj_ln}")
+
+    if plan is not None:
+        lines.append("\n--- ACTIVE PLANNER FILE BLUEPRINTS ---")
+        lines.append(f"Objective:      {plan.objective}")
+        lines.append(f"Affected Areas: {', '.join(plan.affected_areas)}")
+        for fb in getattr(plan, "file_blueprints", []):
+            lines.append(f"\n  * File: `{fb.path}`")
+            lines.append(f"    Role: {fb.role}")
+            if fb.required_imports:
+                lines.append(f"    Imports: {', '.join(fb.required_imports)}")
+            if fb.symbols:
+                lines.append("    Planned Symbols:")
+                for sym in fb.symbols:
+                    lines.append(
+                        f"      - {sym.target_symbol}: `{sym.signature}` -> {sym.contract}"
+                    )
+            else:
+                lines.append("    Planned Symbols: [Single-task file / asset / entry script]")
+
+    lines.append("============================================================")
+    return "\n".join(lines)

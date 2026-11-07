@@ -91,6 +91,9 @@ def sanitize_file_content(path: str, content: str) -> str:
         # Remove bare target file path echoed on line 0 (e.g. `services/hydrology.py`)
         if idx == 0 and stripped in (norm_target, target_name, f"./{norm_target}"):
             continue
+        # Strip accidental trailing comma on single-line Python assert statements (`assert x == 1,`)
+        if suffix == ".py" and re.match(r"^\s*assert\s+.+,\s*$", ln):
+            ln = re.sub(r",\s*$", "", ln)
         filtered_lines.append(ln)
 
     cleaned = "\n".join(filtered_lines).strip()

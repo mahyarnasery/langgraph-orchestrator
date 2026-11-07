@@ -613,6 +613,7 @@ def ensure_workspace_imports(
 
     # Map exported top-level symbols across all workspace .py files -> dotted module path
     symbol_to_mod: dict[str, str] = {}
+    dollar_prefixed_fns: set[str] = set()
     mod_set: set[str] = set()
     if workspace_root.exists():
         excluded = {".staging", ".checkpoint", ".git", ".pytest_cache", "__pycache__", "tests"}
@@ -633,11 +634,32 @@ def ensure_workspace_imports(
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     if not node.name.startswith("_"):
                         symbol_to_mod[node.name] = mod_dotted
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for sub in ast.walk(node):
+                            if isinstance(sub, ast.Return) and sub.value is not None:
+                                if (
+                                    isinstance(sub.value, ast.JoinedStr)
+                                    and sub.value.values
+                                    and isinstance(sub.value.values[0], ast.Constant)
+                                    and isinstance(sub.value.values[0].value, str)
+                                    and sub.value.values[0].value.startswith("$")
+                                ) or (
+                                    isinstance(sub.value, ast.Constant)
+                                    and isinstance(sub.value.value, str)
+                                    and sub.value.value.startswith("$")
+                                ):
+                                    dollar_prefixed_fns.add(node.name)
 
     if not symbol_to_mod:
         return source
 
     cleaned_source = source
+    for dfn in dollar_prefixed_fns:
+        cleaned_source = re.sub(
+            rf"\$\{{\s*{re.escape(dfn)}\s*\(",
+            f"{{{dfn}(",
+            cleaned_source,
+        )
     needed_imports: dict[tuple[str, str], str] = {}
 
     # 1. Replace dotted references like `domain.models.TelemetryRecord` -> `TelemetryRecord`
@@ -684,10 +706,28 @@ def ensure_workspace_imports(
     return "\n".join(prepend_lines) + "\n\n" + cleaned_source
 
 
+def _compact_return_summary(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """If a function/method body is a single-line `return <expr>`, return `return <expr>`, else `...`."""
+    body = [
+        s for s in node.body
+        if not (
+            isinstance(s, ast.Expr)
+            and isinstance(s.value, ast.Constant)
+            and isinstance(s.value.value, str)
+        )
+    ]
+    if len(body) == 1 and isinstance(body[0], ast.Return) and body[0].value is not None:
+        expr = ast.unparse(body[0].value).strip()
+        if len(expr) <= 70 and "\n" not in expr:
+            return f"return {expr}"
+    return "..."
+
+
 def generate_pyi_stub(source: str, max_lines: int = 40) -> str:
     """
     Project a Python source string into a compact `.pyi` interface stub:
-    - Strips function and method bodies down to `...`
+    - Preserves single-line `return <expr>` bodies (up to 70 chars) so callers see exact
+      formatting strings/units (e.g. `return f'${amount:.2f}'`), stripping longer bodies to `...`.
     - Preserves top-level constants, class headers, `self.<attr>` names, and full `def` signatures.
     """
     if not source.strip():
@@ -708,7 +748,8 @@ def generate_pyi_stub(source: str, max_lines: int = 40) -> str:
             prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
             args_str = ast.unparse(node.args)
             ret_str = f" -> {ast.unparse(node.returns)}" if node.returns else ""
-            stub_lines.append(f"{prefix} {node.name}({args_str}){ret_str}: ...")
+            body_summary = _compact_return_summary(node)
+            stub_lines.append(f"{prefix} {node.name}({args_str}){ret_str}: {body_summary}")
         elif isinstance(node, ast.ClassDef):
             bases = [ast.unparse(b).strip() for b in node.bases]
             base_str = f"({', '.join(bases)})" if bases else ""
@@ -722,7 +763,8 @@ def generate_pyi_stub(source: str, max_lines: int = 40) -> str:
                     m_prefix = "async def" if isinstance(sub, ast.AsyncFunctionDef) else "def"
                     m_args = ast.unparse(sub.args)
                     m_ret = f" -> {ast.unparse(sub.returns)}" if sub.returns else ""
-                    method_lines.append(f"    {m_prefix} {sub.name}({m_args}){m_ret}: ...")
+                    m_summary = _compact_return_summary(sub)
+                    method_lines.append(f"    {m_prefix} {sub.name}({m_args}){m_ret}: {m_summary}")
                     for stmt in ast.walk(sub):
                         if isinstance(stmt, ast.Assign):
                             for t in stmt.targets:
@@ -1098,3 +1140,232 @@ def slice_tier1_spec_for_files(
             blocks_out.append(f"{idx}. `{tf}`:\n   {body}")
 
     return "\n\n".join(blocks_out) if blocks_out else cleaned_goal
+
+
+# === ALPHA14 BROWNFIELD & AST IMPACT HELPERS ===
+
+
+def extract_symbol_source_ast(source: str, target_symbol: str | None) -> str:
+    """
+    If `target_symbol` ('func_name', 'ClassName', or 'ClassName.method_name') already
+    exists in `source`, extract its standalone AST source (with top-level imports)
+    to pre-populate `.staging/` for surgical brownfield modification.
+    """
+    if not source.strip() or not target_symbol or not target_symbol.strip():
+        return ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ""
+
+    imports: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imp_str = ast.unparse(node).strip()
+            if imp_str not in imports:
+                imports.append(imp_str)
+
+    imp_prefix = ("\n".join(imports) + "\n\n") if imports else ""
+
+    if "." in target_symbol:
+        cls_name, method_name = [p.strip() for p in target_symbol.split(".", 1)]
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                for sub in node.body:
+                    if (
+                        isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and sub.name == method_name
+                    ):
+                        m_src = ast.unparse(sub).strip()
+                        indented_m = textwrap.indent(m_src, "    ")
+                        return f"{imp_prefix}class {cls_name}:\n{indented_m}\n"
+        return ""
+
+    for node in tree.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == target_symbol
+        ):
+            node_src = ast.unparse(node).strip()
+            return f"{imp_prefix}{node_src}\n"
+
+    return ""
+
+
+def is_noop_preservation_task(
+    objective: str,
+    acceptance_criteria: list[str],
+    target_symbol: str | None,
+    planned_symbols: set[str],
+    existing_symbols: set[str],
+) -> bool:
+    """
+    Return True if a task on an existing brownfield file only asks to keep/preserve
+    an already-existing symbol unchanged without adding or modifying behavior.
+    """
+    if not existing_symbols:
+        return False
+    text = f"{objective} {' '.join(acceptance_criteria)}".lower()
+    preserve_phrases = (
+        "remain unchanged",
+        "remains unchanged",
+        "without modification",
+        "not modified",
+        "keep existing",
+        "preserve existing",
+        "ensure ",
+    )
+    modify_phrases = (
+        "update ",
+        "fix ",
+        "add ",
+        "change ",
+        "modify ",
+        "implement new",
+        "instead of",
+        "calculate ",
+        "must return round(",
+    )
+    has_preserve = any(p in text for p in preserve_phrases) and (
+        "unchanged" in text or "without modification" in text or "intact" in text
+    )
+    has_modify = any(p in text for p in modify_phrases)
+    if has_preserve and not has_modify:
+        return True
+    if (
+        target_symbol
+        and target_symbol in existing_symbols
+        and planned_symbols
+        and target_symbol not in planned_symbols
+        and ("unchanged" in text or "without modification" in text or "intact" in text)
+    ):
+        return True
+    return False
+
+
+def refine_existing_class_method_symbol(
+    target_symbol: str | None,
+    objective: str,
+    acceptance_criteria: list[str],
+    existing_symbols: set[str],
+) -> str | None:
+    """
+    If `target_symbol` is a bare `ClassName` (or None) for a class that already exists
+    on disk in `existing_symbols`, and the task objective/criteria target a single method
+    `method_name`, return `'ClassName.method_name'` so staging isolates only that method.
+    """
+    existing_classes = {
+        s.split(".", 1)[0] for s in existing_symbols if "." in s
+    } | {
+        s for s in existing_symbols if "." not in s and s[:1].isupper()
+    }
+    if not existing_classes:
+        return target_symbol
+
+    if target_symbol and "." in target_symbol:
+        return target_symbol
+
+    cls_name = (
+        target_symbol
+        if (target_symbol in existing_classes)
+        else (next(iter(existing_classes)) if len(existing_classes) == 1 else None)
+    )
+    if not cls_name:
+        return target_symbol
+
+    text = f"{objective}\n" + "\n".join(acceptance_criteria)
+    m_dot = re.search(rf"\b{re.escape(cls_name)}\.([a-zA-Z_][a-zA-Z0-9_]*)\b", text)
+    if m_dot:
+        return f"{cls_name}.{m_dot.group(1)}"
+
+    defs = re.findall(r"\bdef\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", text)
+    non_init_defs = [d for d in defs if d != "__init__"]
+    if len(defs) == 1:
+        return f"{cls_name}.{defs[0]}"
+    if len(non_init_defs) == 1 and f"{cls_name}.__init__" in existing_symbols:
+        return f"{cls_name}.{non_init_defs[0]}"
+
+    m_backtick = re.search(r"\bmethod\s+`([a-zA-Z_][a-zA-Z0-9_]*)`", text, re.IGNORECASE)
+    if m_backtick:
+        return f"{cls_name}.{m_backtick.group(1)}"
+
+    m_self_sig = re.search(r"`([a-zA-Z_][a-zA-Z0-9_]*)\(self\b", text)
+    if m_self_sig:
+        return f"{cls_name}.{m_self_sig.group(1)}"
+
+    return target_symbol
+
+
+def rank_repository_files_by_impact(
+    project_goal: str,
+    file_sources: dict[str, str],
+) -> tuple[set[str], set[str]]:
+    """
+    AST Impact Slicer for brownfield repositories:
+    Partitions `file_sources` keys into `(focal_or_1hop_files, background_files)`.
+    """
+    all_files = set(file_sources.keys())
+    if len(all_files) <= 5 or not project_goal.strip():
+        return all_files, set()
+
+    goal_lower = project_goal.lower()
+    focal: set[str] = set()
+
+    mod_to_file: dict[str, str] = {}
+    file_to_syms: dict[str, set[str]] = {}
+    for rel_path, src in file_sources.items():
+        if not rel_path.endswith(".py"):
+            focal.add(rel_path)
+            continue
+        p = Path(rel_path)
+        mod_dotted = ".".join(p.with_suffix("").parts)
+        mod_to_file[mod_dotted] = rel_path
+        mod_to_file[p.stem] = rel_path
+        syms = extract_all_ast_symbol_names(src)
+        file_to_syms[rel_path] = syms
+
+        if (
+            rel_path.lower() in goal_lower
+            or p.name.lower() in goal_lower
+            or mod_dotted.lower() in goal_lower
+        ):
+            focal.add(rel_path)
+            continue
+
+        for sym in syms:
+            short_sym = sym.split(".")[-1]
+            if len(short_sym) >= 4 and short_sym.lower() in goal_lower:
+                focal.add(rel_path)
+                break
+
+    if not focal:
+        return all_files, set()
+
+    imports_graph: dict[str, set[str]] = {f: set() for f in all_files}
+    for rel_path, src in file_sources.items():
+        if not rel_path.endswith(".py") or not src.strip():
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                target_f = mod_to_file.get(node.module)
+                if target_f and target_f != rel_path:
+                    imports_graph[rel_path].add(target_f)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    target_f = mod_to_file.get(alias.name)
+                    if target_f and target_f != rel_path:
+                        imports_graph[rel_path].add(target_f)
+
+    expanded_focal = set(focal)
+    for f in list(focal):
+        expanded_focal.update(imports_graph.get(f, set()))
+        for other_f, deps in imports_graph.items():
+            if f in deps:
+                expanded_focal.add(other_f)
+
+    background = all_files - expanded_focal
+    return expanded_focal, background

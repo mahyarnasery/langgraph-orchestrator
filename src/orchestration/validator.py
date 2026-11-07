@@ -12,7 +12,7 @@ import sys
 import textwrap
 import tomllib
 
-from .ledger import _is_stub_function
+from .ledger import _is_stub_function, extract_all_ast_symbol_names
 from .schemas import Task, TaskBatch, TaskResult, ValidationResult
 from .workspace import get_workspace_root
 
@@ -241,7 +241,12 @@ def _criterion_satisfied_by_file(
             return False
 
     # --- Tier 3: Entry Scripts & General Pattern Matching ---
-    expected_patterns = _extract_expected_patterns(crit_clean)
+    file_norm = _normalize_path(file_path)
+    file_bname = Path(file_norm).name
+    expected_patterns = [
+        p for p in _extract_expected_patterns(crit_clean)
+        if p.strip() not in (file_norm, file_bname, Path(file_norm).stem)
+    ]
     if expected_patterns:
         return all(
             _pattern_matches(pattern, content, stdout)
@@ -723,6 +728,39 @@ def validate_batch(
                 errors.append(f"syntax error in {rel_path}: invalid CSV ({exc})")
                 failed_task_ids.update(file_task_ids)
 
+    # --- 1B. Brownfield Non-Regression AST Symbol Guard ---
+    if file_snapshots:
+        for rel_path in sorted(syntax_ok_files):
+            if not rel_path.endswith(".py") or Path(rel_path).name in ("main.py", "app.py", "hello.py", "__init__.py"):
+                continue
+            prev_src = file_snapshots.get(rel_path, "")
+            if not prev_src or not prev_src.strip():
+                continue
+            prev_syms = extract_all_ast_symbol_names(prev_src)
+            if not prev_syms:
+                continue
+            curr_syms = extract_all_ast_symbol_names(file_contents.get(rel_path, ""))
+            dropped_syms = sorted(prev_syms - curr_syms)
+            if dropped_syms:
+                file_tasks = tasks_by_file.get(rel_path, [])
+                combined_task_text = " ".join(
+                    f"{t.objective} {' '.join(t.acceptance_criteria)}" for t in file_tasks
+                ).lower()
+                explicitly_removed = any(
+                    kw in combined_task_text
+                    for kw in ("remove ", "delete ", "rename ", "deprecate ", "drop ")
+                )
+                if not explicitly_removed:
+                    errors.append(
+                        f"missing symbol (regression in {rel_path}): pre-existing symbol(s) {dropped_syms} were accidentally deleted"
+                    )
+                    for ft in file_tasks:
+                        failed_task_ids.add(ft.task_id)
+            else:
+                checks.append(
+                    f"non-regression OK: {rel_path} (preserved {len(prev_syms)} pre-existing symbol(s))"
+                )
+
     # --- 2. AST Symbol Verification ---
     for task in batch.tasks:
         if not task.target_symbol or not task.relevant_files:
@@ -904,7 +942,15 @@ def validate_batch(
             if satisfied:
                 checks.append(f"acceptance: {criterion}")
             else:
-                errors.append(f"acceptance criteria not met ({task.task_id}): {criterion}")
+                stdout_notes = [
+                    f"actual stdout={file_stdouts[tf]!r}"
+                    for tf in task_files
+                    if file_stdouts.get(tf)
+                ]
+                diag_note = f" [{'; '.join(stdout_notes)}]" if stdout_notes else ""
+                errors.append(
+                    f"acceptance criteria not met ({task.task_id}): {criterion}{diag_note}"
+                )
                 failed_task_ids.add(task.task_id)
 
     return ValidationResult(

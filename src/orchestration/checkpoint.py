@@ -508,3 +508,68 @@ def format_checkpoint_status() -> str:
             )
 
     return "\n".join(lines)
+
+
+# === ALPHA14 WORKSPACE ORIGIN & BASELINE SNAPSHOTTER ===
+
+
+def inspect_workspace_baseline() -> tuple[str, dict[str, str], int]:
+    """
+    Inspect the active workspace before starting a new cycle and return:
+    `(workspace_origin, file_snapshots, next_stage_test_id)`
+    where `workspace_origin` is:
+    - `'greenfield'`: No existing user code/config files in the workspace.
+    - `'orchestrator_native'` (Situation 1): Created by our orchestrator (contains
+      `tests/test_stage_*.py` or a checkpoint with `stages` / `completed_stage_ids`).
+    - `'external_repo'` (Situation 2): Contains pre-existing code/config files on disk
+      without orchestrator stage suites.
+    """
+    from src.harnesses.aider import list_workspace_files
+
+    ws_root = get_workspace_root()
+    ckpt_file = get_checkpoint_file()
+
+    stage_test_numbers: list[int] = []
+    tests_dir = ws_root / "tests"
+    if tests_dir.is_dir():
+        for tp in tests_dir.glob("test_stage_*.py"):
+            num_str = tp.stem.removeprefix("test_stage_")
+            if num_str.isdigit():
+                stage_test_numbers.append(int(num_str))
+
+    ckpt_has_stages = False
+    if ckpt_file.is_file():
+        try:
+            ckpt_obj = CheckpointData.model_validate_json(
+                ckpt_file.read_text(encoding="utf-8")
+            )
+            ckpt_has_stages = bool(ckpt_obj.stages or ckpt_obj.completed_stage_ids)
+        except Exception:
+            ckpt_has_stages = False
+
+    has_orchestrator_markers = bool(stage_test_numbers) or ckpt_has_stages
+
+    snapshots: dict[str, str] = {}
+    for fpath in list_workspace_files():
+        rel_path = _normalize_rel_path(str(fpath.relative_to(ws_root)))
+        if rel_path.startswith("tests/") or Path(rel_path).name.startswith("test_"):
+            continue
+        try:
+            snapshots[rel_path] = fpath.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+    non_empty_user_files = [
+        k for k, v in snapshots.items()
+        if v.strip() and Path(k).name != "__init__.py"
+    ]
+
+    if not non_empty_user_files:
+        origin = "greenfield"
+    elif has_orchestrator_markers:
+        origin = "orchestrator_native"
+    else:
+        origin = "external_repo"
+
+    next_stage_id = (max(stage_test_numbers) + 1) if stage_test_numbers else 1
+    return origin, snapshots, next_stage_id
